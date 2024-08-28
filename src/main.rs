@@ -2,16 +2,15 @@ use key_utils::Secp256k1PublicKey;
 //use std::time::Duration;
 //use key_utils::Secp256k1PublicKey;
 use lazy_static::lazy_static;
-use tokio::sync::mpsc::channel;
 use std::net::ToSocketAddrs;
+use tokio::sync::mpsc::channel;
 
 mod ingress;
 pub mod jd_client;
-mod shared;
-pub mod status;
-mod translator;
-mod share_accounter;
 mod minin_pool_connection;
+mod share_accounter;
+mod shared;
+mod translator;
 
 const TRANSLATOR_BUFFER_SIZE: usize = 32;
 const MIN_EXTRANONCE_SIZE: u16 = 8;
@@ -33,18 +32,24 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() {
-    let auth_pub_k: Secp256k1PublicKey =
-        crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
-    let address = POOL_ADDRESS.to_socket_addrs().expect("Invalid pool address")
+    let auth_pub_k: Secp256k1PublicKey = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let address = POOL_ADDRESS
+        .to_socket_addrs()
+        .expect("Invalid pool address")
         .next()
         .expect("Invalid pool address");
-    let (send_to_pool,recv_from_pool,_) = minin_pool_connection::connect_pool(address, auth_pub_k, None, None).await.expect("Impossible connect to the pool");
+    let (send_to_pool, recv_from_pool, _) =
+        minin_pool_connection::connect_pool(address, auth_pub_k, None, None)
+            .await
+            .expect("Impossible connect to the pool");
 
     let (downs_sv1_tx, downs_sv1_rx) = channel(10);
     ingress::sv1_ingress::start(downs_sv1_tx).await;
 
     let (translator_up_tx, mut translator_up_rx) = channel(10);
-    let _ = translator::start(downs_sv1_rx, translator_up_tx).await.expect("Impossible initialize translator");
+    let _ = translator::start(downs_sv1_rx, translator_up_tx)
+        .await
+        .expect("Impossible initialize translator");
 
     let (from_jdc_to_share_accounter_send, from_jdc_to_share_accounter_recv) = channel(10);
     let (from_share_accounter_to_jdc_send, from_share_accounter_to_jdc_recv) = channel(10);
@@ -57,12 +62,14 @@ async fn main() {
         jdc_to_translator_sender,
         from_share_accounter_to_jdc_recv,
         from_jdc_to_share_accounter_send,
-    ).await;
+    )
+    .await;
 
     let _ = share_accounter::start(
         from_jdc_to_share_accounter_recv,
         from_share_accounter_to_jdc_send,
         recv_from_pool,
         send_to_pool,
-        ).await;
+    )
+    .await;
 }

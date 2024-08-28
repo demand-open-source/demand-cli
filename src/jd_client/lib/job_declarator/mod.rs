@@ -69,7 +69,6 @@ pub struct JobDeclarator {
         BuildNoHashHasher<u64>,
     >,
     up: Arc<Mutex<Upstream>>,
-    task_collector: Arc<Mutex<Vec<AbortHandle>>>,
     pub coinbase_tx_prefix: B064K<'static>,
     pub coinbase_tx_suffix: B064K<'static>,
 }
@@ -80,7 +79,6 @@ impl JobDeclarator {
         _authority_public_key: [u8; 32],
         config: ProxyConfig,
         up: Arc<Mutex<Upstream>>,
-        task_collector: Arc<Mutex<Vec<AbortHandle>>>,
     ) -> Result<Arc<Mutex<Self>>, Error<'static>> {
         let stream = tokio::net::TcpStream::connect(address).await?;
         //let initiator = Initiator::from_raw_k(authority_public_key)?;
@@ -117,7 +115,6 @@ impl JobDeclarator {
             last_set_new_prev_hash: None,
             future_jobs: HashMap::with_hasher(BuildNoHashHasher::default()),
             up,
-            task_collector,
             coinbase_tx_prefix: vec![].try_into().unwrap(),
             coinbase_tx_suffix: vec![].try_into().unwrap(),
             set_new_prev_hash_counter: 0,
@@ -164,19 +161,13 @@ impl JobDeclarator {
         match token_len {
             0 => {
                 {
+                    // TODO TODO TODO
                     let task = {
                         let self_mutex = self_mutex.clone();
                         tokio::task::spawn(async move {
                             Self::allocate_tokens(&self_mutex, 2).await;
                         })
                     };
-                    self_mutex
-                        .safe_lock(|s| {
-                            s.task_collector
-                                .safe_lock(|c| c.push(task.abort_handle()))
-                                .unwrap()
-                        })
-                        .unwrap();
                 }
 
                 // we wait for token allocation to avoid infinite recursion
@@ -189,19 +180,13 @@ impl JobDeclarator {
             }
             1 => {
                 {
+                    // TODO TODO TODO
                     let task = {
                         let self_mutex = self_mutex.clone();
                         tokio::task::spawn(async move {
                             Self::allocate_tokens(&self_mutex, 1).await;
                         })
                     };
-                    self_mutex
-                        .safe_lock(|s| {
-                            s.task_collector
-                                .safe_lock(|c| c.push(task.abort_handle()))
-                                .unwrap()
-                        })
-                        .unwrap();
                 }
                 // There is a token, unwrap is safe
                 self_mutex
@@ -270,6 +255,7 @@ impl JobDeclarator {
         mut receiver: TReceiver<StandardEitherFrame<PoolMessages<'static>>>,
     ) {
         let up = self_mutex.safe_lock(|s| s.up.clone()).unwrap();
+        // TODO TODO TODO
         let main_task = {
             let self_mutex = self_mutex.clone();
             tokio::task::spawn(async move {
@@ -360,13 +346,6 @@ impl JobDeclarator {
                 }
             })
         };
-        self_mutex
-            .safe_lock(|s| {
-                s.task_collector
-                    .safe_lock(|c| c.push(main_task.abort_handle()))
-                    .unwrap()
-            })
-            .unwrap();
     }
 
     pub fn on_set_new_prev_hash(

@@ -44,10 +44,7 @@ impl TaskManager {
         self.abort.take()
     }
 
-    pub async fn add_relay_up(
-        self_: Arc<Mutex<Self>>,
-        abortable: AbortOnDrop,
-    ) -> Result<(), ()> {
+    pub async fn add_relay_up(self_: Arc<Mutex<Self>>, abortable: AbortOnDrop) -> Result<(), ()> {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
             .send(Task::RelayUp(abortable))

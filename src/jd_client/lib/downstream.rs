@@ -1,8 +1,4 @@
-use super::{
-    job_declarator::JobDeclarator,
-    status::{self, State},
-    upstream_sv2::Upstream as UpstreamMiningNode,
-};
+use super::{job_declarator::JobDeclarator, upstream_sv2::Upstream as UpstreamMiningNode};
 use async_channel::SendError;
 use roles_logic_sv2::{
     channel_logic::channel_factory::{OnNewShare, PoolChannelFactory, Share},
@@ -40,8 +36,6 @@ pub struct DownstreamMiningNode {
     pub prev_job_id: Option<u32>,
     solution_sender: TSender<SubmitSolution<'static>>,
     withhold: bool,
-    task_collector: Arc<Mutex<Vec<AbortHandle>>>,
-    tx_status: status::Sender,
     miner_coinbase_output: Vec<TxOut>,
     // used to retreive the job id of the share that we send upstream
     last_template_id: u64,
@@ -118,8 +112,6 @@ impl DownstreamMiningNode {
         upstream: Option<Arc<Mutex<UpstreamMiningNode>>>,
         solution_sender: TSender<SubmitSolution<'static>>,
         withhold: bool,
-        task_collector: Arc<Mutex<Vec<AbortHandle>>>,
-        tx_status: status::Sender,
         miner_coinbase_output: Vec<TxOut>,
         jd: Option<Arc<Mutex<JobDeclarator>>>,
     ) -> Self {
@@ -133,8 +125,6 @@ impl DownstreamMiningNode {
             prev_job_id: None,
             solution_sender,
             withhold,
-            task_collector,
-            tx_status,
             miner_coinbase_output,
             // set it to an arbitrary value cause when we use it we always updated it.
             // Is used before sending the share to upstream in the main loop when we have a share.
@@ -146,18 +136,13 @@ impl DownstreamMiningNode {
 
     /// Strat listen for downstream mining node. Return as soon as one downstream connect.
     pub fn start(self_mutex: Arc<Mutex<Self>>, mut receiver: TReceiver<Mining<'static>>) {
+        // TODO TODO TODO
         task::spawn(async move {
             DownstreamMiningNode::set_channel_factory(self_mutex.clone());
 
             while let Some(message) = receiver.recv().await {
                 DownstreamMiningNode::next(&self_mutex, message).await;
             }
-            let tx_status = self_mutex.safe_lock(|s| s.tx_status.clone()).unwrap();
-            let err = Error::DownstreamDown;
-            let status = status::Status {
-                state: State::DownstreamShutdown(err.into()),
-            };
-            tx_status.send(status).await.unwrap();
         });
     }
 
@@ -171,6 +156,7 @@ impl DownstreamMiningNode {
                 .unwrap();
             let recv_factory = {
                 let self_mutex = self_mutex.clone();
+                // TODO TODO TODO
                 tokio::task::spawn(async move {
                     let factory = UpstreamMiningNode::take_channel_factory(upstream).await;
                     self_mutex
@@ -180,13 +166,6 @@ impl DownstreamMiningNode {
                         .unwrap();
                 })
             };
-            self_mutex
-                .safe_lock(|s| {
-                    s.task_collector
-                        .safe_lock(|c| c.push(recv_factory.abort_handle()))
-                        .unwrap()
-                })
-                .unwrap();
         }
     }
 

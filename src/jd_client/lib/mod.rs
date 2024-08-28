@@ -4,7 +4,6 @@ pub mod job_declarator;
 pub mod proxy_config;
 pub mod template_receiver;
 pub mod upstream_sv2;
-pub use crate::status;
 
 use std::{sync::atomic::AtomicBool, time::Duration};
 
@@ -44,20 +43,6 @@ impl PoolChangerTrigger {
             timeout,
             task: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn start(&mut self, sender: status::Sender) {
-        let timeout = self.timeout;
-        let task = tokio::task::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            let _ = sender
-                .send(status::Status {
-                    state: status::State::UpstreamRogue,
-                })
-                .await;
-        });
-        self.task = Some(task);
     }
 
     pub fn stop(&mut self) {

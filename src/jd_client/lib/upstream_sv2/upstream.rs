@@ -1,12 +1,8 @@
-use super::super::downstream::DownstreamMiningNode as Downstream;
+use super::super::error::Error::PoisonLock;
+use crate::jd_client::lib::error::ProxyResult;
 
-use super::super::{
-    error::{
-        Error::{PoisonLock, UpstreamIncoming},
-        ProxyResult,
-    },
-    status, PoolChangerTrigger,
-};
+use super::super::{downstream::DownstreamMiningNode as Downstream, PoolChangerTrigger};
+
 use binary_sv2::{Seq0255, U256};
 use roles_logic_sv2::{
     channel_logic::channel_factory::PoolChannelFactory,
@@ -15,7 +11,7 @@ use roles_logic_sv2::{
     handlers::mining::{ParseUpstreamMiningMessages, SendTo},
     job_declaration_sv2::DeclareMiningJob,
     mining_sv2::{ExtendedExtranonce, Extranonce, SetCustomMiningJob},
-    parsers::{Mining, PoolMessages},
+    parsers::Mining,
     routing_logic::{MiningRoutingLogic, NoRouting},
     selectors::NullDownstreamMiningSelector,
     utils::{Id, Mutex},
@@ -23,7 +19,7 @@ use roles_logic_sv2::{
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tokio::{task, task::AbortHandle};
+use tokio::task;
 use tracing::{error, info, warn};
 
 use std::collections::VecDeque;
@@ -98,7 +94,6 @@ pub struct Upstream {
     channel_id: Option<u32>,
     /// This allows the upstream threads to be able to communicate back to the main thread its
     /// current status.
-    tx_status: status::Sender,
     /// Minimum `extranonce2` size. Initially requested in the `jdc-config.toml`, and ultimately
     /// set by the SV2 Upstream via the SV2 `OpenExtendedMiningChannelSuccess` message.
     pub min_extranonce_size: u16,
@@ -110,7 +105,6 @@ pub struct Upstream {
     /// Sends messages to the SV2 Upstream role
     pub sender: TSender<Mining<'static>>,
     pub downstream: Option<Arc<Mutex<Downstream>>>,
-    task_collector: Arc<Mutex<Vec<AbortHandle>>>,
     #[allow(dead_code)]
     pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
     channel_factory: Option<PoolChannelFactory>,
@@ -142,8 +136,6 @@ impl Upstream {
     pub async fn new(
         min_extranonce_size: u16,
         pool_signature: String,
-        tx_status: status::Sender,
-        task_collector: Arc<Mutex<Vec<AbortHandle>>>,
         pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
         sender: TSender<Mining<'static>>,
     ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
@@ -152,10 +144,8 @@ impl Upstream {
             min_extranonce_size,
             upstream_extranonce1_size: 16, // 16 is the default since that is the only value the pool supports currently
             pool_signature,
-            tx_status,
             sender,
             downstream: None,
-            task_collector,
             pool_chaneger_trigger,
             channel_factory: None,
             template_to_job_id: TemplateToJobId::new(),
@@ -226,10 +216,7 @@ impl Upstream {
         self_: Arc<Mutex<Self>>,
         mut recv: TReceiver<Mining<'static>>,
     ) -> ProxyResult<'static, ()> {
-        let tx_status = self_
-            .safe_lock(|s| s.tx_status.clone())
-            .map_err(|_| PoisonLock)?;
-
+        // TODO TODO TODO
         let main_task = {
             let self_ = self_.clone();
             task::spawn(async move {
@@ -258,30 +245,12 @@ impl Upstream {
                         Ok(SendTo::None(_)) => (),
                         Ok(_) => unreachable!(),
                         Err(e) => {
-                            let status = status::Status {
-                                state: status::State::UpstreamShutdown(UpstreamIncoming(e)),
-                            };
-                            error!(
-                                "TERMINATING: Error handling pool role message: {:?}",
-                                status
-                            );
-                            if let Err(e) = tx_status.send(status).await {
-                                error!("Status channel down: {:?}", e);
-                            }
-
-                            break;
+                            // TODO TODO TODO
                         }
                     }
                 }
             })
         };
-        self_
-            .safe_lock(|s| {
-                s.task_collector
-                    .safe_lock(|c| c.push(main_task.abort_handle()))
-                    .unwrap()
-            })
-            .unwrap();
         Ok(())
     }
 

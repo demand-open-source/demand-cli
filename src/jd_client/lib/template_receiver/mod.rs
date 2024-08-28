@@ -1,8 +1,7 @@
-use super::{job_declarator::JobDeclarator, status, PoolChangerTrigger};
+use super::{job_declarator::JobDeclarator, PoolChangerTrigger};
 use bitcoin::{consensus::Encodable, TxOut};
 use codec_sv2::{HandshakeRole, Initiator, StandardEitherFrame, StandardSv2Frame};
 use demand_sv2_connection::noise_connection_tokio::Connection;
-use error_handling::handle_result;
 use key_utils::Secp256k1PublicKey;
 use roles_logic_sv2::{
     handlers::{template_distribution::ParseServerTemplateDistributionMessages, SendTo_},
@@ -16,7 +15,6 @@ use roles_logic_sv2::{
 use setup_connection::SetupConnectionHandler;
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tokio::task::AbortHandle;
 use tracing::{error, info, warn};
 
 mod message_handler;
@@ -31,10 +29,8 @@ pub struct TemplateRx {
     sender: TSender<EitherFrame>,
     /// Allows the tp recv to communicate back to the main thread any status updates
     /// that would interest the main thread for error handling
-    tx_status: status::Sender,
     jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
     down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
-    task_collector: Arc<Mutex<Vec<AbortHandle>>>,
     new_template_message: Option<NewTemplate<'static>>,
     pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
     miner_coinbase_output: Vec<u8>,
@@ -46,10 +42,8 @@ impl TemplateRx {
     pub async fn connect(
         address: SocketAddr,
         solution_receiver: TReceiver<SubmitSolution<'static>>,
-        tx_status: status::Sender,
         jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
         down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
-        task_collector: Arc<Mutex<Vec<AbortHandle>>>,
         pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
         miner_coinbase_outputs: Vec<TxOut>,
         authority_public_key: Option<Secp256k1PublicKey>,
@@ -88,20 +82,16 @@ impl TemplateRx {
 
         let self_mutex = Arc::new(Mutex::new(Self {
             sender: sender.clone(),
-            tx_status,
             jd,
             down,
-            task_collector: task_collector.clone(),
             new_template_message: None,
             pool_chaneger_trigger,
             miner_coinbase_output: encoded_outputs,
             test_only_do_not_send_solution_to_tp,
         }));
 
+        // TODO TODO TODO
         let task = tokio::task::spawn(Self::on_new_solution(self_mutex.clone(), solution_receiver));
-        task_collector
-            .safe_lock(|c| c.push(task.abort_handle()))
-            .unwrap();
         Self::start_templates(self_mutex, receiver);
     }
 
@@ -157,12 +147,12 @@ impl TemplateRx {
     pub fn start_templates(self_mutex: Arc<Mutex<Self>>, mut receiver: TReceiver<EitherFrame>) {
         let jd = self_mutex.safe_lock(|s| s.jd.clone()).unwrap();
         let down = self_mutex.safe_lock(|s| s.down.clone()).unwrap();
-        let tx_status = self_mutex.safe_lock(|s| s.tx_status.clone()).unwrap();
         let mut coinbase_output_max_additional_size_sent = false;
         let mut last_token = None;
         let miner_coinbase_output = self_mutex
             .safe_lock(|s| s.miner_coinbase_output.clone())
             .unwrap();
+        // TODO TODO TODO
         let main_task = {
             let self_mutex = self_mutex.clone();
             tokio::task::spawn(async move {
@@ -186,125 +176,125 @@ impl TemplateRx {
                     }
 
                     let received = receiver.recv().await.expect("TP down");
-                    let mut frame: StdFrame =
-                        handle_result!(tx_status.clone(), received.try_into());
-                    let message_type = frame.get_header().unwrap().msg_type();
-                    let payload = frame.payload();
+                    //let mut frame: StdFrame =
+                    //    handle_result!(tx_status.clone(), received.try_into());
+                    let frame: Result<StdFrame, _> = received.try_into();
+                    if let Ok(mut frame) = frame {
+                        let message_type = frame.get_header().unwrap().msg_type();
+                        let payload = frame.payload();
 
-                    let next_message_to_send =
-                        ParseServerTemplateDistributionMessages::handle_message_template_distribution(
-                            self_mutex.clone(),
-                            message_type,
-                            payload,
-                        );
-                    match next_message_to_send {
-                        Ok(SendTo::None(m)) => {
-                            match m {
-                                // Send the new template along with the token to the JD so that JD can
-                                // declare the mining job
-                                Some(TemplateDistribution::NewTemplate(m)) => {
-                                    // See coment on the definition of the global for memory
-                                    // ordering
-                                    super::IS_NEW_TEMPLATE_HANDLED
-                                        .store(false, std::sync::atomic::Ordering::Release);
-                                    Self::send_tx_data_request(&self_mutex, m.clone()).await;
-                                    self_mutex
-                                        .safe_lock(|t| t.new_template_message = Some(m.clone()))
-                                        .unwrap();
-                                    let token = last_token.clone().unwrap();
-                                    let pool_output = token.coinbase_output.to_vec();
-                                    super::downstream::DownstreamMiningNode::on_new_template(
-                                        &down,
-                                        m.clone(),
-                                        &pool_output[..],
-                                    )
-                                    .await
-                                    .unwrap();
-                                }
-                                Some(TemplateDistribution::SetNewPrevHash(m)) => {
-                                    info!("Received SetNewPrevHash, waiting for IS_NEW_TEMPLATE_HANDLED");
-                                    // See coment on the definition of the global for memory
-                                    // ordering
-                                    while !super::IS_NEW_TEMPLATE_HANDLED
-                                        .load(std::sync::atomic::Ordering::Acquire)
-                                    {
-                                        tokio::task::yield_now().await;
-                                    }
-                                    info!("IS_NEW_TEMPLATE_HANDLED ok");
-                                    if let Some(jd) = jd.as_ref() {
-                                        super::job_declarator::JobDeclarator::on_set_new_prev_hash(
-                                            jd.clone(),
+                        let next_message_to_send =
+                            ParseServerTemplateDistributionMessages::handle_message_template_distribution(
+                                self_mutex.clone(),
+                                message_type,
+                                payload,
+                            );
+                        match next_message_to_send {
+                            Ok(SendTo::None(m)) => {
+                                match m {
+                                    // Send the new template along with the token to the JD so that JD can
+                                    // declare the mining job
+                                    Some(TemplateDistribution::NewTemplate(m)) => {
+                                        // See coment on the definition of the global for memory
+                                        // ordering
+                                        super::IS_NEW_TEMPLATE_HANDLED
+                                            .store(false, std::sync::atomic::Ordering::Release);
+                                        Self::send_tx_data_request(&self_mutex, m.clone()).await;
+                                        self_mutex
+                                            .safe_lock(|t| t.new_template_message = Some(m.clone()))
+                                            .unwrap();
+                                        let token = last_token.clone().unwrap();
+                                        let pool_output = token.coinbase_output.to_vec();
+                                        super::downstream::DownstreamMiningNode::on_new_template(
+                                            &down,
                                             m.clone(),
-                                        );
-                                    }
-                                    super::downstream::DownstreamMiningNode::on_set_new_prev_hash(
-                                        &down, m,
-                                    )
-                                    .await
-                                    .unwrap();
-                                }
-
-                                Some(TemplateDistribution::RequestTransactionDataSuccess(m)) => {
-                                    // safe to unwrap because this message is received after the new
-                                    // template message
-                                    let transactions_data = m.transaction_list;
-                                    let excess_data = m.excess_data;
-                                    let m = self_mutex
-                                        .safe_lock(|t| t.new_template_message.clone())
-                                        .unwrap()
-                                        .unwrap();
-                                    let token = last_token.unwrap();
-                                    last_token = None;
-                                    let mining_token = token.mining_job_token.to_vec();
-                                    let pool_coinbase_out = token.coinbase_output.to_vec();
-                                    if let Some(jd) = jd.as_ref() {
-                                        super::job_declarator::JobDeclarator::on_new_template(
-                                            jd,
-                                            m.clone(),
-                                            mining_token,
-                                            transactions_data,
-                                            excess_data,
-                                            pool_coinbase_out,
+                                            &pool_output[..],
                                         )
-                                        .await;
+                                        .await
+                                        .unwrap();
                                     }
-                                }
-                                Some(TemplateDistribution::RequestTransactionDataError(_)) => {
-                                    warn!("The prev_hash of the template requested to Template Provider no longer points to the latest tip. Continuing work on the updated template.")
-                                }
-                                _ => {
-                                    error!("{:?}", frame);
-                                    error!("{:?}", frame.payload());
-                                    error!("{:?}", frame.get_header());
-                                    std::process::exit(1);
+                                    Some(TemplateDistribution::SetNewPrevHash(m)) => {
+                                        info!("Received SetNewPrevHash, waiting for IS_NEW_TEMPLATE_HANDLED");
+                                        // See coment on the definition of the global for memory
+                                        // ordering
+                                        while !super::IS_NEW_TEMPLATE_HANDLED
+                                            .load(std::sync::atomic::Ordering::Acquire)
+                                        {
+                                            tokio::task::yield_now().await;
+                                        }
+                                        info!("IS_NEW_TEMPLATE_HANDLED ok");
+                                        if let Some(jd) = jd.as_ref() {
+                                            super::job_declarator::JobDeclarator::on_set_new_prev_hash(
+                                                jd.clone(),
+                                                m.clone(),
+                                            );
+                                        }
+                                        super::downstream::DownstreamMiningNode::on_set_new_prev_hash(
+                                            &down, m,
+                                        )
+                                        .await
+                                        .unwrap();
+                                    }
+
+                                    Some(TemplateDistribution::RequestTransactionDataSuccess(
+                                        m,
+                                    )) => {
+                                        // safe to unwrap because this message is received after the new
+                                        // template message
+                                        let transactions_data = m.transaction_list;
+                                        let excess_data = m.excess_data;
+                                        let m = self_mutex
+                                            .safe_lock(|t| t.new_template_message.clone())
+                                            .unwrap()
+                                            .unwrap();
+                                        let token = last_token.unwrap();
+                                        last_token = None;
+                                        let mining_token = token.mining_job_token.to_vec();
+                                        let pool_coinbase_out = token.coinbase_output.to_vec();
+                                        if let Some(jd) = jd.as_ref() {
+                                            super::job_declarator::JobDeclarator::on_new_template(
+                                                jd,
+                                                m.clone(),
+                                                mining_token,
+                                                transactions_data,
+                                                excess_data,
+                                                pool_coinbase_out,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Some(TemplateDistribution::RequestTransactionDataError(_)) => {
+                                        warn!("The prev_hash of the template requested to Template Provider no longer points to the latest tip. Continuing work on the updated template.")
+                                    }
+                                    _ => {
+                                        error!("{:?}", frame);
+                                        error!("{:?}", frame.payload());
+                                        error!("{:?}", frame.get_header());
+                                        std::process::exit(1);
+                                    }
                                 }
                             }
+                            Ok(m) => {
+                                error!("{:?}", m);
+                                error!("{:?}", frame);
+                                error!("{:?}", frame.payload());
+                                error!("{:?}", frame.get_header());
+                                std::process::exit(1);
+                            }
+                            Err(e) => {
+                                error!("{:?}", e);
+                                error!("{:?}", frame);
+                                error!("{:?}", frame.payload());
+                                error!("{:?}", frame.get_header());
+                                std::process::exit(1);
+                            }
                         }
-                        Ok(m) => {
-                            error!("{:?}", m);
-                            error!("{:?}", frame);
-                            error!("{:?}", frame.payload());
-                            error!("{:?}", frame.get_header());
-                            std::process::exit(1);
-                        }
-                        Err(e) => {
-                            error!("{:?}", e);
-                            error!("{:?}", frame);
-                            error!("{:?}", frame.payload());
-                            error!("{:?}", frame.get_header());
-                            std::process::exit(1);
-                        }
+                    } else {
+                        // TODO TODO TODO
                     }
                 }
             })
         };
-        self_mutex
-            .safe_lock(|s| {
-                s.task_collector
-                    .safe_lock(|c| c.push(main_task.abort_handle()))
-                    .unwrap()
-            })
-            .unwrap();
     }
 
     async fn on_new_solution(self_: Arc<Mutex<Self>>, mut rx: TReceiver<SubmitSolution<'static>>) {

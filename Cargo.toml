@@ -36,7 +36,6 @@ rpc_sv2 = "1.0.0"
 tracing = { version = "0.1" }
 tokio = {version="^1.36.0",features = ["full","tracing"]}
 framing_sv2 = "^2.0.0"
-error_handling = "1.0.0"
 demand-share-accounting-ext = "0.0.6"
 #demand-share-accounting-ext = { version = "0.0.6", path = "../demand-share-accounting-ext"}
 

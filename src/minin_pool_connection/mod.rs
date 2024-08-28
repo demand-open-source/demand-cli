@@ -3,6 +3,7 @@ mod task_manager;
 use std::net::SocketAddr;
 
 use codec_sv2::{HandshakeRole, StandardEitherFrame, StandardSv2Frame};
+use demand_share_accounting_ext::parser::PoolExtMessages;
 use demand_sv2_connection::noise_connection_tokio::Connection;
 use key_utils::Secp256k1PublicKey;
 use noise_sv2::Initiator;
@@ -14,7 +15,6 @@ use roles_logic_sv2::{
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error, info};
-use demand_share_accounting_ext::parser::PoolExtMessages;
 
 use crate::shared::utils::AbortOnDrop;
 use task_manager::TaskManager;
@@ -96,7 +96,10 @@ pub async fn connect_pool(
     }
 }
 
-fn relay_up(mut recv: Receiver<PoolExtMessages<'static>>, send: Sender<EitherFrame>) -> AbortOnDrop {
+fn relay_up(
+    mut recv: Receiver<PoolExtMessages<'static>>,
+    send: Sender<EitherFrame>,
+) -> AbortOnDrop {
     let task = tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
             let std_frame: Result<StdFrame, _> = msg.try_into();
@@ -114,7 +117,10 @@ fn relay_up(mut recv: Receiver<PoolExtMessages<'static>>, send: Sender<EitherFra
     task.into()
 }
 
-fn relay_down(mut recv: Receiver<EitherFrame>, send: Sender<PoolExtMessages<'static>>) -> AbortOnDrop {
+fn relay_down(
+    mut recv: Receiver<EitherFrame>,
+    send: Sender<PoolExtMessages<'static>>,
+) -> AbortOnDrop {
     let task = tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
             let msg: Result<StdFrame, ()> = msg.try_into().map_err(|_| ());
@@ -123,7 +129,8 @@ fn relay_down(mut recv: Receiver<EitherFrame>, send: Sender<PoolExtMessages<'sta
                     let message_type = header.msg_type();
                     let payload = msg.payload();
                     let extension = header.ext_type();
-                    let msg: Result<PoolExtMessages<'_>, _> = (extension,message_type, payload).try_into();
+                    let msg: Result<PoolExtMessages<'_>, _> =
+                        (extension, message_type, payload).try_into();
                     if let Ok(msg) = msg {
                         let msg = msg.into_static();
                         if send.send(msg).await.is_err() {
