@@ -12,7 +12,7 @@ use roles_logic_sv2::{
     template_distribution_sv2::SetNewPrevHash,
     utils::{hash_lists_tuple, Mutex},
 };
-use std::{collections::HashMap, convert::TryInto, str::FromStr};
+use std::{collections::HashMap, convert::TryInto};
 use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
 use tracing::{error, info};
@@ -25,10 +25,7 @@ use roles_logic_sv2::{
     template_distribution_sv2::NewTemplate,
     utils::Id,
 };
-use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 pub type Message = PoolMessages<'static>;
 pub type SendTo = SendTo_<JobDeclaration<'static>, ()>;
@@ -39,7 +36,7 @@ use setup_connection::SetupConnectionHandler;
 
 use crate::shared::utils::AbortOnDrop;
 
-use super::{error::Error, mining_upstream::Upstream, proxy_config::ProxyConfig};
+use super::{error::Error, mining_upstream::Upstream};
 
 #[derive(Debug, Clone)]
 pub struct LastDeclareJob {
@@ -80,35 +77,23 @@ pub struct JobDeclarator {
 impl JobDeclarator {
     pub async fn new(
         address: SocketAddr,
-        _authority_public_key: [u8; 32],
-        config: ProxyConfig,
+        authority_public_key: [u8; 32],
         up: Arc<Mutex<Upstream>>,
     ) -> Result<(Arc<Mutex<Self>>, AbortOnDrop), Error<'static>> {
         let stream = tokio::net::TcpStream::connect(address).await?;
-        //let initiator = Initiator::from_raw_k(authority_public_key)?;
-        let initiator = Initiator::new(None);
+        let initiator = Initiator::from_raw_k(authority_public_key)?;
         let (mut receiver, mut sender, _, _) =
             Connection::new(stream, HandshakeRole::Initiator(initiator))
                 .await
                 .expect("impossible to connect");
 
-        let proxy_address = SocketAddr::new(
-            IpAddr::from_str(&config.downstream_address).unwrap(),
-            config.downstream_port,
-        );
-
-        info!(
-            "JD proxy: setupconnection Proxy address: {:?}",
-            proxy_address
-        );
-
-        SetupConnectionHandler::setup(&mut receiver, &mut sender, proxy_address)
+        SetupConnectionHandler::setup(&mut receiver, &mut sender, address)
             .await
             .unwrap();
 
         info!("JD CONNECTED");
 
-        let min_extranonce_size = config.min_extranonce2_size;
+        let min_extranonce_size = crate::MIN_EXTRANONCE_SIZE;
 
         let task_manager = TaskManager::initialize();
         let abortable = task_manager

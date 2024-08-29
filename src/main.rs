@@ -2,7 +2,6 @@ use jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-
 use key_utils::Secp256k1PublicKey;
 //use std::time::Duration;
 //use key_utils::Secp256k1PublicKey;
@@ -27,8 +26,9 @@ const CHANNEL_DIFF_UPDTATE_INTERVAL: u32 = 10;
 const MIN_SV1_DOWSNTREAM_HASHRATE: f32 = 1_000_000.0;
 const POOL_SIGNATURE: &str = "DEMAND";
 const MAX_LEN_DOWN_MSG: u32 = 10000;
-const POOL_ADDRESS: &str = "mining.dmnd.work:1000";
+const POOL_ADDRESS: &str = "mining.dmnd.work:2000";
 const AUTH_PUB_KEY: &str = "9bQHWXsQ2J9TRFTaxRh3KjoxdyLRfWVEy25YHtKF8y8gotLoCZZ";
+const TP_ADDRESS: &str = "127.0.0.1:8432";
 
 lazy_static! {
     static ref SV1_DOWN_LISTEN_ADDR: String = std::env::var("SV1_DOWN_LISTEN_ADDR")

@@ -4,13 +4,12 @@ mod error;
 mod job_declarator;
 pub mod mining_downstream;
 mod mining_upstream;
-mod proxy_config;
 mod task_manager;
 mod template_receiver;
 
 use job_declarator::JobDeclarator;
+use key_utils::Secp256k1PublicKey;
 use mining_downstream::DownstreamMiningNode;
-use proxy_config::ProxyConfig;
 use std::sync::atomic::AtomicBool;
 use task_manager::TaskManager;
 use template_receiver::TemplateRx;
@@ -63,18 +62,9 @@ pub async fn start(
 
     let upstream_index = 0;
 
-    let proxy_config = ProxyConfig::default();
-    let abortable = initialize_jd(
-        proxy_config.upstreams.get(upstream_index).unwrap().clone(),
-        receiver,
-        sender,
-        up_receiver,
-        up_sender,
-    )
-    .await;
+    let abortable = initialize_jd(receiver, sender, up_receiver, up_sender).await;
 }
 async fn initialize_jd(
-    upstream_config: proxy_config::Upstream,
     receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
     sender: tokio::sync::mpsc::Sender<Mining<'static>>,
     up_receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
@@ -85,10 +75,7 @@ async fn initialize_jd(
         .safe_lock(|t| t.get_aborter())
         .unwrap()
         .unwrap();
-    let proxy_config = ProxyConfig::default();
-    let test_only_do_not_send_solution_to_tp = proxy_config
-        .test_only_do_not_send_solution_to_tp
-        .unwrap_or(false);
+    let test_only_do_not_send_solution_to_tp = false;
 
     // When Downstream receive a share that meets bitcoin target it transformit in a
     // SubmitSolution and send it to the TemplateReceiver
@@ -97,7 +84,7 @@ async fn initialize_jd(
     // Instantiate a new `Upstream` (SV2 Pool)
     let upstream = match mining_upstream::Upstream::new(
         0, // TODO
-        upstream_config.pool_signature.clone(),
+        crate::POOL_SIGNATURE.to_string(),
         up_sender,
     )
     .await
@@ -123,20 +110,18 @@ async fn initialize_jd(
         .unwrap();
 
     // Initialize JD part
-    let mut parts = proxy_config.tp_address.split(':');
+    let mut parts = crate::TP_ADDRESS.split(':');
     let ip_tp = parts.next().unwrap().to_string();
     let port_tp = parts.next().unwrap().parse::<u16>().unwrap();
 
+    let auth_pub_k: Secp256k1PublicKey = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let (jd, jd_abortable) = match JobDeclarator::new(
-        upstream_config
-            .jd_address
-            .clone()
+        crate::POOL_ADDRESS
             .to_socket_addrs()
             .unwrap()
             .next()
             .unwrap(),
-        upstream_config.authority_pubkey.into_bytes(),
-        proxy_config.clone(),
+        auth_pub_k.into_bytes(),
         upstream.clone(),
     )
     .await
@@ -155,7 +140,7 @@ async fn initialize_jd(
         sender,
         Some(upstream.clone()),
         send_solution,
-        proxy_config.withhold,
+        false,
         vec![],
         Some(jd.clone()),
     )));
@@ -170,7 +155,7 @@ async fn initialize_jd(
         Some(jd.clone()),
         donwstream,
         vec![],
-        proxy_config.tp_authority_public_key,
+        None,
         test_only_do_not_send_solution_to_tp,
     )
     .await;
