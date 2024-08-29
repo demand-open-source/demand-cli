@@ -1,7 +1,6 @@
-use super::super::error::Error::PoisonLock;
-use crate::jd_client::lib::error::ProxyResult;
+use crate::jd_client::error::ProxyResult;
 
-use super::super::{downstream::DownstreamMiningNode as Downstream, PoolChangerTrigger};
+use crate::jd_client::{downstream::DownstreamMiningNode as Downstream, PoolChangerTrigger};
 
 use binary_sv2::{Seq0255, U256};
 use roles_logic_sv2::{
@@ -119,7 +118,8 @@ impl Upstream {
     ) -> ProxyResult<'static, ()> {
         let sender = self_
             .safe_lock(|s| s.sender.clone())
-            .map_err(|_| PoisonLock)?;
+            // TODO TODO TODO
+            .unwrap();
         sender.send(message).await.map_err(|e| {
             super::super::error::Error::ChannelErrorSender(
                 super::super::error::ChannelSendError::General(e.to_string()),
