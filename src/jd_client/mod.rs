@@ -41,7 +41,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 use std::net::ToSocketAddrs;
@@ -61,54 +60,8 @@ pub async fn start(
     let upstream_index = 0;
 
     let proxy_config = ProxyConfig::default();
-
-    if let Some(upstream) = proxy_config.upstreams.get(upstream_index) {
-        let initialize = initialize_jd(upstream.clone(), receiver, sender, up_receiver, up_sender);
-        tokio::task::spawn(initialize);
-    } else {
-        let initialize = initialize_jd_as_solo_miner(receiver, sender);
-        tokio::task::spawn(initialize);
-    }
+    initialize_jd(proxy_config.upstreams.get(upstream_index).unwrap().clone(), receiver, sender, up_receiver, up_sender).await;
 }
-async fn initialize_jd_as_solo_miner(
-    receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
-    sender: tokio::sync::mpsc::Sender<Mining<'static>>,
-) {
-    let proxy_config = ProxyConfig::default();
-    let miner_tx_out =
-        proxy_config::get_coinbase_output(std::env::var("ADDRESS").unwrap().as_str()).unwrap();
-
-    // When Downstream receive a share that meets bitcoin target it transformit in a
-    // SubmitSolution and send it to the TemplateReceiver
-    let (send_solution, recv_solution) = tokio::sync::mpsc::channel(10);
-
-    let donwstream = Arc::new(Mutex::new(downstream::DownstreamMiningNode::new(
-        sender,
-        None,
-        send_solution,
-        proxy_config.withhold,
-        miner_tx_out.clone(),
-        None,
-    )));
-    DownstreamMiningNode::start(donwstream.clone(), receiver);
-
-    // Initialize JD part
-    let mut parts = proxy_config.tp_address.split(':');
-    let ip_tp = parts.next().unwrap().to_string();
-    let port_tp = parts.next().unwrap().parse::<u16>().unwrap();
-
-    TemplateRx::connect(
-        SocketAddr::new(IpAddr::from_str(ip_tp.as_str()).unwrap(), port_tp),
-        recv_solution,
-        None,
-        donwstream,
-        miner_tx_out.clone(),
-        proxy_config.tp_authority_public_key,
-        false,
-    )
-    .await;
-}
-
 async fn initialize_jd(
     upstream_config: proxy_config::Upstream,
     receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
