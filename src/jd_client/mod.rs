@@ -54,15 +54,12 @@ pub async fn start(
     sender: tokio::sync::mpsc::Sender<Mining<'static>>,
     up_receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
     up_sender: tokio::sync::mpsc::Sender<Mining<'static>>,
-) {
+) -> AbortOnDrop {
     if std::env::var("ADDRESS").is_err() {
         error!("ADDRESS env variable not set");
         std::process::exit(1);
     }
-
-    let upstream_index = 0;
-
-    let abortable = initialize_jd(receiver, sender, up_receiver, up_sender).await;
+    initialize_jd(receiver, sender, up_receiver, up_sender).await
 }
 async fn initialize_jd(
     receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,

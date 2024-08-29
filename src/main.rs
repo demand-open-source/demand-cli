@@ -3,11 +3,10 @@ use jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 use key_utils::Secp256k1PublicKey;
-//use std::time::Duration;
-//use key_utils::Secp256k1PublicKey;
 use lazy_static::lazy_static;
 use std::net::ToSocketAddrs;
 use tokio::sync::mpsc::channel;
+use tracing::{error, info};
 
 mod ingress;
 pub mod jd_client;
@@ -29,10 +28,11 @@ const MAX_LEN_DOWN_MSG: u32 = 10000;
 const POOL_ADDRESS: &str = "mining.dmnd.work:2000";
 const AUTH_PUB_KEY: &str = "9bQHWXsQ2J9TRFTaxRh3KjoxdyLRfWVEy25YHtKF8y8gotLoCZZ";
 const TP_ADDRESS: &str = "127.0.0.1:8432";
+const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:32767";
 
 lazy_static! {
-    static ref SV1_DOWN_LISTEN_ADDR: String = std::env::var("SV1_DOWN_LISTEN_ADDR")
-        .expect("SV1_DOWN_LISTEN_ADDR env variable is not set");
+    static ref SV1_DOWN_LISTEN_ADDR: String =
+        std::env::var("SV1_DOWN_LISTEN_ADDR").unwrap_or(DEFAULT_LISTEN_ADDRESS.to_string());
 }
 
 #[tokio::main]
@@ -43,16 +43,16 @@ async fn main() {
         .expect("Invalid pool address")
         .next()
         .expect("Invalid pool address");
-    let (send_to_pool, recv_from_pool, _) =
+    let (send_to_pool, recv_from_pool, pool_connection_abortable) =
         minin_pool_connection::connect_pool(address, auth_pub_k, None, None)
             .await
             .expect("Impossible connect to the pool");
 
     let (downs_sv1_tx, downs_sv1_rx) = channel(10);
-    ingress::sv1_ingress::start(downs_sv1_tx).await;
+    let sv1_ingress_abortable = ingress::sv1_ingress::start(downs_sv1_tx);
 
     let (translator_up_tx, mut translator_up_rx) = channel(10);
-    let _ = translator::start(downs_sv1_rx, translator_up_tx)
+    let translator_abortable = translator::start(downs_sv1_rx, translator_up_tx)
         .await
         .expect("Impossible initialize translator");
 
@@ -62,7 +62,7 @@ async fn main() {
         .recv()
         .await
         .expect("translator failed before initialization");
-    jd_client::start(
+    let jdc_abortable = jd_client::start(
         jdc_from_translator_receiver,
         jdc_to_translator_sender,
         from_share_accounter_to_jdc_recv,
@@ -70,11 +70,42 @@ async fn main() {
     )
     .await;
 
-    let _ = share_accounter::start(
+    let share_accounter_abortable = share_accounter::start(
         from_jdc_to_share_accounter_recv,
         from_share_accounter_to_jdc_send,
         recv_from_pool,
         send_to_pool,
     )
     .await;
+    let status_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            if pool_connection_abortable.is_finished() {
+                error!("Upstream mining connnection closed");
+                break;
+            }
+            if sv1_ingress_abortable.is_finished() {
+                error!("Downtream mining socket unavailable");
+                break;
+            }
+            if translator_abortable.is_finished() {
+                error!("Translator error");
+                break;
+            }
+            if jdc_abortable.is_finished() {
+                error!("Jdc error");
+                break;
+            }
+            if share_accounter_abortable.is_finished() {
+                error!("Share accounter error");
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = status_task => (),
+        _ = tokio::signal::ctrl_c() => (),
+    }
+    info!("exiting");
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 }

@@ -187,7 +187,8 @@ pub fn get_mining_setup_connection_msg(work_selection: bool) -> SetupConnection<
         false => 0b0000_0000_0000_0000_0000_0000_0000_0100,
         true => 0b0000_0000_0000_0000_0000_0000_0000_0110,
     };
-    let address = std::env::var("ADDRESS").unwrap();
+    let address = std::env::var("ADDRESS")
+        .unwrap_or("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string());
     let device_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
     let device_id = format!("{}::SOLO::{}", device_id, address)
         .to_string()

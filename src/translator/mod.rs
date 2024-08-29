@@ -18,7 +18,6 @@ use crate::shared::utils::AbortOnDrop;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
 
 use self::upstream::diff_management::UpstreamDifficultyConfig;
-use roles_logic_sv2::parsers::PoolMessages;
 mod task_manager;
 use task_manager::TaskManager;
 

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
-use crate::shared::error::Sv1IngressError;
+use crate::shared::{error::Sv1IngressError, utils::AbortOnDrop};
 use futures::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -12,28 +12,31 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 
-pub async fn start(downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>) {
+pub fn start(downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>) -> AbortOnDrop {
     info!("starting downstream listner");
-    listen_for_downstream(downstreams).await;
+    listen_for_downstream(downstreams)
 }
 
-pub async fn listen_for_downstream(
+fn listen_for_downstream(
     downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>,
-) {
-    let down_addr: String = crate::SV1_DOWN_LISTEN_ADDR.to_string();
-    let downstream_addr: SocketAddr = down_addr.parse().expect("Invalid listen address");
-    let downstream_listener = TcpListener::bind(downstream_addr)
-        .await
-        .expect("impossible to bind downstream");
-    while let Ok((stream, addr)) = downstream_listener.accept().await {
-        info!("Try to connect {:#?}", addr);
-        Downstream::new(
-            stream,
-            crate::MAX_LEN_DOWN_MSG,
-            addr.ip(),
-            downstreams.clone(),
-        );
-    }
+) -> AbortOnDrop {
+    tokio::task::spawn(async move {
+        let down_addr: String = crate::SV1_DOWN_LISTEN_ADDR.to_string();
+        let downstream_addr: SocketAddr = down_addr.parse().expect("Invalid listen address");
+        let downstream_listener = TcpListener::bind(downstream_addr)
+            .await
+            .expect("impossible to bind downstream");
+        while let Ok((stream, addr)) = downstream_listener.accept().await {
+            info!("Try to connect {:#?}", addr);
+            Downstream::new(
+                stream,
+                crate::MAX_LEN_DOWN_MSG,
+                addr.ip(),
+                downstreams.clone(),
+            );
+        }
+    })
+    .into()
 }
 struct Downstream {}
 
