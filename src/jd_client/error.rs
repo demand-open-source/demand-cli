@@ -1,32 +1,11 @@
 use std::fmt;
 
 use bitcoin::util::uint::ParseLengthError;
-use roles_logic_sv2::mining_sv2::{ExtendedExtranonce, NewExtendedMiningJob, SetCustomMiningJob};
 
-pub type ProxyResult<'a, T> = core::result::Result<T, Error<'a>>;
-
-#[derive(Debug)]
-pub enum ChannelSendError<'a> {
-    SubmitSharesExtended(
-        async_channel::SendError<roles_logic_sv2::mining_sv2::SubmitSharesExtended<'a>>,
-    ),
-    SetNewPrevHash(async_channel::SendError<roles_logic_sv2::mining_sv2::SetNewPrevHash<'a>>),
-    NewExtendedMiningJob(async_channel::SendError<NewExtendedMiningJob<'a>>),
-    General(String),
-    Extranonce(async_channel::SendError<(ExtendedExtranonce, u32)>),
-    SetCustomMiningJob(
-        async_channel::SendError<roles_logic_sv2::mining_sv2::SetCustomMiningJob<'a>>,
-    ),
-    NewTemplate(
-        async_channel::SendError<(
-            roles_logic_sv2::template_distribution_sv2::SetNewPrevHash<'a>,
-            Vec<u8>,
-        )>,
-    ),
-}
+pub type ProxyResult<T> = core::result::Result<T, Error>;
 
 #[derive(Debug)]
-pub enum Error<'a> {
+pub enum Error {
     VecToSlice32(Vec<u8>),
     /// Errors on bad CLI argument input.
     BadCliArgs,
@@ -47,16 +26,12 @@ pub enum Error<'a> {
     SubprotocolMining(String),
     // Locking Errors
     PoisonLock,
-    // Channel Receiver Error
-    ChannelErrorReceiver(async_channel::RecvError),
     TokioChannelErrorRecv(tokio::sync::broadcast::error::RecvError),
-    // Channel Sender Errors
-    ChannelErrorSender(ChannelSendError<'a>),
     Uint256Conversion(ParseLengthError),
     Infallible(std::convert::Infallible),
 }
 
-impl<'a> fmt::Display for Error<'a> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use Error::*;
         match self {
@@ -70,9 +45,7 @@ impl<'a> fmt::Display for Error<'a> {
             SubprotocolMining(ref e) => write!(f, "Subprotocol Mining Error: `{:?}`", e),
             UpstreamIncoming(ref e) => write!(f, "Upstream parse incoming error: `{:?}`", e),
             PoisonLock => write!(f, "Poison Lock error"),
-            ChannelErrorReceiver(ref e) => write!(f, "Channel receive error: `{:?}`", e),
             TokioChannelErrorRecv(ref e) => write!(f, "Channel receive error: `{:?}`", e),
-            ChannelErrorSender(ref e) => write!(f, "Channel send error: `{:?}`", e),
             Uint256Conversion(ref e) => write!(f, "U256 Conversion Error: `{:?}`", e),
             VecToSlice32(ref e) => write!(f, "Standard Error: `{:?}`", e),
             Infallible(ref e) => write!(f, "Infallible Error:`{:?}`", e),
@@ -80,49 +53,43 @@ impl<'a> fmt::Display for Error<'a> {
     }
 }
 
-impl<'a> From<binary_sv2::Error> for Error<'a> {
+impl From<binary_sv2::Error> for Error {
     fn from(e: binary_sv2::Error) -> Self {
         Error::BinarySv2(e)
     }
 }
 
-impl<'a> From<codec_sv2::noise_sv2::Error> for Error<'a> {
+impl From<codec_sv2::noise_sv2::Error> for Error {
     fn from(e: codec_sv2::noise_sv2::Error) -> Self {
         Error::CodecNoise(e)
     }
 }
 
-impl<'a> From<framing_sv2::Error> for Error<'a> {
+impl From<framing_sv2::Error> for Error {
     fn from(e: framing_sv2::Error) -> Self {
         Error::FramingSv2(e)
     }
 }
 
-impl<'a> From<std::io::Error> for Error<'a> {
+impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)
     }
 }
 
-impl<'a> From<std::num::ParseIntError> for Error<'a> {
+impl From<std::num::ParseIntError> for Error {
     fn from(e: std::num::ParseIntError) -> Self {
         Error::ParseInt(e)
     }
 }
 
-impl<'a> From<roles_logic_sv2::errors::Error> for Error<'a> {
+impl From<roles_logic_sv2::errors::Error> for Error {
     fn from(e: roles_logic_sv2::errors::Error) -> Self {
         Error::RolesSv2Logic(e)
     }
 }
 
-impl<'a> From<async_channel::RecvError> for Error<'a> {
-    fn from(e: async_channel::RecvError) -> Self {
-        Error::ChannelErrorReceiver(e)
-    }
-}
-
-impl<'a> From<tokio::sync::broadcast::error::RecvError> for Error<'a> {
+impl From<tokio::sync::broadcast::error::RecvError> for Error {
     fn from(e: tokio::sync::broadcast::error::RecvError) -> Self {
         Error::TokioChannelErrorRecv(e)
     }
@@ -145,74 +112,19 @@ impl<'a> From<tokio::sync::broadcast::error::RecvError> for Error<'a> {
 //     }
 // }
 
-// *** CHANNEL SENDER ERRORS ***
-impl<'a> From<async_channel::SendError<roles_logic_sv2::mining_sv2::SubmitSharesExtended<'a>>>
-    for Error<'a>
-{
-    fn from(
-        e: async_channel::SendError<roles_logic_sv2::mining_sv2::SubmitSharesExtended<'a>>,
-    ) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::SubmitSharesExtended(e))
-    }
-}
-
-impl<'a> From<async_channel::SendError<roles_logic_sv2::mining_sv2::SetNewPrevHash<'a>>>
-    for Error<'a>
-{
-    fn from(e: async_channel::SendError<roles_logic_sv2::mining_sv2::SetNewPrevHash<'a>>) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::SetNewPrevHash(e))
-    }
-}
-
-impl<'a> From<async_channel::SendError<(ExtendedExtranonce, u32)>> for Error<'a> {
-    fn from(e: async_channel::SendError<(ExtendedExtranonce, u32)>) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::Extranonce(e))
-    }
-}
-
-impl<'a> From<async_channel::SendError<NewExtendedMiningJob<'a>>> for Error<'a> {
-    fn from(e: async_channel::SendError<NewExtendedMiningJob<'a>>) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::NewExtendedMiningJob(e))
-    }
-}
-
-impl<'a> From<async_channel::SendError<SetCustomMiningJob<'a>>> for Error<'a> {
-    fn from(e: async_channel::SendError<SetCustomMiningJob<'a>>) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::SetCustomMiningJob(e))
-    }
-}
-
-impl<'a>
-    From<
-        async_channel::SendError<(
-            roles_logic_sv2::template_distribution_sv2::SetNewPrevHash<'a>,
-            Vec<u8>,
-        )>,
-    > for Error<'a>
-{
-    fn from(
-        e: async_channel::SendError<(
-            roles_logic_sv2::template_distribution_sv2::SetNewPrevHash<'a>,
-            Vec<u8>,
-        )>,
-    ) -> Self {
-        Error::ChannelErrorSender(ChannelSendError::NewTemplate(e))
-    }
-}
-
-impl<'a> From<Vec<u8>> for Error<'a> {
+impl From<Vec<u8>> for Error {
     fn from(e: Vec<u8>) -> Self {
         Error::VecToSlice32(e)
     }
 }
 
-impl<'a> From<ParseLengthError> for Error<'a> {
+impl From<ParseLengthError> for Error {
     fn from(e: ParseLengthError) -> Self {
         Error::Uint256Conversion(e)
     }
 }
 
-impl<'a> From<std::convert::Infallible> for Error<'a> {
+impl From<std::convert::Infallible> for Error {
     fn from(e: std::convert::Infallible) -> Self {
         Error::Infallible(e)
     }

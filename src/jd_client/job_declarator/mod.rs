@@ -79,7 +79,7 @@ impl JobDeclarator {
         address: SocketAddr,
         authority_public_key: [u8; 32],
         up: Arc<Mutex<Upstream>>,
-    ) -> Result<(Arc<Mutex<Self>>, AbortOnDrop), Error<'static>> {
+    ) -> Result<(Arc<Mutex<Self>>, AbortOnDrop), Error> {
         let stream = tokio::net::TcpStream::connect(address).await?;
         let initiator = Initiator::from_raw_k(authority_public_key)?;
         let (mut receiver, mut sender, _, _) =

@@ -112,19 +112,13 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub async fn send(
-        self_: &Arc<Mutex<Self>>,
-        message: Mining<'static>,
-    ) -> ProxyResult<'static, ()> {
+    pub async fn send(self_: &Arc<Mutex<Self>>, message: Mining<'static>) -> ProxyResult<()> {
         let sender = self_
             .safe_lock(|s| s.sender.clone())
             // TODO TODO TODO
             .unwrap();
-        sender.send(message).await.map_err(|e| {
-            super::super::error::Error::ChannelErrorSender(
-                super::super::error::ChannelSendError::General(e.to_string()),
-            )
-        })?;
+        // TODO TODO TODO
+        sender.send(message).await.unwrap();
         Ok(())
     }
     /// Instantiate a new `Upstream`.
@@ -137,7 +131,7 @@ impl Upstream {
         min_extranonce_size: u16,
         pool_signature: String,
         sender: TSender<Mining<'static>>,
-    ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
+    ) -> ProxyResult<Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
             channel_id: None,
             min_extranonce_size,
@@ -165,7 +159,7 @@ impl Upstream {
         coinbase_tx_outs: Vec<u8>,
         coinbase_tx_locktime: u32,
         template_id: u64,
-    ) -> ProxyResult<'static, ()> {
+    ) -> ProxyResult<()> {
         info!("Sending set custom mining job");
         let request_id = self_.safe_lock(|s| s.req_ids.next()).unwrap();
         let channel_id = loop {
@@ -212,7 +206,7 @@ impl Upstream {
     pub async fn parse_incoming(
         self_: Arc<Mutex<Self>>,
         mut recv: TReceiver<Mining<'static>>,
-    ) -> ProxyResult<'static, AbortOnDrop> {
+    ) -> ProxyResult<AbortOnDrop> {
         let task_manager = TaskManager::initialize();
         let abortable = task_manager
             .safe_lock(|t| t.get_aborter())

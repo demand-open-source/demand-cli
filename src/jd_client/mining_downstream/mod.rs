@@ -2,7 +2,6 @@ mod task_manager;
 use crate::shared::utils::AbortOnDrop;
 
 use super::{job_declarator::JobDeclarator, mining_upstream::Upstream as UpstreamMiningNode};
-use async_channel::SendError;
 use roles_logic_sv2::{
     channel_logic::channel_factory::{OnNewShare, PoolChannelFactory, Share},
     common_properties::{CommonDownstreamData, IsDownstream, IsMiningDownstream},
@@ -257,10 +256,7 @@ impl DownstreamMiningNode {
     }
 
     /// Send a message downstream
-    pub async fn send(
-        self_mutex: &Arc<Mutex<Self>>,
-        message: Mining<'static>,
-    ) -> Result<(), SendError<StdFrame>> {
+    pub async fn send(self_mutex: &Arc<Mutex<Self>>, message: Mining<'static>) -> Result<(), ()> {
         let sender = self_mutex.safe_lock(|self_| self_.sender.clone()).unwrap();
         match sender.send(message).await {
             Ok(_) => Ok(()),
