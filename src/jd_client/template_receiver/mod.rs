@@ -1,3 +1,6 @@
+mod task_manager;
+use crate::shared::utils::AbortOnDrop;
+
 use super::job_declarator::JobDeclarator;
 use bitcoin::{consensus::Encodable, TxOut};
 use codec_sv2::{HandshakeRole, Initiator, StandardEitherFrame, StandardSv2Frame};
@@ -14,6 +17,7 @@ use roles_logic_sv2::{
 };
 use setup_connection::SetupConnectionHandler;
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
+use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
 use tracing::{error, info, warn};
 
@@ -46,7 +50,7 @@ impl TemplateRx {
         miner_coinbase_outputs: Vec<TxOut>,
         authority_public_key: Option<Secp256k1PublicKey>,
         test_only_do_not_send_solution_to_tp: bool,
-    ) {
+    ) -> AbortOnDrop {
         let mut encoded_outputs = vec![];
         miner_coinbase_outputs
             .consensus_encode(&mut encoded_outputs)
@@ -87,9 +91,21 @@ impl TemplateRx {
             test_only_do_not_send_solution_to_tp,
         }));
 
-        // TODO TODO TODO
-        let task = tokio::task::spawn(Self::on_new_solution(self_mutex.clone(), solution_receiver));
-        Self::start_templates(self_mutex, receiver);
+        let task_manager = TaskManager::initialize();
+        let abortable = task_manager
+            .safe_lock(|t| t.get_aborter())
+            .unwrap()
+            .unwrap();
+        let on_new_solution_task =
+            tokio::task::spawn(Self::on_new_solution(self_mutex.clone(), solution_receiver));
+        TaskManager::add_on_new_solution(task_manager.clone(), on_new_solution_task.into())
+            .await
+            .unwrap();
+        let main_task = Self::start_templates(self_mutex, receiver).await;
+        TaskManager::add_main_task(task_manager, main_task)
+            .await
+            .unwrap();
+        abortable
     }
 
     pub async fn send(self_: &Arc<Mutex<Self>>, sv2_frame: StdFrame) {
@@ -141,7 +157,10 @@ impl TemplateRx {
         }
     }
 
-    pub fn start_templates(self_mutex: Arc<Mutex<Self>>, mut receiver: TReceiver<EitherFrame>) {
+    pub async fn start_templates(
+        self_mutex: Arc<Mutex<Self>>,
+        mut receiver: TReceiver<EitherFrame>,
+    ) -> AbortOnDrop {
         let jd = self_mutex.safe_lock(|s| s.jd.clone()).unwrap();
         let down = self_mutex.safe_lock(|s| s.down.clone()).unwrap();
         let mut coinbase_output_max_additional_size_sent = false;
@@ -149,7 +168,6 @@ impl TemplateRx {
         let miner_coinbase_output = self_mutex
             .safe_lock(|s| s.miner_coinbase_output.clone())
             .unwrap();
-        // TODO TODO TODO
         let main_task = {
             let self_mutex = self_mutex.clone();
             tokio::task::spawn(async move {
@@ -224,7 +242,7 @@ impl TemplateRx {
                                             super::job_declarator::JobDeclarator::on_set_new_prev_hash(
                                                 jd.clone(),
                                                 m.clone(),
-                                            );
+                                            ).await;
                                         }
                                         super::downstream::DownstreamMiningNode::on_set_new_prev_hash(
                                             &down, m,
@@ -292,6 +310,7 @@ impl TemplateRx {
                 }
             })
         };
+        main_task.into()
     }
 
     async fn on_new_solution(self_: Arc<Mutex<Self>>, mut rx: TReceiver<SubmitSolution<'static>>) {

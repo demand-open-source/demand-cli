@@ -1,4 +1,4 @@
-use crate::jd_client::error::ProxyResult;
+use crate::{jd_client::error::ProxyResult, shared::utils::AbortOnDrop};
 
 use crate::jd_client::downstream::DownstreamMiningNode as Downstream;
 
@@ -22,6 +22,8 @@ use tokio::task;
 use tracing::{error, info, warn};
 
 use std::collections::VecDeque;
+
+use super::task_manager::TaskManager;
 
 #[derive(Debug)]
 struct CircularBuffer {
@@ -207,12 +209,15 @@ impl Upstream {
 
     /// Parses the incoming SV2 message from the Upstream role and routes the message to the
     /// appropriate handler.
-    #[allow(clippy::result_large_err)]
-    pub fn parse_incoming(
+    pub async fn parse_incoming(
         self_: Arc<Mutex<Self>>,
         mut recv: TReceiver<Mining<'static>>,
-    ) -> ProxyResult<'static, ()> {
-        // TODO TODO TODO
+    ) -> ProxyResult<'static, AbortOnDrop> {
+        let task_manager = TaskManager::initialize();
+        let abortable = task_manager
+            .safe_lock(|t| t.get_aborter())
+            .unwrap()
+            .unwrap();
         let main_task = {
             let self_ = self_.clone();
             task::spawn(async move {
@@ -247,7 +252,10 @@ impl Upstream {
                 }
             })
         };
-        Ok(())
+        TaskManager::add_main_task(task_manager.clone(), main_task.into())
+            .await
+            .unwrap();
+        Ok(abortable)
     }
 
     pub async fn take_channel_factory(self_: Arc<Mutex<Self>>) -> PoolChannelFactory {

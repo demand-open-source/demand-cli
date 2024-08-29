@@ -4,6 +4,7 @@ pub mod downstream;
 mod error;
 mod job_declarator;
 mod proxy_config;
+mod task_manager;
 mod template_receiver;
 mod upstream_sv2;
 
@@ -11,6 +12,7 @@ use downstream::DownstreamMiningNode;
 use job_declarator::JobDeclarator;
 use proxy_config::ProxyConfig;
 use std::sync::atomic::AtomicBool;
+use task_manager::TaskManager;
 use template_receiver::TemplateRx;
 
 /// Is used by the template receiver and the downstream. When a NewTemplate is received the context
@@ -46,6 +48,8 @@ use std::{
 use std::net::ToSocketAddrs;
 use tracing::error;
 
+use crate::shared::utils::AbortOnDrop;
+
 pub async fn start(
     receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
     sender: tokio::sync::mpsc::Sender<Mining<'static>>,
@@ -60,7 +64,14 @@ pub async fn start(
     let upstream_index = 0;
 
     let proxy_config = ProxyConfig::default();
-    initialize_jd(proxy_config.upstreams.get(upstream_index).unwrap().clone(), receiver, sender, up_receiver, up_sender).await;
+    let abortable = initialize_jd(
+        proxy_config.upstreams.get(upstream_index).unwrap().clone(),
+        receiver,
+        sender,
+        up_receiver,
+        up_sender,
+    )
+    .await;
 }
 async fn initialize_jd(
     upstream_config: proxy_config::Upstream,
@@ -68,7 +79,12 @@ async fn initialize_jd(
     sender: tokio::sync::mpsc::Sender<Mining<'static>>,
     up_receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
     up_sender: tokio::sync::mpsc::Sender<Mining<'static>>,
-) {
+) -> AbortOnDrop {
+    let task_manager = TaskManager::initialize();
+    let abortable = task_manager
+        .safe_lock(|t| t.get_aborter())
+        .unwrap()
+        .unwrap();
     let proxy_config = ProxyConfig::default();
     let test_only_do_not_send_solution_to_tp = proxy_config
         .test_only_do_not_send_solution_to_tp
@@ -94,17 +110,24 @@ async fn initialize_jd(
     };
 
     // Start receiving messages from the SV2 Upstream role
-    if let Err(e) = upstream_sv2::Upstream::parse_incoming(upstream.clone(), up_receiver) {
-        error!("failed to create sv2 parser: {}", e);
-        panic!()
-    }
+    let upstream_abortable =
+        match upstream_sv2::Upstream::parse_incoming(upstream.clone(), up_receiver).await {
+            Ok(abortable) => abortable,
+            Err(e) => {
+                error!("failed to create sv2 parser: {}", e);
+                panic!()
+            }
+        };
+    TaskManager::add_mining_upstream_task(task_manager.clone(), upstream_abortable)
+        .await
+        .unwrap();
 
     // Initialize JD part
     let mut parts = proxy_config.tp_address.split(':');
     let ip_tp = parts.next().unwrap().to_string();
     let port_tp = parts.next().unwrap().parse::<u16>().unwrap();
 
-    let jd = match JobDeclarator::new(
+    let (jd, jd_abortable) = match JobDeclarator::new(
         upstream_config
             .jd_address
             .clone()
@@ -124,6 +147,9 @@ async fn initialize_jd(
             todo!()
         }
     };
+    TaskManager::add_job_declarator_task(task_manager.clone(), jd_abortable)
+        .await
+        .unwrap();
 
     let donwstream = Arc::new(Mutex::new(downstream::DownstreamMiningNode::new(
         sender,
@@ -135,7 +161,7 @@ async fn initialize_jd(
     )));
     DownstreamMiningNode::start(donwstream.clone(), receiver);
 
-    TemplateRx::connect(
+    let tp_abortable = TemplateRx::connect(
         SocketAddr::new(IpAddr::from_str(ip_tp.as_str()).unwrap(), port_tp),
         recv_solution,
         Some(jd.clone()),
@@ -145,4 +171,8 @@ async fn initialize_jd(
         test_only_do_not_send_solution_to_tp,
     )
     .await;
+    TaskManager::add_template_receiver_task(task_manager.clone(), tp_abortable)
+        .await
+        .unwrap();
+    abortable
 }
