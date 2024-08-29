@@ -1,6 +1,6 @@
 use crate::jd_client::error::ProxyResult;
 
-use crate::jd_client::{downstream::DownstreamMiningNode as Downstream, PoolChangerTrigger};
+use crate::jd_client::downstream::DownstreamMiningNode as Downstream;
 
 use binary_sv2::{Seq0255, U256};
 use roles_logic_sv2::{
@@ -104,8 +104,6 @@ pub struct Upstream {
     /// Sends messages to the SV2 Upstream role
     pub sender: TSender<Mining<'static>>,
     pub downstream: Option<Arc<Mutex<Downstream>>>,
-    #[allow(dead_code)]
-    pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
     channel_factory: Option<PoolChannelFactory>,
     template_to_job_id: TemplateToJobId,
     req_ids: Id,
@@ -136,7 +134,6 @@ impl Upstream {
     pub async fn new(
         min_extranonce_size: u16,
         pool_signature: String,
-        pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
         sender: TSender<Mining<'static>>,
     ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
@@ -146,7 +143,6 @@ impl Upstream {
             pool_signature,
             sender,
             downstream: None,
-            pool_chaneger_trigger,
             channel_factory: None,
             template_to_job_id: TemplateToJobId::new(),
             req_ids: Id::new(),

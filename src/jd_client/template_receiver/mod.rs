@@ -1,4 +1,4 @@
-use super::{job_declarator::JobDeclarator, PoolChangerTrigger};
+use super::job_declarator::JobDeclarator;
 use bitcoin::{consensus::Encodable, TxOut};
 use codec_sv2::{HandshakeRole, Initiator, StandardEitherFrame, StandardSv2Frame};
 use demand_sv2_connection::noise_connection_tokio::Connection;
@@ -32,7 +32,6 @@ pub struct TemplateRx {
     jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
     down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
     new_template_message: Option<NewTemplate<'static>>,
-    pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
     miner_coinbase_output: Vec<u8>,
     test_only_do_not_send_solution_to_tp: bool,
 }
@@ -44,7 +43,6 @@ impl TemplateRx {
         solution_receiver: TReceiver<SubmitSolution<'static>>,
         jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
         down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
-        pool_chaneger_trigger: Arc<Mutex<PoolChangerTrigger>>,
         miner_coinbase_outputs: Vec<TxOut>,
         authority_public_key: Option<Secp256k1PublicKey>,
         test_only_do_not_send_solution_to_tp: bool,
@@ -85,7 +83,6 @@ impl TemplateRx {
             jd,
             down,
             new_template_message: None,
-            pool_chaneger_trigger,
             miner_coinbase_output: encoded_outputs,
             test_only_do_not_send_solution_to_tp,
         }));
