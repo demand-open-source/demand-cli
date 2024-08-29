@@ -159,7 +159,10 @@ async fn initialize_jd(
         vec![],
         Some(jd.clone()),
     )));
-    DownstreamMiningNode::start(donwstream.clone(), receiver);
+    let downstream_abortable = DownstreamMiningNode::start(donwstream.clone(), receiver).await;
+    TaskManager::add_mining_upstream_task(task_manager.clone(), downstream_abortable)
+        .await
+        .unwrap();
 
     let tp_abortable = TemplateRx::connect(
         SocketAddr::new(IpAddr::from_str(ip_tp.as_str()).unwrap(), port_tp),
@@ -171,7 +174,7 @@ async fn initialize_jd(
         test_only_do_not_send_solution_to_tp,
     )
     .await;
-    TaskManager::add_template_receiver_task(task_manager.clone(), tp_abortable)
+    TaskManager::add_template_receiver_task(task_manager, tp_abortable)
         .await
         .unwrap();
     abortable

@@ -1,3 +1,6 @@
+mod task_manager;
+use crate::shared::utils::AbortOnDrop;
+
 use super::{job_declarator::JobDeclarator, mining_upstream::Upstream as UpstreamMiningNode};
 use async_channel::SendError;
 use roles_logic_sv2::{
@@ -11,6 +14,7 @@ use roles_logic_sv2::{
     template_distribution_sv2::{NewTemplate, SubmitSolution},
     utils::Mutex,
 };
+use task_manager::TaskManager;
 use tokio::{
     sync::mpsc::{Receiver as TReceiver, Sender as TSender},
     task,
@@ -135,38 +139,48 @@ impl DownstreamMiningNode {
     }
 
     /// Strat listen for downstream mining node. Return as soon as one downstream connect.
-    pub fn start(self_mutex: Arc<Mutex<Self>>, mut receiver: TReceiver<Mining<'static>>) {
-        // TODO TODO TODO
-        task::spawn(async move {
-            DownstreamMiningNode::set_channel_factory(self_mutex.clone());
-
+    pub async fn start(
+        self_mutex: Arc<Mutex<Self>>,
+        mut receiver: TReceiver<Mining<'static>>,
+    ) -> AbortOnDrop {
+        let task_manager = TaskManager::initialize();
+        let abortable = task_manager
+            .safe_lock(|t| t.get_aborter())
+            .unwrap()
+            .unwrap();
+        let factory_abortable = DownstreamMiningNode::set_channel_factory(self_mutex.clone());
+        TaskManager::add_set_channel_factory(task_manager.clone(), factory_abortable)
+            .await
+            .unwrap();
+        let main_task = task::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 DownstreamMiningNode::next(&self_mutex, message).await;
             }
         });
+        TaskManager::add_main_task(task_manager, main_task.into())
+            .await
+            .unwrap();
+        abortable
     }
 
     // When we do pooled minig we create a channel factory when the pool send a open extended
     // mining channel success
-    fn set_channel_factory(self_mutex: Arc<Mutex<Self>>) {
-        if !self_mutex.safe_lock(|s| s.status.is_solo_miner()).unwrap() {
-            // Safe unwrap already checked if it contains an upstream withe `is_solo_miner`
-            let upstream = self_mutex
-                .safe_lock(|s| s.status.get_upstream().unwrap())
-                .unwrap();
-            let recv_factory = {
-                let self_mutex = self_mutex.clone();
-                // TODO TODO TODO
-                tokio::task::spawn(async move {
-                    let factory = UpstreamMiningNode::take_channel_factory(upstream).await;
-                    self_mutex
-                        .safe_lock(|s| {
-                            s.status.set_channel(factory);
-                        })
-                        .unwrap();
-                })
-            };
-        }
+    fn set_channel_factory(self_mutex: Arc<Mutex<Self>>) -> AbortOnDrop {
+        tokio::task::spawn(async move {
+            if !self_mutex.safe_lock(|s| s.status.is_solo_miner()).unwrap() {
+                // Safe unwrap already checked if it contains an upstream withe `is_solo_miner`
+                let upstream = self_mutex
+                    .safe_lock(|s| s.status.get_upstream().unwrap())
+                    .unwrap();
+                let factory = UpstreamMiningNode::take_channel_factory(upstream).await;
+                self_mutex
+                    .safe_lock(|s| {
+                        s.status.set_channel(factory);
+                    })
+                    .unwrap();
+            }
+        })
+        .into()
     }
 
     /// Parse the received message and relay it to the right upstream
@@ -497,6 +511,8 @@ impl
                                 let jd = self.jd.clone();
                                 let mut share = share.clone();
                                 share.extranonce = extranonce.try_into().unwrap();
+                                // This do not need to be put in a task manager it always return
+                                // fastly
                                 tokio::task::spawn(async move {
                                     JobDeclarator::on_solution(&jd.unwrap(), share).await
                                 });

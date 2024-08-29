@@ -445,8 +445,8 @@ impl JobDeclarator {
     ) {
         let prev_hash = self_mutex
             .safe_lock(|s| s.last_set_new_prev_hash.clone())
-            .unwrap()
-            .expect("");
+            .expect("Poison lock error")
+            .expect("Impossible to get last p hash");
         let solution = SubmitSolutionJd {
             extranonce: solution.extranonce,
             prev_hash: prev_hash.prev_hash,
@@ -458,8 +458,13 @@ impl JobDeclarator {
         let frame: StdFrame =
             PoolMessages::JobDeclaration(JobDeclaration::SubmitSolution(solution))
                 .try_into()
-                .unwrap();
-        let sender = self_mutex.safe_lock(|s| s.sender.clone()).unwrap();
-        sender.send(frame.into()).await.unwrap();
+                .expect("Infallible operation");
+        let sender = self_mutex
+            .safe_lock(|s| s.sender.clone())
+            .expect("Poison lock error");
+        sender
+            .send(frame.into())
+            .await
+            .expect("JDC Sub solution receiver unavailable");
     }
 }
