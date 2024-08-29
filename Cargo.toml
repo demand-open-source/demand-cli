@@ -9,7 +9,6 @@ serde_json = { version = "1.0.64", default-features = false, features = ["alloc"
 serde = { version = "*", features = ["derive", "alloc"], default-features = false }
 tokio-util = { version = "*", features = ["codec"] }
 nohash-hasher = "*"
-toml = "*"
 futures = "*"
 async-channel="^1.8.0"
 async-recursion = "1.0.0"
