@@ -37,6 +37,7 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt::init();
     let auth_pub_k: Secp256k1PublicKey = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let address = POOL_ADDRESS
         .to_socket_addrs()
