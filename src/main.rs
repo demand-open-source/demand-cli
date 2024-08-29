@@ -1,3 +1,8 @@
+use jemallocator::Jemalloc;
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+
 use key_utils::Secp256k1PublicKey;
 //use std::time::Duration;
 //use key_utils::Secp256k1PublicKey;

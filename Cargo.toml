@@ -8,12 +8,9 @@ bitcoin = {version = "0.29.1", features = ["serde","rand"]}
 serde_json = { version = "1.0.64", default-features = false, features = ["alloc"] }
 serde = { version = "*", features = ["derive", "alloc"], default-features = false }
 tokio-util = { version = "*", features = ["codec"] }
-tokio-stream = "*"
 nohash-hasher = "*"
 toml = "*"
 futures = "*"
-reqwest = { version = "*", default-features = false, features = ["rustls-tls", "json"] }
-dotenv = "^0.15.0"
 async-channel="^1.8.0"
 async-recursion = "1.0.0"
 lazy_static = "1.4.0"
@@ -26,13 +23,11 @@ siphasher = "1"
 jemallocator = "*"
 roles_logic_sv2 = "1.2.1"
 sv1_api = "1.0.1"
-const_sv2 = "1.0.0"
 demand-sv2-connection = "0.0.3"
 noise_sv2 = "1.1.0"
 key-utils = "1.0.0"
 codec_sv2 = { version = "1.2.1", features = ["noise_sv2","with_buffer_pool"]}
 binary_sv2 = "1.1.0"
-rpc_sv2 = "1.0.0"
 tracing = { version = "0.1" }
 tokio = {version="^1.36.0",features = ["full","tracing"]}
 framing_sv2 = "^2.0.0"
