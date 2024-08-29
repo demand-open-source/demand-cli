@@ -1,15 +1,15 @@
 #![allow(special_module_name)]
 
-pub mod downstream;
 mod error;
 mod job_declarator;
+pub mod mining_downstream;
 mod proxy_config;
 mod task_manager;
 mod template_receiver;
 mod upstream_sv2;
 
-use downstream::DownstreamMiningNode;
 use job_declarator::JobDeclarator;
+use mining_downstream::DownstreamMiningNode;
 use proxy_config::ProxyConfig;
 use std::sync::atomic::AtomicBool;
 use task_manager::TaskManager;
@@ -151,7 +151,7 @@ async fn initialize_jd(
         .await
         .unwrap();
 
-    let donwstream = Arc::new(Mutex::new(downstream::DownstreamMiningNode::new(
+    let donwstream = Arc::new(Mutex::new(DownstreamMiningNode::new(
         sender,
         Some(upstream.clone()),
         send_solution,

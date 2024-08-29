@@ -1,4 +1,5 @@
 mod task_manager;
+use crate::jd_client::mining_downstream::DownstreamMiningNode as Downstream;
 use crate::shared::utils::AbortOnDrop;
 
 use super::job_declarator::JobDeclarator;
@@ -34,7 +35,7 @@ pub struct TemplateRx {
     /// Allows the tp recv to communicate back to the main thread any status updates
     /// that would interest the main thread for error handling
     jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
-    down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
+    down: Arc<Mutex<Downstream>>,
     new_template_message: Option<NewTemplate<'static>>,
     miner_coinbase_output: Vec<u8>,
     test_only_do_not_send_solution_to_tp: bool,
@@ -46,7 +47,7 @@ impl TemplateRx {
         address: SocketAddr,
         solution_receiver: TReceiver<SubmitSolution<'static>>,
         jd: Option<Arc<Mutex<super::job_declarator::JobDeclarator>>>,
-        down: Arc<Mutex<super::downstream::DownstreamMiningNode>>,
+        down: Arc<Mutex<Downstream>>,
         miner_coinbase_outputs: Vec<TxOut>,
         authority_public_key: Option<Secp256k1PublicKey>,
         test_only_do_not_send_solution_to_tp: bool,
@@ -220,7 +221,7 @@ impl TemplateRx {
                                             .unwrap();
                                         let token = last_token.clone().unwrap();
                                         let pool_output = token.coinbase_output.to_vec();
-                                        super::downstream::DownstreamMiningNode::on_new_template(
+                                        Downstream::on_new_template(
                                             &down,
                                             m.clone(),
                                             &pool_output[..],
@@ -244,11 +245,7 @@ impl TemplateRx {
                                                 m.clone(),
                                             ).await;
                                         }
-                                        super::downstream::DownstreamMiningNode::on_set_new_prev_hash(
-                                            &down, m,
-                                        )
-                                        .await
-                                        .unwrap();
+                                        Downstream::on_set_new_prev_hash(&down, m).await.unwrap();
                                     }
 
                                     Some(TemplateDistribution::RequestTransactionDataSuccess(

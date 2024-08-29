@@ -1,6 +1,6 @@
 use crate::{jd_client::error::ProxyResult, shared::utils::AbortOnDrop};
 
-use crate::jd_client::downstream::DownstreamMiningNode as Downstream;
+use crate::jd_client::mining_downstream::DownstreamMiningNode as Downstream;
 
 use binary_sv2::{Seq0255, U256};
 use roles_logic_sv2::{
