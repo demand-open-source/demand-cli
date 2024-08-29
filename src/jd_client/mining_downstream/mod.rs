@@ -1,4 +1,4 @@
-use super::{job_declarator::JobDeclarator, upstream_sv2::Upstream as UpstreamMiningNode};
+use super::{job_declarator::JobDeclarator, mining_upstream::Upstream as UpstreamMiningNode};
 use async_channel::SendError;
 use roles_logic_sv2::{
     channel_logic::channel_factory::{OnNewShare, PoolChannelFactory, Share},

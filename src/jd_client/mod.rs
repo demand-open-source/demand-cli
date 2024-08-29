@@ -3,10 +3,10 @@
 mod error;
 mod job_declarator;
 pub mod mining_downstream;
+mod mining_upstream;
 mod proxy_config;
 mod task_manager;
 mod template_receiver;
-mod upstream_sv2;
 
 use job_declarator::JobDeclarator;
 use mining_downstream::DownstreamMiningNode;
@@ -95,7 +95,7 @@ async fn initialize_jd(
     let (send_solution, recv_solution) = tokio::sync::mpsc::channel(10);
 
     // Instantiate a new `Upstream` (SV2 Pool)
-    let upstream = match upstream_sv2::Upstream::new(
+    let upstream = match mining_upstream::Upstream::new(
         0, // TODO
         upstream_config.pool_signature.clone(),
         up_sender,
@@ -111,7 +111,7 @@ async fn initialize_jd(
 
     // Start receiving messages from the SV2 Upstream role
     let upstream_abortable =
-        match upstream_sv2::Upstream::parse_incoming(upstream.clone(), up_receiver).await {
+        match mining_upstream::Upstream::parse_incoming(upstream.clone(), up_receiver).await {
             Ok(abortable) => abortable,
             Err(e) => {
                 error!("failed to create sv2 parser: {}", e);

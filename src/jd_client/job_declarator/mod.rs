@@ -15,7 +15,6 @@ use roles_logic_sv2::{
 use std::{collections::HashMap, convert::TryInto, str::FromStr};
 use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tokio::task::AbortHandle;
 use tracing::{error, info};
 
 use async_recursion::async_recursion;
@@ -40,7 +39,7 @@ use setup_connection::SetupConnectionHandler;
 
 use crate::shared::utils::AbortOnDrop;
 
-use super::{error::Error, proxy_config::ProxyConfig, upstream_sv2::Upstream};
+use super::{error::Error, mining_upstream::Upstream, proxy_config::ProxyConfig};
 
 #[derive(Debug, Clone)]
 pub struct LastDeclareJob {
