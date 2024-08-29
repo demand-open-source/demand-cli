@@ -60,7 +60,7 @@ pub struct Downstream {
     version_rolling_min_bit: Option<HexU32Be>,
     /// Sends a SV1 `mining.submit` message received from the Downstream role to the `Bridge` for
     /// translation into a SV2 `SubmitSharesExtended`.
-    tx_sv1_bridge: async_channel::Sender<DownstreamMessages>,
+    tx_sv1_bridge: Sender<DownstreamMessages>,
     tx_outgoing: Sender<json_rpc::Message>,
     /// True if this is the first job received from `Upstream`.
     pub(super) first_job_received: bool,
@@ -76,7 +76,7 @@ impl Downstream {
     #[allow(clippy::too_many_arguments)]
     pub async fn new_downstream(
         connection_id: u32,
-        tx_sv1_bridge: async_channel::Sender<DownstreamMessages>,
+        tx_sv1_bridge: Sender<DownstreamMessages>,
         rx_sv1_notify: broadcast::Receiver<server_to_client::Notify<'static>>,
         extranonce1: Vec<u8>,
         last_notify: Option<server_to_client::Notify<'static>>,
@@ -149,7 +149,7 @@ impl Downstream {
     /// Accept connections from one or more SV1 Downstream roles (SV1 Mining Devices) and create a
     /// new `Downstream` for each connection.
     pub async fn accept_connections(
-        tx_sv1_submit: async_channel::Sender<DownstreamMessages>,
+        tx_sv1_submit: Sender<DownstreamMessages>,
         tx_mining_notify: broadcast::Sender<server_to_client::Notify<'static>>,
         bridge: Arc<Mutex<super::super::proxy::Bridge>>,
         upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
@@ -231,7 +231,7 @@ impl Downstream {
         let sender = self_
             .safe_lock(|s| s.tx_sv1_bridge.clone())
             .map_err(|_| Error::PoisonLock)?;
-        let _ = sender.send(msg).await;
+        let _ = sender.send(msg);
         Ok(())
     }
     #[cfg(test)]
@@ -241,7 +241,7 @@ impl Downstream {
         extranonce1: Vec<u8>,
         version_rolling_mask: Option<HexU32Be>,
         version_rolling_min_bit: Option<HexU32Be>,
-        tx_sv1_bridge: async_channel::Sender<DownstreamMessages>,
+        tx_sv1_bridge: Sender<DownstreamMessages>,
         tx_outgoing: Sender<json_rpc::Message>,
         first_job_received: bool,
         extranonce2_len: usize,

@@ -1,6 +1,5 @@
 use tokio::task::JoinHandle;
 
-use async_channel::{Receiver, Sender};
 use roles_logic_sv2::{
     channel_logic::channel_factory::{ExtendedChannelKind, ProxyExtendedChannelFactory, Share},
     mining_sv2::{
@@ -33,18 +32,9 @@ use tracing::{debug, error, info};
 /// 2. SV2 `SetNewPrevHash` + `NewExtendedMiningJob` -> SV1 `mining.notify`
 #[derive(Debug)]
 pub struct Bridge {
-    /// Receives a SV1 `mining.submit` message from the Downstream role.
-    rx_sv1_downstream: Receiver<DownstreamMessages>,
     /// Sends SV2 `SubmitSharesExtended` messages translated from SV1 `mining.submit` messages to
     /// the `Upstream`.
-    tx_sv2_submit_shares_ext: Sender<SubmitSharesExtended<'static>>,
-    /// Receives a SV2 `SetNewPrevHash` message from the `Upstream` to be translated (along with a
-    /// SV2 `NewExtendedMiningJob` message) to a SV1 `mining.submit` for the `Downstream`.
-    rx_sv2_set_new_prev_hash: Receiver<SetNewPrevHash<'static>>,
-    /// Receives a SV2 `NewExtendedMiningJob` message from the `Upstream` to be translated (along
-    /// with a SV2 `SetNewPrevHash` message) to a SV1 `mining.submit` to be sent to the
-    /// `Downstream`.
-    rx_sv2_new_ext_mining_job: Receiver<NewExtendedMiningJob<'static>>,
+    tx_sv2_submit_shares_ext: tokio::sync::mpsc::Sender<SubmitSharesExtended<'static>>,
     /// Sends SV1 `mining.notify` message (translated from the SV2 `SetNewPrevHash` and
     /// `NewExtendedMiningJob` messages stored in the `NextMiningNotify`) to the `Downstream`.
     tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
@@ -75,10 +65,7 @@ impl Bridge {
     #[allow(clippy::too_many_arguments)]
     /// Instantiate a new `Bridge`.
     pub fn new(
-        rx_sv1_downstream: Receiver<DownstreamMessages>,
-        tx_sv2_submit_shares_ext: Sender<SubmitSharesExtended<'static>>,
-        rx_sv2_set_new_prev_hash: Receiver<SetNewPrevHash<'static>>,
-        rx_sv2_new_ext_mining_job: Receiver<NewExtendedMiningJob<'static>>,
+        tx_sv2_submit_shares_ext: tokio::sync::mpsc::Sender<SubmitSharesExtended<'static>>,
         tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
         extranonces: ExtendedExtranonce,
         target: Arc<Mutex<Vec<u8>>>,
@@ -91,10 +78,7 @@ impl Bridge {
             target.safe_lock(|t| t.clone()).unwrap().try_into().unwrap();
         let upstream_target: Target = upstream_target.into();
         Arc::new(Mutex::new(Self {
-            rx_sv1_downstream,
             tx_sv2_submit_shares_ext,
-            rx_sv2_set_new_prev_hash,
-            rx_sv2_new_ext_mining_job,
             tx_sv1_notify,
             last_notify: None,
             channel_factory: ProxyExtendedChannelFactory::new(
@@ -154,15 +138,22 @@ impl Bridge {
 
     /// Starts the tasks that receive SV1 and SV2 messages to be translated and sent to their
     /// respective roles.
-    pub async fn start(self_: Arc<Mutex<Self>>) -> Result<AbortOnDrop, ()> {
+    pub async fn start(
+        self_: Arc<Mutex<Self>>,
+        rx_sv2_set_new_prev_hash: tokio::sync::mpsc::Receiver<SetNewPrevHash<'static>>,
+        rx_sv2_new_ext_mining_job: tokio::sync::mpsc::Receiver<NewExtendedMiningJob<'static>>,
+        rx_sv1_downstream: tokio::sync::mpsc::Receiver<DownstreamMessages>,
+    ) -> Result<AbortOnDrop, ()> {
         let task_manager = TaskManager::initialize();
         let abortable = task_manager
             .safe_lock(|t| t.get_aborter())
             .unwrap()
             .unwrap();
-        let new_prev_hash_handler = Self::handle_new_prev_hash(self_.clone());
-        let new_ext_m_job_handler = Self::handle_new_extended_mining_job(self_.clone());
-        let downs_message_handler = Self::handle_downstream_messages(self_);
+        let new_prev_hash_handler =
+            Self::handle_new_prev_hash(self_.clone(), rx_sv2_set_new_prev_hash);
+        let new_ext_m_job_handler =
+            Self::handle_new_extended_mining_job(self_.clone(), rx_sv2_new_ext_mining_job);
+        let downs_message_handler = Self::handle_downstream_messages(self_, rx_sv1_downstream);
         TaskManager::add_handle_new_prev_hash(task_manager.clone(), new_prev_hash_handler.into())
             .await?;
         TaskManager::add_handle_new_extended_mining_job(
@@ -180,8 +171,10 @@ impl Bridge {
 
     /// Receives a `DownstreamMessages` message from the `Downstream`, handles based on the
     /// variant received.
-    fn handle_downstream_messages(self_: Arc<Mutex<Self>>) -> JoinHandle<()> {
-        let rx_sv1_downstream = self_.safe_lock(|s| s.rx_sv1_downstream.clone()).unwrap();
+    fn handle_downstream_messages(
+        self_: Arc<Mutex<Self>>,
+        mut rx_sv1_downstream: tokio::sync::mpsc::Receiver<DownstreamMessages>,
+    ) -> JoinHandle<()> {
         tokio::task::spawn(async move {
             loop {
                 let msg = rx_sv1_downstream.recv().await.unwrap();
@@ -377,10 +370,11 @@ impl Bridge {
     /// that before every received `SetNewPrevHash`, a `NewExtendedMiningJob` with a
     /// corresponding `job_id` has already been received. If this is not the case, an error has
     /// occurred on the Upstream pool role and the connection will close.
-    fn handle_new_prev_hash(self_: Arc<Mutex<Self>>) -> JoinHandle<()> {
-        let (tx_sv1_notify, rx_sv2_set_new_prev_hash) = self_
-            .safe_lock(|s| (s.tx_sv1_notify.clone(), s.rx_sv2_set_new_prev_hash.clone()))
-            .unwrap();
+    fn handle_new_prev_hash(
+        self_: Arc<Mutex<Self>>,
+        mut rx_sv2_set_new_prev_hash: tokio::sync::mpsc::Receiver<SetNewPrevHash<'static>>,
+    ) -> JoinHandle<()> {
+        let tx_sv1_notify = self_.safe_lock(|s| s.tx_sv1_notify.clone()).unwrap();
         debug!("Starting handle_new_prev_hash task");
         tokio::task::spawn(async move {
             loop {
@@ -464,10 +458,11 @@ impl Bridge {
     /// `Downstream`. If `future_job=false` but this job's `job_id` does not match the current SV2
     /// `SetNewPrevHash` `job_id`, an error has occurred on the Upstream pool role and the
     /// connection will close.
-    fn handle_new_extended_mining_job(self_: Arc<Mutex<Self>>) -> JoinHandle<()> {
-        let (tx_sv1_notify, rx_sv2_new_ext_mining_job) = self_
-            .safe_lock(|s| (s.tx_sv1_notify.clone(), s.rx_sv2_new_ext_mining_job.clone()))
-            .unwrap();
+    fn handle_new_extended_mining_job(
+        self_: Arc<Mutex<Self>>,
+        mut rx_sv2_new_ext_mining_job: tokio::sync::mpsc::Receiver<NewExtendedMiningJob<'static>>,
+    ) -> JoinHandle<()> {
+        let tx_sv1_notify = self_.safe_lock(|s| s.tx_sv1_notify.clone()).unwrap();
         debug!("Starting handle_new_extended_mining_job task");
         tokio::task::spawn(async move {
             loop {
@@ -503,8 +498,8 @@ pub struct OpenSv1Downstream {
 #[cfg(test)]
 mod test {
     use super::*;
-    //use tokio::sync::mpsc::channel as bounded;
-    use async_channel::bounded;
+    use tokio::sync::broadcast::channel as bounded;
+    use tokio::sync::mpsc::channel;
 
     use bitcoin::util::psbt::serialize::Serialize;
 
@@ -513,7 +508,8 @@ mod test {
 
         pub struct BridgeInterface {
             pub tx_sv1_submit: Sender<DownstreamMessages>,
-            pub rx_sv2_submit_shares_ext: Receiver<SubmitSharesExtended<'static>>,
+            pub rx_sv2_submit_shares_ext:
+                tokio::sync::mpsc::Receiver<SubmitSharesExtended<'static>>,
             pub tx_sv2_set_new_prev_hash: Sender<SetNewPrevHash<'static>>,
             pub tx_sv2_new_ext_mining_job: Sender<NewExtendedMiningJob<'static>>,
             pub rx_sv1_notify: broadcast::Receiver<server_to_client::Notify<'static>>,
@@ -522,28 +518,28 @@ mod test {
         pub fn create_bridge(
             extranonces: ExtendedExtranonce,
         ) -> (Arc<Mutex<Bridge>>, BridgeInterface) {
-            let (tx_sv1_submit, rx_sv1_submit) = bounded(1);
-            let (tx_sv2_submit_shares_ext, rx_sv2_submit_shares_ext) = bounded(1);
-            let (tx_sv2_set_new_prev_hash, rx_sv2_set_new_prev_hash) = bounded(1);
-            let (tx_sv2_new_ext_mining_job, rx_sv2_new_ext_mining_job) = bounded(1);
+            let (tx_sv1_submit, _) = bounded(1);
+            let (tx_sv2_submit_shares_ext, rx_sv2_submit_shares_ext) = channel(1);
+            let (tx_sv2_set_new_prev_hash, _) = bounded(1);
+            let (tx_sv2_new_ext_mining_job, _) = bounded(1);
             let (tx_sv1_notify, rx_sv1_notify) = broadcast::channel(1);
             let upstream_target = vec![
                 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0,
             ];
             let interface = BridgeInterface {
-                tx_sv1_submit,
+                tx_sv1_submit: tx_sv1_submit.clone(),
                 rx_sv2_submit_shares_ext,
-                tx_sv2_set_new_prev_hash,
-                tx_sv2_new_ext_mining_job,
+                tx_sv2_set_new_prev_hash: tx_sv2_set_new_prev_hash.clone(),
+                tx_sv2_new_ext_mining_job: tx_sv2_new_ext_mining_job.clone(),
                 rx_sv1_notify,
             };
 
             let b = Bridge::new(
-                rx_sv1_submit,
+                tx_sv1_submit.clone(),
                 tx_sv2_submit_shares_ext,
-                rx_sv2_set_new_prev_hash,
-                rx_sv2_new_ext_mining_job,
+                tx_sv2_set_new_prev_hash.clone(),
+                tx_sv2_new_ext_mining_job,
                 tx_sv1_notify,
                 extranonces,
                 Arc::new(Mutex::new(upstream_target)),

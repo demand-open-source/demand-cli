@@ -6,7 +6,6 @@ use super::super::{
     },
     upstream::diff_management::UpstreamDifficultyConfig,
 };
-use async_channel::{Receiver, Sender};
 use binary_sv2::u256_from_int;
 use roles_logic_sv2::{
     common_messages_sv2::Protocol,
@@ -29,6 +28,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
+use tokio::sync::broadcast::Sender;
 use tokio::{
     sync::mpsc::{Receiver as TReceiver, Sender as TSender},
     task,
@@ -62,19 +62,16 @@ pub struct Upstream {
     last_job_id: Option<u32>,
     /// Bytes used as implicit first part of `extranonce`.
     extranonce_prefix: Option<Vec<u8>>,
-    /// Receives SV2 `SubmitSharesExtended` messages translated from SV1 `mining.submit` messages.
-    /// Translated by and sent from the `Bridge`.
-    rx_sv2_submit_shares_ext: Receiver<SubmitSharesExtended<'static>>,
     /// Sends SV2 `SetNewPrevHash` messages to be translated (along with SV2 `NewExtendedMiningJob`
     /// messages) into SV1 `mining.notify` messages. Received and translated by the `Bridge`.
-    tx_sv2_set_new_prev_hash: Sender<SetNewPrevHash<'static>>,
+    tx_sv2_set_new_prev_hash: tokio::sync::mpsc::Sender<SetNewPrevHash<'static>>,
     /// Sends SV2 `NewExtendedMiningJob` messages to be translated (along with SV2 `SetNewPrevHash`
     /// messages) into SV1 `mining.notify` messages. Received and translated by the `Bridge`.
-    tx_sv2_new_ext_mining_job: Sender<NewExtendedMiningJob<'static>>,
+    tx_sv2_new_ext_mining_job: tokio::sync::mpsc::Sender<NewExtendedMiningJob<'static>>,
     /// Sends the extranonce1 and the channel id received in the SV2 `OpenExtendedMiningChannelSuccess` message to be
     /// used by the `Downstream` and sent to the Downstream role in a SV2 `mining.subscribe`
     /// response message. Passed to the `Downstream` on connection creation.
-    tx_sv2_extranonce: Sender<(ExtendedExtranonce, u32)>,
+    tx_sv2_extranonce: tokio::sync::mpsc::Sender<(ExtendedExtranonce, u32)>,
     /// The first `target` is received by the Upstream role in the SV2
     /// `OpenExtendedMiningChannelSuccess` message, then updated periodically via SV2 `SetTarget`
     /// messages. Passed to the `Downstream` on connection creation and sent to the Downstream role
@@ -106,17 +103,15 @@ impl Upstream {
     /// from the `Downstream`.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        rx_sv2_submit_shares_ext: Receiver<SubmitSharesExtended<'static>>,
-        tx_sv2_set_new_prev_hash: Sender<SetNewPrevHash<'static>>,
-        tx_sv2_new_ext_mining_job: Sender<NewExtendedMiningJob<'static>>,
+        tx_sv2_set_new_prev_hash: tokio::sync::mpsc::Sender<SetNewPrevHash<'static>>,
+        tx_sv2_new_ext_mining_job: tokio::sync::mpsc::Sender<NewExtendedMiningJob<'static>>,
         min_extranonce_size: u16,
-        tx_sv2_extranonce: Sender<(ExtendedExtranonce, u32)>,
+        tx_sv2_extranonce: tokio::sync::mpsc::Sender<(ExtendedExtranonce, u32)>,
         target: Arc<Mutex<Vec<u8>>>,
         difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
         sender: TSender<Mining<'static>>,
     ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
-            rx_sv2_submit_shares_ext,
             extranonce_prefix: None,
             tx_sv2_set_new_prev_hash,
             tx_sv2_new_ext_mining_job,
@@ -135,6 +130,7 @@ impl Upstream {
     pub async fn start(
         self_: Arc<Mutex<Self>>,
         incoming_receiver: TReceiver<Mining<'static>>,
+        rx_sv2_submit_shares_ext: TReceiver<SubmitSharesExtended<'static>>,
     ) -> Result<AbortOnDrop, ()> {
         let task_manager = TaskManager::initialize();
         let abortable = task_manager
@@ -147,7 +143,8 @@ impl Upstream {
         let (diff_manager_abortable, main_loop_abortable) =
             Self::parse_incoming(self_.clone(), incoming_receiver).map_err(|_| ())?;
 
-        let handle_submit_abortable = Self::handle_submit(self_.clone()).map_err(|_| ())?;
+        let handle_submit_abortable =
+            Self::handle_submit(self_.clone(), rx_sv2_submit_shares_ext).map_err(|_| ())?;
 
         TaskManager::add_diff_managment(task_manager.clone(), diff_manager_abortable).await?;
         TaskManager::add_main_loop(task_manager.clone(), main_loop_abortable).await?;
@@ -341,11 +338,13 @@ impl Upstream {
             .map_err(|_e| PoisonLock)
     }
 
-    #[allow(clippy::result_large_err)]
-    fn handle_submit(self_: Arc<Mutex<Self>>) -> ProxyResult<'static, AbortOnDrop> {
+    fn handle_submit(
+        self_: Arc<Mutex<Self>>,
+        mut rx_submit: TReceiver<SubmitSharesExtended<'static>>,
+    ) -> ProxyResult<'static, AbortOnDrop> {
         let clone = self_.clone();
-        let (tx_frame, rx_submit) = clone
-            .safe_lock(|s| (s.sender.clone(), s.rx_sv2_submit_shares_ext.clone()))
+        let tx_frame = clone
+            .safe_lock(|s| s.sender.clone())
             .map_err(|_| PoisonLock)?;
 
         let handle = {

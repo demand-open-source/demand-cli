@@ -13,7 +13,7 @@ use tracing::{error, info};
 
 pub async fn start_accept_connection(
     task_manager: Arc<Mutex<TaskManager>>,
-    tx_sv1_submit: async_channel::Sender<DownstreamMessages>,
+    tx_sv1_submit: Sender<DownstreamMessages>,
     tx_mining_notify: broadcast::Sender<server_to_client::Notify<'static>>,
     bridge: Arc<Mutex<super::super::proxy::Bridge>>,
     upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,

@@ -10,7 +10,6 @@ serde = { version = "*", features = ["derive", "alloc"], default-features = fals
 tokio-util = { version = "*", features = ["codec"] }
 nohash-hasher = "*"
 futures = "*"
-async-channel="^1.8.0"
 async-recursion = "1.0.0"
 lazy_static = "1.4.0"
 hashbrown = { version = "0.11", default-features = false, features = ["ahash", "serde"] }
