@@ -12,8 +12,9 @@ type Message = Mining<'static>;
 
 enum Task {
     DownstreamListener(AbortOnDrop),
-    Bridge(AbortOnDrop),
     Upstream(AbortOnDrop),
+    StartupTask(AbortOnDrop),
+    Bridge(AbortOnDrop),
 }
 
 pub struct TaskManager {
@@ -64,6 +65,16 @@ impl TaskManager {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
             .send(Task::Upstream(abortable))
+            .await
+            .map_err(|_| ())
+    }
+    pub async fn add_startup_task(
+        self_: Arc<Mutex<Self>>,
+        abortable: AbortOnDrop,
+    ) -> Result<(), ()> {
+        let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
+        send_task
+            .send(Task::StartupTask(abortable))
             .await
             .map_err(|_| ())
     }

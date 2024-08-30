@@ -103,43 +103,59 @@ pub async fn start(
         upstream::Upstream::start(upstream, recv_from_up, rx_sv2_submit_shares_ext)
             .await
             .unwrap();
-
-    let (extended_extranonce, up_id) = rx_sv2_extranonce.recv().await.unwrap();
-    loop {
-        let target: [u8; 32] = target.safe_lock(|t| t.clone()).unwrap().try_into().unwrap();
-        if target != [0; 32] {
-            break;
-        };
-        tokio::task::yield_now().await;
-    }
-
-    // Instantiate a new `Bridge` and begins handling incoming messages
-    let b = proxy::Bridge::new(
-        tx_sv2_submit_shares_ext,
-        tx_sv1_notify.clone(),
-        extended_extranonce,
-        target,
-        up_id,
-    );
-    let bridge_aborter = proxy::Bridge::start(
-        b.clone(),
-        rx_sv2_set_new_prev_hash,
-        rx_sv2_new_ext_mining_job,
-        rx_sv1_bridge,
-    )
-    .await?;
-
-    let downstream_aborter = downstream::Downstream::accept_connections(
-        tx_sv1_bridge,
-        tx_sv1_notify,
-        b,
-        diff_config,
-        downstreams,
-    )
-    .await?;
-
-    TaskManager::add_bridge(task_manager.clone(), bridge_aborter).await?;
-    TaskManager::add_downstream_listener(task_manager.clone(), downstream_aborter).await?;
     TaskManager::add_upstream(task_manager.clone(), upstream_abortable).await?;
+
+    let startup_task = {
+        let target = target.clone();
+        let task_manager = task_manager.clone();
+        tokio::task::spawn(async move {
+            let (extended_extranonce, up_id) = rx_sv2_extranonce.recv().await.unwrap();
+            loop {
+                let target: [u8; 32] = target.safe_lock(|t| t.clone()).unwrap().try_into().unwrap();
+                if target != [0; 32] {
+                    break;
+                };
+                tokio::task::yield_now().await;
+            }
+
+            // Instantiate a new `Bridge` and begins handling incoming messages
+            let b = proxy::Bridge::new(
+                tx_sv2_submit_shares_ext,
+                tx_sv1_notify.clone(),
+                extended_extranonce,
+                target,
+                up_id,
+            );
+            let bridge_aborter = proxy::Bridge::start(
+                b.clone(),
+                rx_sv2_set_new_prev_hash,
+                rx_sv2_new_ext_mining_job,
+                rx_sv1_bridge,
+            )
+            .await
+            .unwrap();
+
+            let downstream_aborter = downstream::Downstream::accept_connections(
+                tx_sv1_bridge,
+                tx_sv1_notify,
+                b,
+                diff_config,
+                downstreams,
+            )
+            .await
+            .unwrap();
+
+            TaskManager::add_bridge(task_manager.clone(), bridge_aborter)
+                .await
+                .unwrap();
+            TaskManager::add_downstream_listener(task_manager.clone(), downstream_aborter)
+                .await
+                .unwrap();
+        })
+    };
+    TaskManager::add_startup_task(task_manager.clone(), startup_task.into())
+        .await
+        .unwrap();
+
     Ok(abortable)
 }

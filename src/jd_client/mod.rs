@@ -55,10 +55,6 @@ pub async fn start(
     up_receiver: tokio::sync::mpsc::Receiver<Mining<'static>>,
     up_sender: tokio::sync::mpsc::Sender<Mining<'static>>,
 ) -> AbortOnDrop {
-    if std::env::var("ADDRESS").is_err() {
-        error!("ADDRESS env variable not set");
-        std::process::exit(1);
-    }
     initialize_jd(receiver, sender, up_receiver, up_sender).await
 }
 async fn initialize_jd(
@@ -92,19 +88,6 @@ async fn initialize_jd(
             panic!()
         }
     };
-
-    // Start receiving messages from the SV2 Upstream role
-    let upstream_abortable =
-        match mining_upstream::Upstream::parse_incoming(upstream.clone(), up_receiver).await {
-            Ok(abortable) => abortable,
-            Err(e) => {
-                error!("failed to create sv2 parser: {}", e);
-                panic!()
-            }
-        };
-    TaskManager::add_mining_upstream_task(task_manager.clone(), upstream_abortable)
-        .await
-        .unwrap();
 
     // Initialize JD part
     let mut parts = crate::TP_ADDRESS.split(':');
@@ -142,7 +125,23 @@ async fn initialize_jd(
         Some(jd.clone()),
     )));
     let downstream_abortable = DownstreamMiningNode::start(donwstream.clone(), receiver).await;
-    TaskManager::add_mining_upstream_task(task_manager.clone(), downstream_abortable)
+    TaskManager::add_mining_downtream_task(task_manager.clone(), downstream_abortable)
+        .await
+        .unwrap();
+    upstream
+        .safe_lock(|u| u.downstream = Some(donwstream.clone()))
+        .expect("Poison lock");
+
+    // Start receiving messages from the SV2 Upstream role
+    let upstream_abortable =
+        match mining_upstream::Upstream::parse_incoming(upstream.clone(), up_receiver).await {
+            Ok(abortable) => abortable,
+            Err(e) => {
+                error!("failed to create sv2 parser: {}", e);
+                panic!()
+            }
+        };
+    TaskManager::add_mining_upstream_task(task_manager.clone(), upstream_abortable)
         .await
         .unwrap();
 

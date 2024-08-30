@@ -27,7 +27,7 @@ const POOL_SIGNATURE: &str = "DEMAND";
 const MAX_LEN_DOWN_MSG: u32 = 10000;
 const POOL_ADDRESS: &str = "mining.dmnd.work:2000";
 const AUTH_PUB_KEY: &str = "9bQHWXsQ2J9TRFTaxRh3KjoxdyLRfWVEy25YHtKF8y8gotLoCZZ";
-const TP_ADDRESS: &str = "127.0.0.1:8432";
+const TP_ADDRESS: &str = "127.0.0.1:8442";
 const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:32767";
 
 lazy_static! {
@@ -50,7 +50,7 @@ async fn main() {
             .expect("Impossible connect to the pool");
 
     let (downs_sv1_tx, downs_sv1_rx) = channel(10);
-    let sv1_ingress_abortable = ingress::sv1_ingress::start(downs_sv1_tx);
+    let sv1_ingress_abortable = ingress::sv1_ingress::start(downs_sv1_tx).await;
 
     let (translator_up_tx, mut translator_up_rx) = channel(10);
     let translator_abortable = translator::start(downs_sv1_rx, translator_up_tx)
@@ -78,34 +78,28 @@ async fn main() {
         send_to_pool,
     )
     .await;
-    let status_task = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if pool_connection_abortable.is_finished() {
-                error!("Upstream mining connnection closed");
-                break;
-            }
-            if sv1_ingress_abortable.is_finished() {
-                error!("Downtream mining socket unavailable");
-                break;
-            }
-            if translator_abortable.is_finished() {
-                error!("Translator error");
-                break;
-            }
-            if jdc_abortable.is_finished() {
-                error!("Jdc error");
-                break;
-            }
-            if share_accounter_abortable.is_finished() {
-                error!("Share accounter error");
-                break;
-            }
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        if pool_connection_abortable.is_finished() {
+            error!("Upstream mining connnection closed");
+            break;
         }
-    });
-    tokio::select! {
-        _ = status_task => (),
-        _ = tokio::signal::ctrl_c() => (),
+        if sv1_ingress_abortable.is_finished() {
+            error!("Downtream mining socket unavailable");
+            break;
+        }
+        if translator_abortable.is_finished() {
+            error!("Translator error");
+            break;
+        }
+        if jdc_abortable.is_finished() {
+            error!("Jdc error");
+            break;
+        }
+        if share_accounter_abortable.is_finished() {
+            error!("Share accounter error");
+            break;
+        }
     }
     info!("exiting");
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

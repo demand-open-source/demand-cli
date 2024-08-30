@@ -12,7 +12,7 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 
-pub fn start(downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>) -> AbortOnDrop {
+pub async fn start(downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>) -> AbortOnDrop {
     info!("starting downstream listner");
     listen_for_downstream(downstreams)
 }

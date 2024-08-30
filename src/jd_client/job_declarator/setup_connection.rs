@@ -25,7 +25,8 @@ impl SetupConnectionHandler {
         let vendor = String::new().try_into().unwrap();
         let hardware_version = String::new().try_into().unwrap();
         let firmware = String::new().try_into().unwrap();
-        let address = std::env::var("ADDRESS").unwrap();
+        let address = std::env::var("ADDRESS")
+            .unwrap_or("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".to_string());
         let device_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         let device_id = format!("{}::SOLO::{}", device_id, address)
             .to_string()

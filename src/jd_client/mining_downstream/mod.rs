@@ -282,9 +282,10 @@ impl DownstreamMiningNode {
             .safe_lock(|s| {
                 let channel = s.status.get_channel();
                 channel.update_pool_outputs(vec![pool_output]);
+                // TODO TODO TODO if this fail just reinitialize the proxy
                 channel.on_new_template(&mut new_template)
             })
-            .unwrap()?;
+            .expect("Poison lock")?;
         // to_send is HashMap<channel_id, messages_to_send> but here we have only one downstream so
         // only one channel opened downstream. That means that we can take all the messages in the
         // map and send them downstream.
