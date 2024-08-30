@@ -6,11 +6,11 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 #[derive(Debug)]
-#[allow(clippy::enum_variant_names)]
+#[allow(dead_code)]
 enum Task {
-    HandleNewExtendedMiningJob(AbortOnDrop),
-    HandleDownstreamMessages(AbortOnDrop),
-    HandleNewPrevHash(AbortOnDrop),
+    NewExtendedMiningJob(AbortOnDrop),
+    DownstreamMessages(AbortOnDrop),
+    NewPrevHash(AbortOnDrop),
 }
 
 pub struct TaskManager {
@@ -47,7 +47,7 @@ impl TaskManager {
     ) -> Result<(), ()> {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
-            .send(Task::HandleNewExtendedMiningJob(abortable))
+            .send(Task::NewExtendedMiningJob(abortable))
             .await
             .map_err(|_| ())
     }
@@ -57,7 +57,7 @@ impl TaskManager {
     ) -> Result<(), ()> {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
-            .send(Task::HandleNewPrevHash(abortable))
+            .send(Task::NewPrevHash(abortable))
             .await
             .map_err(|_| ())
     }
@@ -67,7 +67,7 @@ impl TaskManager {
     ) -> Result<(), ()> {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
-            .send(Task::HandleDownstreamMessages(abortable))
+            .send(Task::DownstreamMessages(abortable))
             .await
             .map_err(|_| ())
     }

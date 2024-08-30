@@ -10,9 +10,11 @@ use tracing::warn;
 
 type Message = Mining<'static>;
 
+#[allow(dead_code)]
 enum Task {
     DownstreamListener(AbortOnDrop),
     Upstream(AbortOnDrop),
+    #[allow(clippy::enum_variant_names)]
     StartupTask(AbortOnDrop),
     Bridge(AbortOnDrop),
 }

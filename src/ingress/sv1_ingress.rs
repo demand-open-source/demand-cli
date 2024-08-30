@@ -12,14 +12,10 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 use tracing::{error, info, warn};
 
-pub async fn start(downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>) -> AbortOnDrop {
-    info!("starting downstream listner");
-    listen_for_downstream(downstreams)
-}
-
-fn listen_for_downstream(
+pub fn start_listen_for_downstream(
     downstreams: Sender<(Sender<String>, Receiver<String>, IpAddr)>,
 ) -> AbortOnDrop {
+    info!("Starting downstream listner");
     tokio::task::spawn(async move {
         let down_addr: String = crate::SV1_DOWN_LISTEN_ADDR.to_string();
         let downstream_addr: SocketAddr = down_addr.parse().expect("Invalid listen address");
@@ -28,7 +24,7 @@ fn listen_for_downstream(
             .expect("impossible to bind downstream");
         while let Ok((stream, addr)) = downstream_listener.accept().await {
             info!("Try to connect {:#?}", addr);
-            Downstream::new(
+            Downstream::initialize(
                 stream,
                 crate::MAX_LEN_DOWN_MSG,
                 addr.ip(),
@@ -41,7 +37,7 @@ fn listen_for_downstream(
 struct Downstream {}
 
 impl Downstream {
-    pub fn new(
+    pub fn initialize(
         stream: TcpStream,
         max_len_for_downstream_messages: u32,
         address: IpAddr,
@@ -60,7 +56,6 @@ impl Downstream {
             Self::start(framed, recv_from_upstream, send_to_upstream).await
         });
     }
-    #[allow(clippy::too_many_arguments)]
     async fn start(
         framed: Framed<TcpStream, LinesCodec>,
         receiver: Receiver<String>,
@@ -82,7 +77,7 @@ impl Downstream {
         mut recv: SplitStream<Framed<TcpStream, LinesCodec>>,
         send: Sender<String>,
     ) -> Sv1IngressError {
-        match tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(Ok(message)) = recv.next().await {
                 if send.send(message).await.is_err() {
                     error!("Upstream dropped");
@@ -92,8 +87,8 @@ impl Downstream {
             warn!("Downstream dropped while trying to send message up");
             Sv1IngressError::DownstreamDropped
         })
-        .await
-        {
+        .await;
+        match task {
             Ok(err) => err,
             Err(_) => Sv1IngressError::TaskFailed,
         }
@@ -102,7 +97,7 @@ impl Downstream {
         mut send: SplitSink<Framed<TcpStream, LinesCodec>, String>,
         mut recv: Receiver<String>,
     ) -> Sv1IngressError {
-        match tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             while let Some(message) = recv.recv().await {
                 let message = message.replace(['\n', '\r'], "");
                 if send.send(message).await.is_err() {
@@ -113,8 +108,8 @@ impl Downstream {
             error!("Upstream dropped");
             Sv1IngressError::TranslatorDropped
         })
-        .await
-        {
+        .await;
+        match task {
             Ok(err) => err,
             Err(_) => Sv1IngressError::TaskFailed,
         }

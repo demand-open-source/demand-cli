@@ -1,4 +1,3 @@
-use roles_logic_sv2::parsers::Mining;
 use std::{convert::Infallible, fmt, sync::PoisonError};
 
 pub type ProxyResult<'a, T> = core::result::Result<T, Error<'a>>;
@@ -16,7 +15,7 @@ pub enum Error<'a> {
     #[allow(clippy::enum_variant_names)]
     TargetError(roles_logic_sv2::errors::Error),
     Infallible(Infallible),
-    ImpossibleToOpenChannnel(Vec<Mining<'static>>),
+    ImpossibleToOpenChannnel,
     #[allow(clippy::enum_variant_names)]
     AsyncChannelError,
 }
@@ -29,7 +28,16 @@ impl From<Infallible> for Error<'_> {
 
 impl<'a> fmt::Display for Error<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self)
+        match self {
+            Error::InvalidExtranonce(e) => write!(f, "InvalidExtranonce {}", e),
+            Error::RolesSv2Logic(e) => write!(f, "RolesSv2Logic {}", e),
+            Error::V1Protocol(e) => write!(f, "V1Protocol {}", e),
+            Error::PoisonLock => write!(f, "PoisonLock"),
+            Error::TargetError(e) => write!(f, "TargetError {}", e),
+            Error::Infallible(e) => write!(f, "Infallible {}", e),
+            Error::ImpossibleToOpenChannnel => write!(f, "ImpossibleToOpenChannnel"),
+            Error::AsyncChannelError => write!(f, "AsyncChannelError"),
+        }
     }
 }
 

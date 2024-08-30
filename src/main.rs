@@ -50,7 +50,7 @@ async fn main() {
             .expect("Impossible connect to the pool");
 
     let (downs_sv1_tx, downs_sv1_rx) = channel(10);
-    let sv1_ingress_abortable = ingress::sv1_ingress::start(downs_sv1_tx).await;
+    let sv1_ingress_abortable = ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
 
     let (translator_up_tx, mut translator_up_rx) = channel(10);
     let translator_abortable = translator::start(downs_sv1_rx, translator_up_tx)

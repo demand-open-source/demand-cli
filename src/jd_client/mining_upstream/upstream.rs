@@ -239,7 +239,7 @@ impl Upstream {
                         }
                         Ok(SendTo::None(_)) => (),
                         Ok(_) => unreachable!(),
-                        Err(e) => {
+                        Err(_e) => {
                             // TODO TODO TODO
                         }
                     }

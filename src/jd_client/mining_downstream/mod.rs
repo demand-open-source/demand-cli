@@ -1,5 +1,6 @@
 mod task_manager;
 use crate::shared::utils::AbortOnDrop;
+use tokio::time::{timeout, Duration};
 
 use super::{job_declarator::JobDeclarator, mining_upstream::Upstream as UpstreamMiningNode};
 use roles_logic_sv2::{
@@ -546,10 +547,4 @@ impl
         Ok(SendTo::None(None))
     }
 }
-
-use tokio::{
-    task::AbortHandle,
-    time::{timeout, Duration},
-};
-
 impl IsMiningDownstream for DownstreamMiningNode {}

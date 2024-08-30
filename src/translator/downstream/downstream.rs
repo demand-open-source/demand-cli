@@ -231,7 +231,7 @@ impl Downstream {
         let sender = self_
             .safe_lock(|s| s.tx_sv1_bridge.clone())
             .map_err(|_| Error::PoisonLock)?;
-        let _ = sender.send(msg);
+        let _ = sender.send(msg).await;
         Ok(())
     }
     #[cfg(test)]

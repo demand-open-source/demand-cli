@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum Task {
     DiffManagment(AbortOnDrop),
     MainLoop(AbortOnDrop),

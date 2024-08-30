@@ -5,6 +5,7 @@ use roles_logic_sv2::utils::Mutex;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+#[allow(dead_code)]
 enum Task {
     AcceptConnection(AbortOnDrop),
     ReceiveDownstream(AbortOnDrop),

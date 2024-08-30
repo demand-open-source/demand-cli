@@ -119,13 +119,14 @@ impl Bridge {
                         channel_id: success.channel_id,
                         last_notify: self.last_notify.clone(),
                         extranonce,
-                        target: self.target.clone(),
                         extranonce2_len,
                     })
                 } else {
-                    let ms = messages.into_iter().map(|m| m.into_static()).collect();
-                    let e = Error::ImpossibleToOpenChannnel(ms);
+                    let ms: Vec<Mining<'_>> =
+                        messages.into_iter().map(|m| m.into_static()).collect();
+                    let e = Error::ImpossibleToOpenChannnel;
                     error!("{}", e);
+                    error!("Messages: {:?}", ms);
                     Err(e)
                 }
             }
@@ -491,7 +492,6 @@ pub struct OpenSv1Downstream {
     pub channel_id: u32,
     pub last_notify: Option<server_to_client::Notify<'static>>,
     pub extranonce: Vec<u8>,
-    pub target: Arc<Mutex<Vec<u8>>>,
     pub extranonce2_len: u16,
 }
 

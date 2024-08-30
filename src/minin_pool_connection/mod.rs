@@ -66,13 +66,14 @@ pub async fn connect_pool(
             .expect("Failed to create connection");
     let setup_connection_msg =
         setup_connection_msg.unwrap_or(get_mining_setup_connection_msg(true));
-    if let Ok(_) = mining_setup_connection(
+    if mining_setup_connection(
         &mut receiver,
         &mut sender,
         setup_connection_msg,
         timer.unwrap_or(DEFAULT_TIMER),
     )
     .await
+    .is_ok()
     {
         let task_manager = TaskManager::initialize();
         let abortable = task_manager
@@ -171,7 +172,7 @@ async fn mining_setup_connection(
         let msg: CommonMessages<'_> = (message_type, payload).try_into().unwrap();
         match msg {
             CommonMessages::SetupConnectionSuccess(s) => Ok(s),
-            _ => return Err(()),
+            _ => Err(()),
         }
     } else {
         Err(())

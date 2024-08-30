@@ -30,8 +30,11 @@ pub enum DownstreamMessages {
 pub struct SubmitShareWithChannelId {
     pub channel_id: u32,
     pub share: Submit<'static>,
-    pub extranonce: Vec<u8>,
-    pub extranonce2_len: usize,
+    // TODO why we need allow dead code here???
+    #[allow(dead_code)]
+    extranonce: Vec<u8>,
+    #[allow(dead_code)]
+    extranonce2_len: usize,
     pub version_rolling_mask: Option<HexU32Be>,
 }
 
