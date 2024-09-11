@@ -13,19 +13,27 @@ async-recursion = "1.0.0"
 lazy_static = "1.4.0"
 rand = "0.8.4"
 jemallocator = "*"
-roles_logic_sv2 = "1.2.1"
-sv1_api = "1.0.1"
-demand-sv2-connection = "0.0.3"
-noise_sv2 = "1.1.0"
-key-utils = "1.0.0"
-codec_sv2 = { version = "1.2.1", features = ["noise_sv2","with_buffer_pool"]}
-binary_sv2 = "1.1.0"
 tracing = { version = "0.1" }
 tracing-subscriber = "*"
 tokio = {version="^1.36.0",features = ["full","tracing"]}
+key-utils = "1.0.0"
+roles_logic_sv2 = "1.2.1"
+sv1_api = "1.0.1"
+demand-sv2-connection = "0.0.3"
 framing_sv2 = "^2.0.0"
-demand-share-accounting-ext = "0.0.6"
-#demand-share-accounting-ext = { version = "0.0.6", path = "../demand-share-accounting-ext"}
+binary_sv2 = "1.1.0"
+demand-share-accounting-ext = "0.0.9"
+noise_sv2 = "1.1.0"
+codec_sv2 = { version = "1.2.1", features = ["noise_sv2","with_buffer_pool"]}
+#demand-share-accounting-ext = { version = "0.0.10", path = "../demand-share-accounting-ext"}
+#demand-sv2-connection = { version = "0.0.3", path = "../demand-sv2-connection"}
+#roles_logic_sv2 = { path = "/home/user/src/stratum/protocols/v2/roles-logic-sv2", version = "1.2.1"}
+#framing_sv2 = { path = "/home/user/src/stratum/protocols/v2/framing-sv2", version = "2.0.0"}
+#binary_sv2 = { path = "/home/user/src/stratum/protocols/v2/binary-sv2/binary-sv2", version = "1.1.0"}
+#noise_sv2 = { version="= 1.1.0", path ="/home/user/src/stratum/protocols/v2/noise-sv2"}
+#codec_sv2 = { version = "1.2.1", features = ["noise_sv2","with_buffer_pool"], path = "/home/user/src/stratum/protocols/v2/codec-sv2" }
+#sv1_api = { version = "1.0.1", path = "/home/user/src/stratum/protocols/v1" }
+
 
 [dev-dependencies]
 rand = "0.8.5"

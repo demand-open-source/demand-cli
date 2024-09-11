@@ -80,7 +80,7 @@ impl Downstream {
         let task = tokio::spawn(async move {
             while let Some(Ok(message)) = recv.next().await {
                 if send.send(message).await.is_err() {
-                    error!("Upstream dropped");
+                    error!("Upstream dropped trying to send");
                     return Sv1IngressError::TranslatorDropped;
                 }
             }
@@ -105,7 +105,7 @@ impl Downstream {
                     return Sv1IngressError::DownstreamDropped;
                 };
             }
-            error!("Upstream dropped");
+            error!("Upstream dropped trying to receive");
             Sv1IngressError::TranslatorDropped
         })
         .await;

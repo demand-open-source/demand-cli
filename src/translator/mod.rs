@@ -85,7 +85,7 @@ pub async fn start(
     let upstream = match upstream::Upstream::new(
         tx_sv2_set_new_prev_hash,
         tx_sv2_new_ext_mining_job,
-        crate::MIN_EXTRANONCE_SIZE,
+        crate::MIN_EXTRANONCE_SIZE - 1,
         tx_sv2_extranonce,
         target.clone(),
         diff_config.clone(),

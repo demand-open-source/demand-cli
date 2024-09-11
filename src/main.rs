@@ -16,19 +16,21 @@ mod shared;
 mod translator;
 
 const TRANSLATOR_BUFFER_SIZE: usize = 32;
-const MIN_EXTRANONCE_SIZE: u16 = 8;
-//const EXPECTED_SV1_HASHPOWER: f32 = 5_000_000_000_000.0;
-const EXPECTED_SV1_HASHPOWER: f32 = 1_000_000.0;
+const MIN_EXTRANONCE_SIZE: u16 = 6;
+const EXPECTED_SV1_HASHPOWER: f32 = 100_000_000_000.0;
+//const EXPECTED_SV1_HASHPOWER: f32 = 1_000_000.0;
 const SHARE_PER_MIN: f32 = 10.0;
 const CHANNEL_DIFF_UPDTATE_INTERVAL: u32 = 10;
-//const MIN_SV1_DOWSNTREAM_HASHRATE: f32 = 1_000_000_000_000.0;
-const MIN_SV1_DOWSNTREAM_HASHRATE: f32 = 1_000_000.0;
-const POOL_SIGNATURE: &str = "DEMAND";
+const MIN_SV1_DOWSNTREAM_HASHRATE: f32 = 1_000_000_000_000.0;
+//const MIN_SV1_DOWSNTREAM_HASHRATE: f32 = 1_000_000.0;
+const POOL_SIGNATURE: &str = "DEMANDsv2";
 const MAX_LEN_DOWN_MSG: u32 = 10000;
 const POOL_ADDRESS: &str = "mining.dmnd.work:2000";
+//const POOL_ADDRESS: &str = "localhost:2000";
 const AUTH_PUB_KEY: &str = "9bQHWXsQ2J9TRFTaxRh3KjoxdyLRfWVEy25YHtKF8y8gotLoCZZ";
+//const AUTH_PUB_KEY: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const TP_ADDRESS: &str = "127.0.0.1:8442";
-const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:32767";
+const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:32767";
 
 lazy_static! {
     static ref SV1_DOWN_LISTEN_ADDR: String =
@@ -38,6 +40,7 @@ lazy_static! {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    std::env::var("TOKEN").expect("Missing TOKEN environment variable");
     let auth_pub_k: Secp256k1PublicKey = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let address = POOL_ADDRESS
         .to_socket_addrs()

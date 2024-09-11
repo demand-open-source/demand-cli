@@ -64,7 +64,7 @@ pub fn relay_down(
                 }
                 PoolExtMessages::ShareAccountingMessages(msg) => {
                     if let ShareAccountingMessages::ShareOk(msg) = msg {
-                        let job_id_bytes = msg.job_id.to_le_bytes();
+                        let job_id_bytes = msg.ref_job_id.to_le_bytes();
                         let job_id = u32::from_le_bytes(job_id_bytes[4..8].try_into().unwrap());
                         let share_sent_up = shares_sent_up
                             .remove(&job_id)

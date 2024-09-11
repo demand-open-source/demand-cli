@@ -452,8 +452,7 @@ impl
         &mut self,
         _: SubmitSharesStandard,
     ) -> Result<SendTo<UpstreamMiningNode>, Error> {
-        warn!("Ignoring SubmitSharesStandard");
-        Ok(SendTo::None(None))
+        panic!("Impossible message from downstream");
     }
 
     fn handle_submit_shares_extended(

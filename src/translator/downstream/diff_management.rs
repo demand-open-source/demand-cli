@@ -333,7 +333,6 @@ fn target_to_sv1_message(
 mod test {
     use super::super::super::upstream::diff_management::UpstreamDifficultyConfig;
     use crate::translator::downstream::{downstream::DownstreamDifficultyConfig, Downstream};
-    use async_channel::unbounded;
     use binary_sv2::U256;
     use rand::{thread_rng, Rng};
     use roles_logic_sv2::{mining_sv2::Target, utils::Mutex};
