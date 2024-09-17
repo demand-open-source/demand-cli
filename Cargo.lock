@@ -390,9 +390,9 @@ dependencies = [
 
 [[package]]
 name = "demand-share-accounting-ext"
-version = "0.0.9"
+version = "0.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58833ccfcfaa548630fbf6e3ceed3dde564c4184451c75162c3d8594e88ce7b5"
+checksum = "304c7101cfe9c4b30b583e7dc9f83227e1e3efe4fa26ab6e1ace841b16870003"
 dependencies = [
  "binary_sv2",
  "const_sv2 2.0.0",

@@ -22,7 +22,7 @@ sv1_api = "1.0.1"
 demand-sv2-connection = "0.0.3"
 framing_sv2 = "^2.0.0"
 binary_sv2 = "1.1.0"
-demand-share-accounting-ext = "0.0.9"
+demand-share-accounting-ext = "0.0.10"
 noise_sv2 = "1.1.0"
 codec_sv2 = { version = "1.2.1", features = ["noise_sv2","with_buffer_pool"]}
 #demand-share-accounting-ext = { version = "0.0.10", path = "../demand-share-accounting-ext"}
