@@ -18,7 +18,7 @@ use std::{
 };
 use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use async_recursion::async_recursion;
 use nohash_hasher::BuildNoHashHasher;
@@ -246,10 +246,11 @@ impl JobDeclarator {
             .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
 
         let template_transactions = tx_list_.to_vec();
+        let tx_count = template_transactions.len();
         let prioritized_txids = crate::prioritized_transactions::snapshot_txids();
         let mut template_txids = HashSet::with_capacity(template_transactions.len());
-        let mut tx_list: Vec<Transaction> = Vec::new();
-        let mut tx_ids = vec![];
+        let mut tx_list: Vec<Transaction> = Vec::with_capacity(tx_count);
+        let mut tx_ids = Vec::with_capacity(tx_count);
         for tx in template_transactions {
             let transaction: Result<Transaction, bitcoin::consensus::encode::Error> =
                 bitcoin::consensus::deserialize(&tx);
@@ -266,6 +267,11 @@ impl JobDeclarator {
                 }
             }
         }
+        debug!(
+            template_id = template.template_id,
+            tx_count,
+            "Received template transaction list"
+        );
         let missing_txids = missing_prioritized_txids(&prioritized_txids, &template_txids);
         if !missing_txids.is_empty() {
             tokio::task::spawn(check_missing_prioritized_txids(
