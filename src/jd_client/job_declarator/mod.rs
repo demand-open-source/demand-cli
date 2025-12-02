@@ -13,8 +13,10 @@ use roles_logic_sv2::{
     utils::Mutex,
 };
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     convert::TryInto,
+    fmt,
 };
 use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
@@ -423,7 +425,14 @@ impl JobDeclarator {
                         }
                     }
                     Ok(SendTo::None(Some(JobDeclaration::DeclareMiningJobError(m)))) => {
-                        error!("Job is not verified: {:?}", m);
+                        let error_code = ErrorDetails::owned(m.error_code.to_vec());
+                        let error_details = ErrorDetails::borrowed(m.error_details.inner_as_ref());
+                        error!(
+                            request_id = m.request_id,
+                            error_code = %error_code,
+                            error_details = %error_details,
+                            "Job is not verified"
+                        );
                     }
                     Ok(SendTo::None(None)) => (),
                     Ok(SendTo::Respond(m)) => {
@@ -648,6 +657,33 @@ async fn check_missing_prioritized_txids(missing_txids: Vec<Txid>, template_id: 
                     error = %e,
                     "failed to check prioritized transaction mempool state"
                 );
+            }
+        }
+    }
+}
+
+struct ErrorDetails<'a>(Cow<'a, [u8]>);
+
+impl<'a> ErrorDetails<'a> {
+    fn borrowed(bytes: &'a [u8]) -> Self {
+        Self(Cow::Borrowed(bytes))
+    }
+
+    fn owned(bytes: Vec<u8>) -> Self {
+        Self(Cow::Owned(bytes))
+    }
+}
+
+impl<'a> fmt::Display for ErrorDetails<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match std::str::from_utf8(self.0.as_ref()) {
+            Ok(text) => f.write_str(text),
+            Err(_) => {
+                f.write_str("0x")?;
+                for byte in self.0.as_ref() {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
             }
         }
     }
