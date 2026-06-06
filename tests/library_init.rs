@@ -110,7 +110,7 @@ async fn library_init_sv2_setup_connection() {
         120_000,
         0,
         100_000_000_000_000.0,
-        131_072.0,
+        0.0,
         "info".to_string(),
         "off".to_string(),
         false,
