@@ -18,7 +18,16 @@ pub struct AppState {
     router: Router,
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
+    downstream_connection_slots: Option<Arc<tokio::sync::Semaphore>>,
     prioritizing_txs: Option<PrioritizingTxs>,
+}
+
+impl AppState {
+    pub(crate) fn is_admission_saturated(&self) -> bool {
+        self.downstream_connection_slots
+            .as_ref()
+            .is_some_and(|s| s.available_permits() == 0)
+    }
 }
 
 #[derive(Clone)]
@@ -31,6 +40,7 @@ pub(crate) async fn start(
     router: Router,
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
+    downstream_connection_slots: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     let prioritizing_txs = Configuration::bitcoind_rpc_config().map(|config| {
         let rpc = Arc::new(BitcoindRpc::new(
@@ -49,6 +59,7 @@ pub(crate) async fn start(
         router,
         stats_sender,
         downstream_handoff,
+        downstream_connection_slots,
         prioritizing_txs,
     };
     let app = AxumRouter::new()

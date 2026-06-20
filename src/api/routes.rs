@@ -1,5 +1,4 @@
 use super::{utils::get_cpu_and_memory_usage, AppState};
-use crate::config::Configuration;
 use crate::proxy_state::ProxyState;
 use axum::{
     extract::{Path, State},
@@ -109,49 +108,47 @@ impl Api {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(APIResponse::error(Some(
-                    "Overloaded: translator handoff channel is closed".to_string(),
+                    "Proxy down: translator handoff channel is closed".to_string(),
                 ))),
             );
         }
 
-        if state.downstream_handoff.capacity() == 0 {
-            let max_capacity = state.downstream_handoff.max_capacity();
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(APIResponse::error(Some(format!(
-                    "Overloaded: translator handoff channel queue is full (0/{max_capacity} slots available)"
-                )))),
-            );
-        }
-
-        if let Some(max_active_downstreams) = Configuration::max_active_downstreams() {
-            if let Ok(stats) = state.stats_sender.collect_stats().await {
-                let active_downstreams = stats.len();
-                if active_downstreams >= max_active_downstreams {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(APIResponse::error(Some(format!(
-                            "Overloaded: active downstreams {active_downstreams}/{max_active_downstreams}"
-                        )))),
-                    );
-                }
-            }
-        }
-
         match ProxyState::is_proxy_down() {
-            (false, None) => (
-                StatusCode::OK,
-                Json(APIResponse::success(Some("Proxy OK".to_string()))),
-            ),
-            (true, Some(states)) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(APIResponse::error(Some(states))),
-            ),
-            _ => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(APIResponse::error(Some("Unknown proxy state".to_string()))),
-            ),
+            (true, Some(states)) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(APIResponse::error(Some(states))),
+                );
+            }
+            (true, None) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(APIResponse::error(Some("Unknown proxy state".to_string()))),
+                );
+            }
+            (false, None) => {}
+            (false, Some(_)) => unreachable!("is_proxy_down should not return Some when false"),
         }
+
+        let saturated = state.is_admission_saturated();
+        let handoff_backlog_full = state.downstream_handoff.capacity() == 0;
+        let body = json!({
+            "status": "ok",
+            "saturated": saturated,
+            "handoff_backlog_full": handoff_backlog_full,
+            "message": if saturated {
+                "Proxy is alive but admission saturated: not accepting new connections"
+            } else if handoff_backlog_full {
+                "Proxy is alive but translator handoff backlog is full"
+            } else {
+                "Proxy OK"
+            }
+        });
+
+        (
+            StatusCode::OK,
+            Json(APIResponse::success(Some(body))),
+        )
     }
 
     pub async fn send_tx_to_bitcoind(
@@ -313,6 +310,7 @@ impl<T: Serialize> APIResponse<T> {
 
 #[tokio::test]
 async fn health_check_reports_full_translator_handoff() {
+    use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;
     use std::{net::IpAddr, time::Instant};
@@ -337,6 +335,7 @@ async fn health_check_reports_full_translator_handoff() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        downstream_connection_slots: None,
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:8332".to_string(),
@@ -346,6 +345,69 @@ async fn health_check_reports_full_translator_handoff() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
+    };
+
+    let response = Api::health_check(State(state)).await.into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["saturated"], false);
+    assert_eq!(body["data"]["handoff_backlog_full"], true);
+}
+
+#[tokio::test]
+async fn health_check_returns_200_when_admission_saturated() {
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, Semaphore};
+
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
+    let (handoff_tx, _handoff_rx) = mpsc::channel(8);
+
+    let state = AppState {
+        router,
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        downstream_connection_slots: Some(Arc::new(Semaphore::new(0))),
+        prioritizing_txs: None,
+    };
+
+    let response = Api::health_check(State(state)).await.into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["saturated"], true);
+    assert_eq!(body["data"]["handoff_backlog_full"], false);
+}
+
+#[tokio::test]
+async fn health_check_returns_503_when_handoff_channel_closed() {
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use tokio::sync::mpsc;
+
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
+    let (handoff_tx, handoff_rx) = mpsc::channel(1);
+    drop(handoff_rx);
+
+    let state = AppState {
+        router,
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        downstream_connection_slots: None,
+        prioritizing_txs: None,
     };
 
     let response = Api::health_check(State(state)).await.into_response();
@@ -367,6 +429,7 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        downstream_connection_slots: None,
         prioritizing_txs: None,
     };
 
@@ -395,6 +458,7 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        downstream_connection_slots: None,
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:8332".to_string(),
@@ -547,6 +611,7 @@ async fn get_prioritized_transactions_returns_snapshot() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        downstream_connection_slots: None,
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 format!("http://{addr}"),
