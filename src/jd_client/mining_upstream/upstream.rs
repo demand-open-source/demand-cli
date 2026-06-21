@@ -578,7 +578,7 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
             Ok(SendTo::None(None))
         } else {
             error!(
-                "Attention received a SetupConnectionSuccess with unknown request_id: {}",
+                "Attention received a SetCustomMiningJobSuccess with unknown request_id: {}",
                 m.request_id
             );
             Ok(SendTo::None(None))
@@ -588,8 +588,24 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
     /// Handles the SV2 `SetCustomMiningJobError` message.
     fn handle_set_custom_mining_job_error(
         &mut self,
-        _m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
+        m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
+        let error_code = std::str::from_utf8(&m.error_code.to_vec())
+            .unwrap_or("unparsable error code")
+            .to_string();
+
+        if let Some(template_id) = self.template_to_job_id.take_template_id(m.request_id) {
+            error!(
+                "SetCustomMiningJobError for template {} (request_id={}, channel_id={}): {}",
+                template_id, m.request_id, m.channel_id, error_code,
+            );
+        } else {
+            warn!(
+                "SetCustomMiningJobError with unknown request_id {} (channel_id={}): {}",
+                m.request_id, m.channel_id, error_code,
+            );
+        }
+
         IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
         Ok(SendTo::None(None))
     }
@@ -637,5 +653,49 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         } else {
             Err(RolesLogicError::DownstreamDown)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binary_sv2::Str0255;
+    use roles_logic_sv2::handlers::mining::ParseUpstreamMiningMessages;
+    use roles_logic_sv2::mining_sv2::SetCustomMiningJobError;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn set_custom_mining_job_error_clears_request_mapping() {
+        IS_CUSTOM_JOB_SET.store(false, Ordering::Release);
+
+        let (sender, _receiver) = mpsc::channel(1);
+        let upstream = Upstream::new(crate::MIN_EXTRANONCE_SIZE, sender)
+            .await
+            .unwrap();
+
+        upstream
+            .safe_lock(|s| s.template_to_job_id.register_template_id(42, 7))
+            .unwrap();
+
+        let err = SetCustomMiningJobError {
+            channel_id: 1,
+            request_id: 7,
+            error_code: Str0255::try_from(String::from("invalid-mining-job-token")).unwrap(),
+        };
+
+        let result = upstream
+            .safe_lock(|u| u.handle_set_custom_mining_job_error(err))
+            .unwrap();
+
+        assert!(matches!(result, Ok(SendTo::None(None))));
+        assert!(
+            upstream
+                .safe_lock(|s| s.template_to_job_id.take_template_id(7))
+                .unwrap()
+                .is_none(),
+            "request_id mapping must be removed on error"
+        );
+        assert!(IS_CUSTOM_JOB_SET.load(Ordering::Acquire));
     }
 }

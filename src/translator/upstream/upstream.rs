@@ -422,11 +422,11 @@ impl Upstream {
                                     todo!()
                                 }
                                 Mining::OpenMiningChannelError(_)
-                                | Mining::UpdateChannelError(_)
-                                //| Mining::SubmitSharesError(_)
-                                | Mining::SetCustomMiningJobError(_) => {
+                                | Mining::UpdateChannelError(_) => {
                                     todo!();
                                 }
+                                //| Mining::SubmitSharesError(_)
+                                //| Mining::SetCustomMiningJobError(_)
                                 // impossible state: handle_message_mining only returns
                                 // the above 3 messages in the Ok(SendTo::None(Some(m))) case to be sent
                                 // to the bridge for translation.
@@ -867,12 +867,19 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         Ok(SendTo::None(None))
     }
 
-    /// Handles the SV2 `SetCustomMiningJobError` message (TODO).
+    /// Handles the SV2 `SetCustomMiningJobError` message.
     fn handle_set_custom_mining_job_error(
         &mut self,
-        _m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
+        m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
-        unimplemented!()
+        let error_code = std::str::from_utf8(&m.error_code.to_vec())
+            .unwrap_or("unparsable error code")
+            .to_string();
+        error!(
+            "Upstream rejected SetCustomMiningJob (request_id={}, channel_id={}): {}",
+            m.request_id, m.channel_id, error_code,
+        );
+        Ok(SendTo::None(None))
     }
 
     /// Handles the SV2 `SetTarget` message which updates the Downstream role(s) target
@@ -1101,5 +1108,25 @@ mod tests {
 
         drop(diff_manager_abortable);
         drop(main_loop_abortable);
+    }
+
+    #[tokio::test]
+    async fn set_custom_mining_job_error_does_not_panic() {
+        use binary_sv2::Str0255;
+        use roles_logic_sv2::handlers::mining::ParseUpstreamMiningMessages;
+        use roles_logic_sv2::mining_sv2::SetCustomMiningJobError;
+
+        let upstream = test_upstream().await;
+        let err = SetCustomMiningJobError {
+            channel_id: 1,
+            request_id: 0,
+            error_code: Str0255::try_from(String::from("invalid-mining-job-token")).unwrap(),
+        };
+
+        let result = upstream
+            .safe_lock(|u| u.handle_set_custom_mining_job_error(err))
+            .unwrap();
+
+        assert!(matches!(result, Ok(SendTo::None(None))));
     }
 }
