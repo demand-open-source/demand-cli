@@ -12,7 +12,7 @@ full Job Declaration.
 -------------------------------
 
 To mine with DMND pool you must first obtain DMND token.  Please complete the registration form at
-https://onboarding.dmnd.work and await our confirmation email before proceeding.
+https://join.dmnd.work and await our confirmation email before proceeding.
 
 # 3. Enable Job Declaration Support
 -------------------------
