@@ -1,4 +1,4 @@
-use super::JobDeclarator;
+use super::{ErrorDetails, JobDeclarator};
 use roles_logic_sv2::{
     handlers::{job_declaration::ParseServerJobDeclarationMessages, SendTo_},
     job_declaration_sv2::{
@@ -9,6 +9,7 @@ use roles_logic_sv2::{
 };
 pub type SendTo = SendTo_<JobDeclaration<'static>, ()>;
 use roles_logic_sv2::errors::Error;
+use tracing::{debug, error};
 
 impl ParseServerJobDeclarationMessages for JobDeclarator {
     fn handle_allocate_mining_job_token_success(
@@ -30,8 +31,16 @@ impl ParseServerJobDeclarationMessages for JobDeclarator {
 
     fn handle_declare_mining_job_error(
         &mut self,
-        _message: DeclareMiningJobError,
+        message: DeclareMiningJobError,
     ) -> Result<SendTo, Error> {
+        let error_code = ErrorDetails::borrowed(message.error_code.inner_as_ref());
+        let error_details = ErrorDetails::borrowed(message.error_details.inner_as_ref());
+        error!(
+            request_id = message.request_id,
+            error_code = %error_code,
+            error_details = %error_details,
+            "DeclareMiningJobError received"
+        );
         // TODO consider using declarative names instead of setting states
         super::super::IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
         Ok(SendTo::None(None))
@@ -41,10 +50,11 @@ impl ParseServerJobDeclarationMessages for JobDeclarator {
         &mut self,
         message: ProvideMissingTransactions,
     ) -> Result<SendTo, Error> {
+        let request_id = message.request_id;
         let tx_list = self
             .last_declare_mining_jobs_sent
-            .get(&message.request_id)
-            .ok_or(Error::UnknownRequestId(message.request_id))?
+            .get(&request_id)
+            .ok_or(Error::UnknownRequestId(request_id))?
             .clone()
             .ok_or(Error::JDSMissingTransactions)?
             .tx_list
@@ -55,7 +65,13 @@ impl ParseServerJobDeclarationMessages for JobDeclarator {
             .iter()
             .filter_map(|&pos| tx_list.get(pos as usize).cloned())
             .collect();
-        let request_id = message.request_id;
+
+        debug!(
+            request_id,
+            requested_txs = unknown_tx_position_list.len(),
+            "Sending ProvideMissingTransactionsSuccess"
+        );
+
         let transaction_list = binary_sv2::Seq064K::new(missing_transactions)
             .map_err(|_| Error::JDSMissingTransactions)?;
         let message_provide_missing_transactions = ProvideMissingTransactionsSuccess {

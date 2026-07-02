@@ -13,12 +13,14 @@ use roles_logic_sv2::{
     utils::Mutex,
 };
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     convert::TryInto,
+    fmt,
 };
 use task_manager::TaskManager;
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use async_recursion::async_recursion;
 use nohash_hasher::BuildNoHashHasher;
@@ -246,10 +248,11 @@ impl JobDeclarator {
             .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
 
         let template_transactions = tx_list_.to_vec();
+        let tx_count = template_transactions.len();
         let prioritized_txids = crate::prioritized_transactions::snapshot_txids();
         let mut template_txids = HashSet::with_capacity(template_transactions.len());
-        let mut tx_list: Vec<Transaction> = Vec::new();
-        let mut tx_ids = vec![];
+        let mut tx_list: Vec<Transaction> = Vec::with_capacity(tx_count);
+        let mut tx_ids = Vec::with_capacity(tx_count);
         for tx in template_transactions {
             let transaction: Result<Transaction, bitcoin::consensus::encode::Error> =
                 bitcoin::consensus::deserialize(&tx);
@@ -266,6 +269,11 @@ impl JobDeclarator {
                 }
             }
         }
+        debug!(
+            template_id = template.template_id,
+            tx_count,
+            "Received template transaction list"
+        );
         let missing_txids = missing_prioritized_txids(&prioritized_txids, &template_txids);
         if !missing_txids.is_empty() {
             tokio::task::spawn(check_missing_prioritized_txids(
@@ -417,7 +425,14 @@ impl JobDeclarator {
                         }
                     }
                     Ok(SendTo::None(Some(JobDeclaration::DeclareMiningJobError(m)))) => {
-                        error!("Job is not verified: {:?}", m);
+                        let error_code = ErrorDetails::owned(m.error_code.to_vec());
+                        let error_details = ErrorDetails::borrowed(m.error_details.inner_as_ref());
+                        error!(
+                            request_id = m.request_id,
+                            error_code = %error_code,
+                            error_details = %error_details,
+                            "Job is not verified"
+                        );
                     }
                     Ok(SendTo::None(None)) => (),
                     Ok(SendTo::Respond(m)) => {
@@ -642,6 +657,33 @@ async fn check_missing_prioritized_txids(missing_txids: Vec<Txid>, template_id: 
                     error = %e,
                     "failed to check prioritized transaction mempool state"
                 );
+            }
+        }
+    }
+}
+
+struct ErrorDetails<'a>(Cow<'a, [u8]>);
+
+impl<'a> ErrorDetails<'a> {
+    fn borrowed(bytes: &'a [u8]) -> Self {
+        Self(Cow::Borrowed(bytes))
+    }
+
+    fn owned(bytes: Vec<u8>) -> Self {
+        Self(Cow::Owned(bytes))
+    }
+}
+
+impl<'a> fmt::Display for ErrorDetails<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match std::str::from_utf8(self.0.as_ref()) {
+            Ok(text) => f.write_str(text),
+            Err(_) => {
+                f.write_str("0x")?;
+                for byte in self.0.as_ref() {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
             }
         }
     }
