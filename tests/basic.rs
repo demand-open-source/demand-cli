@@ -142,7 +142,7 @@ async fn basic() {
         Receiver<DownstreamConnection>,
     ) = tokio::sync::mpsc::channel(1);
 
-    let ingress = sv1_ingress::start_listen_for_downstream(downstreams_tx);
+    let ingress = sv1_ingress::start_listen_for_downstream(downstreams_tx, None);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {

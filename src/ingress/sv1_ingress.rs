@@ -66,14 +66,15 @@ impl AcceptWindowLimiter {
     }
 }
 
-pub fn start_listen_for_downstream(downstreams: Sender<DownstreamConnection>) -> AbortOnDrop {
+pub fn start_listen_for_downstream(
+    downstreams: Sender<DownstreamConnection>,
+    connection_slots: Option<Arc<Semaphore>>,
+) -> AbortOnDrop {
     tokio::task::spawn(async move {
         let down_addr: String = Configuration::downstream_listening_addr()
             .unwrap_or(crate::DEFAULT_LISTEN_ADDRESS.to_string());
         let downstream_addr: SocketAddr = down_addr.parse().expect("Invalid listen address");
         let max_active_downstreams = Configuration::max_active_downstreams();
-        let connection_slots =
-            max_active_downstreams.map(|max| Arc::new(Semaphore::new(max)));
         let accept_backoff = Duration::from_millis(Configuration::accept_backoff_ms());
         let accept_window = Duration::from_millis(Configuration::accept_window_ms());
         let max_accepts_per_window = Configuration::max_accepts_per_window();

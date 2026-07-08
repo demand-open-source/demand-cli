@@ -19,10 +19,10 @@ use lazy_static::lazy_static;
 use proxy_state::{PoolState, ProxyState, TpState, TranslatorState};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    OnceLock,
+    Arc, OnceLock,
 };
 use std::{net::SocketAddr, time::Duration};
-use tokio::sync::mpsc::channel;
+use tokio::sync::{mpsc::channel, Semaphore};
 use tracing::{error, info, warn};
 
 mod api;
@@ -221,7 +221,12 @@ async fn initialize_proxy(
 
         let (downs_sv1_tx, downs_sv1_rx) = channel(crate::DOWNSTREAM_ACCEPT_BUFFER_SIZE);
         let downstream_handoff = downs_sv1_tx.clone();
-        let sv1_ingress_abortable = ingress::sv1_ingress::start_listen_for_downstream(downs_sv1_tx);
+        let connection_slots = Configuration::max_active_downstreams()
+            .map(|max| Arc::new(Semaphore::new(max)));
+        let sv1_ingress_abortable = ingress::sv1_ingress::start_listen_for_downstream(
+            downs_sv1_tx,
+            connection_slots.clone(),
+        );
 
         let (translator_up_tx, mut translator_up_rx) = channel(10);
         let translator_abortable =
@@ -307,8 +312,12 @@ async fn initialize_proxy(
         if let Some(jdc_handle) = jdc_abortable {
             abort_handles.push((jdc_handle, "jdc".to_string()));
         }
-        let server_handle =
-            tokio::spawn(api::start(router.clone(), stats_sender, downstream_handoff));
+        let server_handle = tokio::spawn(api::start(
+            router.clone(),
+            stats_sender,
+            downstream_handoff,
+            connection_slots,
+        ));
         abort_handles.push((server_handle.into(), "api_server".to_string()));
         match monitor(router, abort_handles, epsilon, shutdown_signal.clone()).await {
             Reconnect::NewUpstream(new_pool_addr) => {
