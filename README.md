@@ -1,213 +1,261 @@
-DMND Stratum V2 Client – Getting Started Guide
-========================================
+# DMND Stratum V2 Client — Getting Started Guide
 
-# 1. Introduction
----------------
+## 1. Introduction
 
-Through this guide we will setup DMND Stratum V2 client and connect to DMND pool. After completing
-this guide, you will have a fully functional Stratum V2 mining setup connected to DMND pool with
-full Job Declaration.
+This guide walks you through setting up the DMND Stratum V2 Client and connecting it to the DMND pool. When you're done, you will have a fully functional Stratum V2 mining setup with **Job Declaration** — meaning *you* build your own block templates from your own Bitcoin node, instead of the pool deciding which transactions you mine.
 
-# 2. What You Need Before Starting
--------------------------------
+**Your ASICs do not need to support Stratum V2.** The DMND Client accepts standard Stratum V1 connections from your miners and handles the SV2 protocol to the pool. Any stock-firmware miner works.
 
-To mine with DMND pool you must first obtain DMND token.  Please complete the registration form at
-https://onboarding.dmnd.work and await our confirmation email before proceeding.
+### How the pieces fit together
 
-# 3. Enable Job Declaration Support
--------------------------
+```
+┌─────────┐  SV1 (stratum+tcp)  ┌──────────────┐   SV2 + Job Declaration   ┌───────────┐
+│  ASICs  │ ──────────────────► │ DMND Client  │ ────────────────────────► │ DMND Pool │
+└─────────┘       :32767        └──────┬───────┘          :20000           └───────────┘
+                                       │ templates
+                                ┌──────┴───────┐    IPC     ┌──────────────┐
+                                │    sv2-tp    │ ◄────────► │ Bitcoin Core │
+                                │ (Template    │  (unix     │  (your node) │
+                                │  Provider)   │   socket)  └──────────────┘
+                                └──────────────┘
+                                     :8336
+```
 
-To use Stratum V2 with Job Declaration, you must run Bitcoin Core along Stratum V2 Template
-Provider. Job declaration is one of the key features of Stratum V2 that allow miners to build their
-own blocks, improving decentralization, efficiency, and latency.
+### Default ports
 
+| Component | Port | Direction | Notes |
+|---|---|---|---|
+| sv2-tp (Template Provider) | 8336 | local only | DMND Client connects to it |
+| DMND Client (stratum) | 32767 | LAN | Point your miners here |
+| DMND Client (tx API) | 3001 | local only | Optional — see Section 7. **Do not expose publicly** |
+| DMND Pool | 20000 | outbound | Client → pool |
 
-What you need:
-- Bitcoin Core(At least version 30) with IPC enabled.
-- Stratum V2 Template Provider, which connect to Bitcoin Core via IPC and provide templates to the
-  DMND Stratum V2 Client.
+Your firewall only needs to allow **outbound** connections to the pool, and LAN access from your miners to port 32767. Nothing here requires inbound internet access.
 
-#### 3.1 Run Bitcoin Core
-Follow instruction to download and install Bitcoin Core as describe in the official website:
+### System requirements
 
-https://bitcoincore.org/en/releases/30.2/
+- Release binaries are published for multiple platforms and architectures — grab the one matching your system from the releases page, or build from source (see [Note B](#notes))
+- A machine capable of running a Bitcoin node — a **pruned node works fine**. 4 GB+ RAM recommended. See [Note A](#notes)
+- Bitcoin Core **v30 or later** with multiprocess/IPC support
 
-Then make sure to start Bitcoin Core with IPC enabled.
+## 2. What You Need Before Starting
 
-    bitcoin -m node -chain=main -ipcbind=unix
+To mine with the DMND pool you first need a **DMND token**. Complete the registration form at https://onboarding.dmnd.work and wait for our confirmation email — it contains your token (an alphanumeric string you'll use in Section 4). If you don't see the email, check your spam folder before contacting support.
 
-Note that the `ipcbind=unix` is required and Stratum V2 will not work without it.
+## 3. Enable Job Declaration Support
 
-#### 3.2 Run Template Provider
-Download the Template Provider binary.
-https://github.com/stratum-mining/sv2-tp/releases/tag/v1.0.6
+Job Declaration is the key Stratum V2 feature that lets miners build their own block templates, improving decentralization, censorship resistance, and latency. To use it, you run two components on your own infrastructure:
 
-Run the Template Provider:
+1. **Bitcoin Core** (v30+) with IPC enabled — your own node.
+2. **Stratum V2 Template Provider (`sv2-tp`)** — a separate binary that connects to Bitcoin Core via IPC and serves block templates to the DMND Client.
 
-    sv2-tp -debug=sv2 -loglevel=sv2:trace
+Follow the setup instructions in the sv2-tp README — it covers both running Bitcoin Core with IPC enabled and running the Template Provider, and is always up to date:
 
-If you have changed Bitcoin Core’s default datadir, you may need to specify the
-Unix socket path manually by adding the following option:
+**https://github.com/stratum-mining/sv2-tp#readme**
 
-    -ipcconnect=unix:<path-to-bitcoin-dir>/node.sock
+The Template Provider listens on port **8336** by default — you'll need that in the next section.
 
-The default Template Provider port is **8336**.
+**✅ Verify:** the sv2-tp log should show a successful IPC connection to Bitcoin Core and new templates being generated as blocks arrive.
 
-# 4. Run DMND Client
------------------------------------
+## 4. Run the DMND Client
 
-#### 4.1 Download DMND Stratum V2 Client
-You can download the latest release of DMND Stratum V2 Client from:
-https://github.com/dmnd-pool/dmnd-client/releases/tag/v0.2.9
+### 4.1 Download the DMND Stratum V2 Client
 
+Download the release binary for your platform from:
 
-Assuming that `dmnd-client-linux` is the executable you are using, run:
+https://github.com/dmnd-pool/dmnd-client/releases
 
-    TOKEN=<DMND-token> cargo run -- -l info -d <avg-hashrate>T --tp-address="127.0.0.1:<port>"
+Verify checksums/signatures where provided — standard practice for any software that touches mining revenue.
+
+Make the binary executable and run it:
+
+```
+chmod +x dmnd-client
+TOKEN=<DMND-token> ./dmnd-client -l info -d <hashrate> --tp-address="127.0.0.1:<port>"
+```
 
 Where:
-- `<avg-hashrate>` = average hashrates of all your miners in TH/s. For example,
-if you have three machines of 100Th/s, 200Th/s and 300Th/s, then the average 
-hashrate is (100 + 200 + 300) / 3 = 200 TH/s.  Our dynamic difficulty 
-adjustment algorithm will take care of the rest.
 
-- `<port>` is the Template Provider listening port (default 8336).
+- `<DMND-token>` — the token you received by email during registration (Section 2).
+- `<port>` — the Template Provider port (default **8336**).
+- `<hashrate>` — the hashrate of the **least powerful machine** that will connect to this client. As a rule of thumb: use `250T` if your miners connect directly, or `20P` if you connect aggregator proxies. This only seeds the starting difficulty; the dynamic difficulty adjustment algorithm handles the rest.
 
-- `<DMND-token>` is the token you received via email from DMND pool during registration.
+Example (miners connecting directly):
 
-Example:
+```
+TOKEN=abc123 ./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
+```
 
-    TOKEN=abc123 cargo run -- -l info -d 200T --tp-address="127.0.0.1:8336"
+**✅ Verify:** the client log should show a successful connection to the Template Provider and to the DMND pool, and templates being declared.
 
-#### 4.2 Endpoint configuration
+> **Building from source instead?** See [Note B](#notes).
 
-By default, the client discovers pool addresses from the dashboard API for the selected environment
-and sends worker telemetry to the same API. Operators can override those endpoints when running the
-client behind a private gateway, proxy, or custom deployment.
+### Configuration precedence
 
-The dashboard API base URL can be configured with `--api-base-url`, `api_base_url`, `API_BASE_URL`,
-or `DMND_CLIENT_API_BASE_URL`. The value should be the base URL only; the client appends
-`/api/pool/urls` for pool discovery and `/api/worker/entry` for worker telemetry.
+Every setting in this guide can be provided three ways, with the following precedence (highest wins):
 
-Direct pool addresses can be configured with one or more `--pool-address` values,
-`pool_addresses`, `POOL_ADDRESSES`, `POOL_ADDRESS`, or `DMND_CLIENT_POOL_ADDRESSES`. When direct
-pool addresses are configured, the client skips the dashboard pool-discovery request and connects
-to those addresses directly.
+1. CLI flags (e.g. `--api-base-url`)
+2. `config.toml`
+3. Environment variables (e.g. `API_BASE_URL`)
 
-Example using `config.toml`:
+### 4.2 Endpoint configuration (optional)
 
-    api_base_url = "https://api.example.com"
-    pool_addresses = ["pool-a.example.com:20000", "pool-b.example.com:20000"]
+By default, the client discovers pool addresses from the dashboard API and sends worker telemetry to the same API. You only need this section if you run behind a private gateway, proxy, or custom deployment.
 
-Example using environment variables:
+- **Dashboard API base URL:** `--api-base-url` / `api_base_url` / `API_BASE_URL` / `DMND_CLIENT_API_BASE_URL`. Provide the base URL only; the client appends `/api/pool/urls` (pool discovery) and `/api/worker/entry` (telemetry).
+- **Direct pool addresses:** `--pool-address` (repeatable) / `pool_addresses` / `POOL_ADDRESSES` / `POOL_ADDRESS` / `DMND_CLIENT_POOL_ADDRESSES`. When set, the client skips dashboard pool discovery and connects directly.
 
-    TOKEN=<DMND-token> \
-    API_BASE_URL=https://api.example.com \
-    POOL_ADDRESSES=pool-a.example.com:20000,pool-b.example.com:20000 \
-    cargo run -- -l info -d <avg-hashrate>T --tp-address="127.0.0.1:8336"
+Example `config.toml`:
 
-# 5. Connect Your Miner
------------------------------
+```toml
+api_base_url = "https://api.example.com"
+pool_addresses = ["pool-a.example.com:20000", "pool-b.example.com:20000"]
+```
 
-After you have Bitcoin Core, Stratum V2 Template Provider and DMND Stratum V2 Client running, you
-can point your miner to the DMND Stratum V2 Client.
+Example environment variables:
 
-Enter your DMND token in the password field and point your miners to the machine running the DMND Stratum V2 Client. The username field can be left empty or filled with anything you like. If not changed, the default port of the
-DMND Stratum V2 Client is **32767**. So you should obtain the IP address of the machine running the
-DMND Stratum V2 Client and point your miner to:
+```
+TOKEN=<DMND-token> \
+API_BASE_URL=https://api.example.com \
+POOL_ADDRESSES=pool-a.example.com:20000,pool-b.example.com:20000 \
+./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
+```
 
-    stratum+tcp://<machine_running_dmnd_client_ip>:32767
+## 5. Connect Your Miners
 
+With Bitcoin Core, sv2-tp, and the DMND Client all running, point your ASICs at the machine running the DMND Client:
 
-# 6. Track Hashrate and Earnings
---------------------------------------
-You can track your hashrate and earnings on the DMND pool dashboard:
+```
+stratum+tcp://<dmnd-client-machine-ip>:32767
+```
 
-    https://dashboard.dmnd.work
+- **URL:** the LAN IP of the machine running the DMND Client, port **32767** (default).
+- **Password:** your DMND token.
+- **Username / worker name:** anything you like, or leave empty.
 
-Login with the same credentials you used during registration.
+This is a standard Stratum V1 connection — no special firmware needed. The client handles all SV2 communication with the pool.
 
-# 7. Prioritize Transactions
---------------------------------------
-The DMND Stratum V2 Client can expose an API endpoint that sends a raw transaction to Bitcoin Core
-and asks Bitcoin Core to prioritize that transaction for block template selection.
+**✅ Verify:** miners should connect almost immediately. Expect the first shares to be accepted **within about 6 minutes** of the miner submitting its first share — this is normal, not a fault.
 
-This feature is enabled only when all of the following values are configured:
+## 6. Track Hashrate and Earnings
 
-- `RPC_URL`: Bitcoin Core RPC URL, for example `http://127.0.0.1:8332`.
-- `RPC_USER`: Bitcoin Core RPC username.
-- `RPC_PWD`: Bitcoin Core RPC password.
-- `RPC_FEE_DELTA`: fee delta, in satoshis, passed to Bitcoin Core's `prioritisetransaction` RPC.
-- `API_TX_TOKEN`: bearer token required by the DMND Client transaction API.
+Track hashrate and earnings on the DMND dashboard:
 
-You can set these values with CLI flags (`--rpc-url`, `--rpc-user`, `--rpc-pwd`,
-`--rpc-fee-delta`, `--api-tx-token`), in `config.toml`, or with environment variables. CLI flags
-take precedence over `config.toml`, and `config.toml` takes precedence over environment variables.
+https://dashboard.dmnd.work
 
-Example using environment variables:
+Log in with the credentials you used during registration.
 
-    TOKEN=<DMND-token> \
-    RPC_URL=http://127.0.0.1:8332 \
-    RPC_USER=<bitcoin-rpc-user> \
-    RPC_PWD=<bitcoin-rpc-password> \
-    RPC_FEE_DELTA=100000000 \
-    API_TX_TOKEN=<api-token> \
-    cargo run -- -l info -d <avg-hashrate>T --tp-address="127.0.0.1:8336"
+> Hashrate statistics are averaged over time — the dashboard typically reflects your full hashrate well within the first hour after your miners connect. A low reading right after connecting is normal.
 
-Example using `config.toml`:
+## 7. Prioritize Transactions (optional)
 
-    rpc_url = "http://127.0.0.1:8332"
-    rpc_user = "<bitcoin-rpc-user>"
-    rpc_pwd = "<bitcoin-rpc-password>"
-    rpc_fee_delta = 100000000
-    api_tx_token = "<api-token>"
+The DMND Client can expose an API endpoint that submits a raw transaction to your Bitcoin Core node and asks it to prioritize that transaction for block template selection (via the `prioritisetransaction` RPC).
 
-When the client is running, submit a raw transaction hex to:
+The feature is enabled **only when all** of the following are configured:
 
-    POST http://<dmnd-client-host>:<api-server-port>/api/tx/submit/<raw-transaction-hex>
+| Setting | CLI flag | config.toml | Env var | Description |
+|---|---|---|---|---|
+| RPC URL | `--rpc-url` | `rpc_url` | `RPC_URL` | Bitcoin Core RPC, e.g. `http://127.0.0.1:8332` |
+| RPC user | `--rpc-user` | `rpc_user` | `RPC_USER` | Bitcoin Core RPC username |
+| RPC password | `--rpc-pwd` | `rpc_pwd` | `RPC_PWD` | Bitcoin Core RPC password |
+| Fee delta | `--rpc-fee-delta` | `rpc_fee_delta` | `RPC_FEE_DELTA` | Virtual fee boost **in satoshis**, passed to `prioritisetransaction` |
+| API token | `--api-tx-token` | `api_tx_token` | `API_TX_TOKEN` | Bearer token required by this API |
 
-Check the currently tracked prioritized transactions with:
+> **Fee delta units:** `RPC_FEE_DELTA` is denominated in **satoshis**. It's a *virtual* fee adjustment used only for template selection on your node — it doesn't spend anything — but set it deliberately. `100000` (0.001 BTC virtual boost) is a reasonable starting point.
 
-    GET http://<dmnd-client-host>:<api-server-port>/api/tx/prioritized
+> **Security:**
+> - The tx API (default port **3001**) should never be exposed to the public internet. Bind it to localhost or protect it behind your own gateway.
+> - `config.toml` stores RPC credentials in plaintext — restrict file permissions (`chmod 600 config.toml`).
+> - Treat `API_TX_TOKEN` like a password.
 
-The API server port defaults to `3001` and can be changed with `--api-server-port`,
-`api_server_port`, or `API_SERVER_PORT`.
+Example environment variables:
 
-Example:
+```
+TOKEN=<DMND-token> \
+RPC_URL=http://127.0.0.1:8332 \
+RPC_USER=<bitcoin-rpc-user> \
+RPC_PWD=<bitcoin-rpc-password> \
+RPC_FEE_DELTA=100000 \
+API_TX_TOKEN=<api-token> \
+./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
+```
 
-    curl -X POST \
-      -H "Authorization: Bearer <api-token>" \
-      "http://127.0.0.1:3001/api/tx/submit/<raw-transaction-hex>"
+Example `config.toml`:
 
-    curl \
-      -H "Authorization: Bearer <api-token>" \
-      "http://127.0.0.1:3001/api/tx/prioritized"
+```toml
+rpc_url = "http://127.0.0.1:8332"
+rpc_user = "<bitcoin-rpc-user>"
+rpc_pwd = "<bitcoin-rpc-password>"
+rpc_fee_delta = 100000
+api_tx_token = "<api-token>"
+```
 
-The prioritized transactions response includes the tracked transaction count, transaction hex,
-and live mempool fees from Bitcoin Core. `tx_fee.real` is `getmempoolentry`'s `fees.base`;
-`tx_fee.modified` is `getmempoolentry`'s boosted `fees.modified`.
+### Using the API
 
-    {
-      "success": true,
-      "message": null,
-      "data": {
-        "count": 1,
-        "txs": [
-          {
-            "txid": "<txid>",
-            "tx_hex": "<raw-transaction-hex>",
-            "tx_fee": {
-              "real": 0.00001000,
-              "modified": 1.00001000
-            }
-          }
-        ]
+Submit a raw transaction hex:
+
+```
+curl -X POST \
+  -H "Authorization: Bearer <api-token>" \
+  "http://127.0.0.1:3001/api/tx/submit/<raw-transaction-hex>"
+```
+
+List currently tracked prioritized transactions:
+
+```
+curl \
+  -H "Authorization: Bearer <api-token>" \
+  "http://127.0.0.1:3001/api/tx/prioritized"
+```
+
+The response includes the tracked transaction count, transaction hex, and live mempool fees from Bitcoin Core — `tx_fee.real` is `getmempoolentry`'s `fees.base`; `tx_fee.modified` is the boosted `fees.modified`:
+
+```json
+{
+  "success": true,
+  "message": null,
+  "data": {
+    "count": 1,
+    "txs": [
+      {
+        "txid": "<txid>",
+        "tx_hex": "<raw-transaction-hex>",
+        "tx_fee": {
+          "real": 0.00001000,
+          "modified": 0.00101000
+        }
       }
-    }
+    ]
+  }
+}
+```
 
-If the prioritization configuration is incomplete, these endpoints are disabled. In that case the
-client logs that transaction prioritization is not enabled and the endpoints return `503 Service
-Unavailable`.
+The API server port defaults to **3001** and can be changed with `--api-server-port`, `api_server_port`, or `API_SERVER_PORT`.
 
+If the prioritization configuration is incomplete, these endpoints are disabled: the client logs that transaction prioritization is not enabled and the endpoints return `503 Service Unavailable`.
 
-Happy Mining!
+## 8. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| sv2-tp can't connect to Bitcoin Core | IPC not enabled, or custom datadir | Follow the sv2-tp README setup exactly; check the socket path |
+| DMND Client can't reach Template Provider | Wrong `--tp-address` or sv2-tp not running | Confirm sv2-tp is listening on 8336 (`ss -tlnp \| grep 8336`) |
+| Client runs but no templates | Bitcoin Core still syncing | Wait for full sync (`bitcoin-cli getblockchaininfo`) |
+| Miner connects but no shares yet | Normal within the first ~6 min | Wait; first share acceptance takes about 6 minutes |
+| Still no shares after 10+ min | Wrong token in password field, or `-d` far off | Re-check token; set `-d` to your least powerful machine (250T direct / 20P proxies) |
+| Dashboard shows zero / low hashrate | Statistics lag | Give it up to an hour after connecting |
+| tx API returns 503 | Prioritization config incomplete | All five settings in Section 7 must be set |
+
+Still stuck? Reach out through the support channel listed in your registration confirmation email.
+
+Happy mining!
+
+## Notes
+
+**Note A — Node disk requirements.** A pruned Bitcoin node needs only a few GB of disk and is fully sufficient for Job Declaration. A full archival node needs ~800 GB. Running a node is outside the scope of this guide — see the [Bitcoin Core documentation](https://bitcoincore.org/en/download/) for details.
+
+**Note B — Building from source.** Install the Rust toolchain via [rustup](https://rustup.rs), clone the repository, and build a production binary with:
+
+    cargo build --release
+
+The binary is produced at `./target/release/dmnd-client` — use it exactly as shown in Section 4.1.
