@@ -40,7 +40,7 @@ Your firewall only needs to allow **outbound** connections to the pool, and LAN 
 
 ## 2. What You Need Before Starting
 
-To mine with the DMND pool you first need a **DMND token**. Complete the registration form at https://onboarding.dmnd.work and wait for our confirmation email — it contains your token (an alphanumeric string you'll use in Section 4). If you don't see the email, check your spam folder before contacting support.
+To mine with the DMND pool you first need a **DMND token**. Complete the registration form at https://join.dmnd.work and wait for our confirmation email — it contains your token (an alphanumeric string you'll use in Section 4). If you don't see the email, check your spam folder before contacting support.
 
 ## 3. Enable Job Declaration Support
 
