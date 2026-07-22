@@ -9,7 +9,11 @@ use crate::{
     proxy_state::{DownstreamType, ProxyState, UpstreamType},
     share_log_enabled,
     shared::utils::AbortOnDrop,
-    translator::{error::Error, utils::validate_share},
+    translator::{
+        error::Error,
+        utils::{effective_version, validate_share},
+        MiningNotify,
+    },
 };
 
 use super::{
@@ -139,6 +143,7 @@ pub struct Downstream {
     pub(super) stats_sender: StatsSender,
     pub recent_jobs: RecentJobs,
     pub first_job: Notify<'static>,
+    pub(super) first_job_merge_mining_binding_id: Option<u64>,
     pub share_monitor: SharesMonitor,
     pub user_agent: std::cell::RefCell<String>, // RefCell is used here because `handle_subscribe` and `handle_authorize` take &self not &mut self and we need to mutate user_agent
     pub token: Arc<Mutex<String>>,
@@ -156,9 +161,9 @@ impl Downstream {
     pub async fn new_downstream(
         connection_id: u32,
         tx_sv1_bridge: Sender<DownstreamMessages>,
-        rx_sv1_notify: broadcast::Receiver<server_to_client::Notify<'static>>,
+        rx_sv1_notify: broadcast::Receiver<MiningNotify>,
         extranonce1: Vec<u8>,
-        last_notify: Option<server_to_client::Notify<'static>>,
+        last_notify: Option<MiningNotify>,
         extranonce2_len: usize,
         host: String,
         upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
@@ -185,6 +190,8 @@ impl Downstream {
         );
         assert!(last_notify.is_some());
 
+        let last_notify =
+            last_notify.expect("we have an assertion at the beginning of this function");
         let (tx_outgoing, receiver_outgoing) = channel(crate::TRANSLATOR_BUFFER_SIZE);
 
         // The PID controller uses negative proportional (P) and integral (I) gains to reduce difficulty
@@ -242,7 +249,8 @@ impl Downstream {
             last_call_to_update_hr: 0,
             stats_sender,
             recent_jobs: RecentJobs::new(),
-            first_job: last_notify.expect("we have an assertion at the beginning of this function"),
+            first_job: last_notify.notify,
+            first_job_merge_mining_binding_id: last_notify.merge_mining_binding_id,
             share_monitor: SharesMonitor::new(connection_id, token.clone()),
             user_agent: std::cell::RefCell::new(String::new()),
             token,
@@ -338,7 +346,7 @@ impl Downstream {
     /// new `Downstream` for each connection.
     pub async fn accept_connections(
         tx_sv1_submit: Sender<DownstreamMessages>,
-        tx_mining_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+        tx_mining_notify: broadcast::Sender<MiningNotify>,
         bridge: Arc<Mutex<super::super::proxy::Bridge>>,
         upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
         downstreams: Receiver<crate::DownstreamConnection>,
@@ -759,12 +767,32 @@ impl Downstream {
         let mut upstream_request = request.clone();
         upstream_request.job_id = job.notify.job_id.clone();
 
+        // Merge-mining observation is an independent, bounded, nonblocking side path. Run it
+        // before the normal Bitcoin-share difficulty gate so an authenticated miner submission
+        // that only meets the RSK target can never be hidden by the Bitcoin relay policy.
+        if let Some(binding_id) = job.merge_mining_binding_id {
+            let version = effective_version(
+                job.notify.version.0,
+                request.version_bits.as_ref(),
+                version_rolling_mask.as_ref(),
+            );
+            let mut full_extranonce = extranonce1.clone();
+            full_extranonce.extend_from_slice(request.extra_nonce2.0.as_ref());
+            crate::merge_mining::global().try_observe_share(
+                binding_id,
+                version,
+                request.time.0,
+                request.nonce.0,
+                full_extranonce,
+            );
+        }
+
         if !validate_share(
             &upstream_request,
             &job.notify,
             job.difficulty,
-            extranonce1,
-            version_rolling_mask,
+            &extranonce1,
+            version_rolling_mask.clone(),
         ) {
             let share = ShareInfo::new(
                 request.user_name.clone(),
@@ -953,6 +981,7 @@ impl Downstream {
             upstream_difficulty_config,
             last_call_to_update_hr: 0,
             first_job,
+            first_job_merge_mining_binding_id: None,
             stats_sender,
             recent_jobs: RecentJobs::new(),
             share_monitor: SharesMonitor::new(connection_id, token.clone()),
@@ -1009,10 +1038,11 @@ impl IsServer<'static> for Downstream {
         self.version_rolling_mask = Some(version_rolling_mask.clone());
         self.version_rolling_min_bit = Some(version_rolling_min_bit_count.clone());
         let mut first_job = self.first_job.clone();
-        self.recent_jobs.add_job(
+        self.recent_jobs.add_job_with_binding(
             &mut first_job,
             self.version_rolling_mask.clone(),
             self.current_difficulty(),
+            self.first_job_merge_mining_binding_id,
         );
         self.first_job = first_job;
 
@@ -1187,6 +1217,13 @@ const TRACKED_RECENT_JOBS: usize = 3;
 pub(crate) struct IssuedJob {
     pub notify: Notify<'static>,
     pub difficulty: f32,
+    merge_mining_binding_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct RawJob {
+    notify: Notify<'static>,
+    merge_mining_binding_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1194,7 +1231,7 @@ pub struct RecentJobs {
     v1_to_v2: HashMap<u32, u32>,
     v2_to_v1: HashMap<u32, Vec<u32>>,
     issued_jobs: HashMap<u32, IssuedJob>,
-    jobs: VecDeque<Notify<'static>>,
+    jobs: VecDeque<RawJob>,
     last_v2s: CircularBuffer<u32, TRACKED_RECENT_JOBS>,
     tracked_jobs: usize,
 }
@@ -1203,21 +1240,23 @@ fn apply_mask(mask: Option<HexU32Be>, message: &mut server_to_client::Notify<'st
         message.version = HexU32Be(message.version.0 & !mask.0);
     }
 }
+
 impl RecentJobs {
-    pub(crate) fn add_job(
+    pub(crate) fn add_job_with_binding(
         &mut self,
         notify: &mut Notify<'static>,
         mask: Option<HexU32Be>,
         difficulty: f32,
+        candidate_binding_id: Option<u64>,
     ) {
         apply_mask(mask, notify);
         // save it with the v2 id
-        self.jobs.push_back(notify.clone());
-        let new_id = self.new_v1(
-            notify.job_id.parse::<u32>().unwrap(),
-            notify.clone(),
-            difficulty,
-        );
+        let v2_id = notify.job_id.parse::<u32>().unwrap();
+        self.jobs.push_back(RawJob {
+            notify: notify.clone(),
+            merge_mining_binding_id: candidate_binding_id,
+        });
+        let new_id = self.new_v1(v2_id, notify.clone(), difficulty, candidate_binding_id);
         // send it with the v1 id
         notify.job_id = new_id.to_string();
         if self.jobs.len() > self.tracked_jobs {
@@ -1227,24 +1266,36 @@ impl RecentJobs {
 
     pub(crate) fn clone_last(&mut self, difficulty: f32) -> Option<Notify<'static>> {
         if let Some(job) = self.jobs.back() {
-            let mut job = job.clone();
-            let new_id = self.new_v1(job.job_id.parse::<u32>().unwrap(), job.clone(), difficulty);
-            job.job_id = new_id.to_string();
-            Some(job.clone())
+            let mut notify = job.notify.clone();
+            let v2_id = notify.job_id.parse::<u32>().unwrap();
+            let new_id = self.new_v1(
+                v2_id,
+                notify.clone(),
+                difficulty,
+                job.merge_mining_binding_id,
+            );
+            notify.job_id = new_id.to_string();
+            Some(notify)
         } else {
             None
         }
     }
 
     pub(crate) fn current_jobs(&self) -> VecDeque<Notify<'static>> {
-        self.jobs.clone()
+        self.jobs.iter().map(|job| job.notify.clone()).collect()
     }
 
     pub(crate) fn get_matching_job(&self, v1_id: u32) -> Option<IssuedJob> {
         self.issued_jobs.get(&v1_id).cloned()
     }
 
-    fn new_v1(&mut self, v2_id: u32, notify: Notify<'static>, difficulty: f32) -> u32 {
+    fn new_v1(
+        &mut self,
+        v2_id: u32,
+        notify: Notify<'static>,
+        difficulty: f32,
+        merge_mining_binding_id: Option<u64>,
+    ) -> u32 {
         let mut v1_id = rand::thread_rng().gen();
         while self.v1_to_v2.contains_key(&v1_id) {
             v1_id = rand::thread_rng().gen();
@@ -1261,8 +1312,14 @@ impl RecentJobs {
             }
         }
         self.v1_to_v2.insert(v1_id, v2_id);
-        self.issued_jobs
-            .insert(v1_id, IssuedJob { notify, difficulty });
+        self.issued_jobs.insert(
+            v1_id,
+            IssuedJob {
+                notify,
+                difficulty,
+                merge_mining_binding_id,
+            },
+        );
         v1_id
     }
     fn remove_v2(&mut self, v2_id: u32) {
@@ -1832,7 +1889,7 @@ mod tests {
         let mut recent_jobs = RecentJobs::new();
         let mut job = first_job("42");
 
-        recent_jobs.add_job(&mut job, None, 1.0);
+        recent_jobs.add_job_with_binding(&mut job, None, 1.0, None);
         let first_v1_id = job.job_id.parse::<u32>().unwrap();
         let first_snapshot = recent_jobs.get_matching_job(first_v1_id).unwrap();
         assert_eq!(first_snapshot.notify.job_id, "42");
@@ -1849,25 +1906,84 @@ mod tests {
     }
 
     #[test]
+    fn recent_jobs_keep_merge_mining_binding_without_changing_bitcoin_difficulty() {
+        let mut recent_jobs = RecentJobs::new();
+        let mut job = first_job("42");
+
+        recent_jobs.add_job_with_binding(&mut job, None, 16_777_216.0, Some(7));
+        let first_v1_id = job.job_id.parse::<u32>().unwrap();
+        let first_snapshot = recent_jobs.get_matching_job(first_v1_id).unwrap();
+        assert_eq!(first_snapshot.difficulty, 16_777_216.0);
+        assert_eq!(first_snapshot.merge_mining_binding_id, Some(7));
+
+        let reissued_job = recent_jobs.clone_last(33_554_432.0).unwrap();
+        let reissued_v1_id = reissued_job.job_id.parse::<u32>().unwrap();
+        let reissued_snapshot = recent_jobs.get_matching_job(reissued_v1_id).unwrap();
+        assert_eq!(reissued_snapshot.difficulty, 33_554_432.0);
+        assert_eq!(reissued_snapshot.merge_mining_binding_id, Some(7));
+    }
+
+    #[test]
+    fn recent_jobs_keep_merge_mining_generation_across_v2_id_reuse() {
+        let mut recent_jobs = RecentJobs::new();
+        let old_notify = first_job("42");
+        recent_jobs.jobs.push_back(RawJob {
+            notify: old_notify.clone(),
+            merge_mining_binding_id: Some(7),
+        });
+        let old_v1_id = recent_jobs.new_v1(42, old_notify, 1.0, Some(7));
+
+        let new_notify = first_job("42");
+        recent_jobs.jobs.push_back(RawJob {
+            notify: new_notify.clone(),
+            merge_mining_binding_id: Some(8),
+        });
+        let new_v1_id = recent_jobs.new_v1(42, new_notify, 4.0, Some(8));
+
+        assert_eq!(
+            recent_jobs
+                .get_matching_job(old_v1_id)
+                .unwrap()
+                .merge_mining_binding_id,
+            Some(7)
+        );
+        assert_eq!(
+            recent_jobs
+                .get_matching_job(new_v1_id)
+                .unwrap()
+                .merge_mining_binding_id,
+            Some(8)
+        );
+        assert_eq!(
+            recent_jobs.jobs.front().unwrap().merge_mining_binding_id,
+            Some(7)
+        );
+        assert_eq!(
+            recent_jobs.jobs.back().unwrap().merge_mining_binding_id,
+            Some(8)
+        );
+    }
+
+    #[test]
     fn recent_jobs_preserve_three_v2_job_retention() {
         let mut recent_jobs = RecentJobs::new();
 
         let mut job_1 = first_job("1");
-        recent_jobs.add_job(&mut job_1, None, 1.0);
+        recent_jobs.add_job_with_binding(&mut job_1, None, 1.0, None);
         let job_1_v1 = job_1.job_id.parse::<u32>().unwrap();
         let job_1_reissued = recent_jobs.clone_last(2.0).unwrap();
         let job_1_reissued_v1 = job_1_reissued.job_id.parse::<u32>().unwrap();
 
         let mut job_2 = first_job("2");
-        recent_jobs.add_job(&mut job_2, None, 2.0);
+        recent_jobs.add_job_with_binding(&mut job_2, None, 2.0, None);
         let job_2_v1 = job_2.job_id.parse::<u32>().unwrap();
 
         let mut job_3 = first_job("3");
-        recent_jobs.add_job(&mut job_3, None, 3.0);
+        recent_jobs.add_job_with_binding(&mut job_3, None, 3.0, None);
         let job_3_v1 = job_3.job_id.parse::<u32>().unwrap();
 
         let mut job_4 = first_job("4");
-        recent_jobs.add_job(&mut job_4, None, 4.0);
+        recent_jobs.add_job_with_binding(&mut job_4, None, 4.0, None);
         let job_4_v1 = job_4.job_id.parse::<u32>().unwrap();
 
         assert_eq!(recent_jobs.current_jobs().len(), 3);

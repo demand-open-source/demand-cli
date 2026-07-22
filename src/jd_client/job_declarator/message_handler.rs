@@ -9,6 +9,7 @@ use roles_logic_sv2::{
 };
 pub type SendTo = SendTo_<JobDeclaration<'static>, ()>;
 use roles_logic_sv2::errors::Error;
+use tracing::warn;
 
 impl ParseServerJobDeclarationMessages for JobDeclarator {
     fn handle_allocate_mining_job_token_success(
@@ -30,21 +31,25 @@ impl ParseServerJobDeclarationMessages for JobDeclarator {
 
     fn handle_declare_mining_job_error(
         &mut self,
-        _message: DeclareMiningJobError,
+        message: DeclareMiningJobError,
     ) -> Result<SendTo, Error> {
-        // TODO consider using declarative names instead of setting states
-        super::super::IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
-        Ok(SendTo::None(None))
+        Ok(SendTo::None(Some(JobDeclaration::DeclareMiningJobError(
+            message.into_static(),
+        ))))
     }
 
     fn handle_provide_missing_transactions(
         &mut self,
         message: ProvideMissingTransactions,
     ) -> Result<SendTo, Error> {
-        let tx_list = self
-            .last_declare_mining_jobs_sent
-            .get(&message.request_id)
-            .ok_or(Error::UnknownRequestId(message.request_id))?
+        let Some(last_declare) = self.last_declare_mining_jobs_sent.get(&message.request_id) else {
+            warn!(
+                request_id = message.request_id,
+                "ignoring missing-transactions request for an unknown declaration"
+            );
+            return Ok(SendTo::None(None));
+        };
+        let tx_list = last_declare
             .clone()
             .ok_or(Error::JDSMissingTransactions)?
             .tx_list

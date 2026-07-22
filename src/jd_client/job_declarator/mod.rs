@@ -42,7 +42,7 @@ use crate::{
     shared::utils::AbortOnDrop,
 };
 
-use super::{error::Error, mining_upstream::Upstream};
+use super::{error::Error, mining_downstream::DownstreamJob, mining_upstream::Upstream};
 
 #[derive(Debug, Clone)]
 pub struct LastDeclareJob {
@@ -50,6 +50,7 @@ pub struct LastDeclareJob {
     template: NewTemplate<'static>,
     coinbase_pool_output: Vec<u8>,
     tx_list: Seq064K<'static, B016M<'static>>,
+    downstream_job: DownstreamJob,
 }
 
 #[derive(Debug)]
@@ -71,12 +72,11 @@ pub struct JobDeclarator {
             NewTemplate<'static>,
             // pool's outputs
             Vec<u8>,
+            DownstreamJob,
         ),
         BuildNoHashHasher<u64>,
     >,
     up: Arc<Mutex<Upstream>>,
-    pub coinbase_tx_prefix: B064K<'static>,
-    pub coinbase_tx_suffix: B064K<'static>,
     pub task_manager: Arc<Mutex<TaskManager>>,
 }
 
@@ -116,8 +116,6 @@ impl JobDeclarator {
             last_set_new_prev_hash: None,
             future_jobs: HashMap::with_hasher(BuildNoHashHasher::default()),
             up,
-            coinbase_tx_prefix: vec![].try_into().expect("Internal error: this operation can not fail because Vec can always be converted into Inner"),
-            coinbase_tx_suffix: vec![].try_into().expect("Internal error: this operation can not fail because Vec can always be converted into Inner"),
             set_new_prev_hash_counter: 0,
             task_manager,
         }));
@@ -127,17 +125,14 @@ impl JobDeclarator {
         Ok((self_, abortable))
     }
 
-    fn get_last_declare_job_sent(
+    fn take_last_declare_job_sent(
         self_mutex: &Arc<Mutex<Self>>,
         request_id: u32,
-    ) -> Result<LastDeclareJob, Error> {
+    ) -> Result<Option<LastDeclareJob>, Error> {
         let id = self_mutex
-            .safe_lock(|s| s.last_declare_mining_jobs_sent.remove(&request_id).clone())
+            .safe_lock(|s| s.last_declare_mining_jobs_sent.remove(&request_id))
             .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
-        Ok(id
-            .expect("Impossible to get last declare job sent")
-            .clone()
-            .expect("This is ok"))
+        Ok(id.flatten())
     }
 
     fn update_last_declare_job_sent(
@@ -219,13 +214,14 @@ impl JobDeclarator {
         }
     }
 
-    pub async fn on_new_template(
+    pub(crate) async fn on_new_template(
         self_mutex: &Arc<Mutex<Self>>,
         template: NewTemplate<'static>,
         token: Vec<u8>,
         tx_list_: Seq064K<'static, B016M<'static>>,
         excess_data: B064K<'static>,
         coinbase_pool_output: Vec<u8>,
+        downstream_job: DownstreamJob,
     ) -> Result<(), Error> {
         let now = std::time::Instant::now();
         while !super::IS_CUSTOM_JOB_SET.load(std::sync::atomic::Ordering::Acquire) {
@@ -275,13 +271,8 @@ impl JobDeclarator {
         }
         let tx_ids: Seq064K<'static, U256> = Seq064K::from(tx_ids);
 
-        let coinbase_prefix = self_mutex
-            .safe_lock(|s| s.coinbase_tx_prefix.clone())
-            .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
-
-        let coinbase_suffix = self_mutex
-            .safe_lock(|s| s.coinbase_tx_suffix.clone())
-            .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
+        let coinbase_prefix = downstream_job.coinbase_tx_prefix.clone();
+        let coinbase_suffix = downstream_job.coinbase_tx_suffix.clone();
 
         let declare_job = DeclareMiningJob {
             request_id: id,
@@ -297,6 +288,7 @@ impl JobDeclarator {
             template,
             coinbase_pool_output,
             tx_list: tx_list_.clone(),
+            downstream_job,
         };
         Self::update_last_declare_job_sent(self_mutex, id, last_declare)?;
         let frame: StdFrame =
@@ -350,8 +342,15 @@ impl JobDeclarator {
                     Ok(SendTo::None(Some(JobDeclaration::DeclareMiningJobSuccess(m)))) => {
                         let new_token = m.new_mining_job_token;
                         let last_declare =
-                            match Self::get_last_declare_job_sent(&self_mutex, m.request_id) {
-                                Ok(last_declare) => last_declare,
+                            match Self::take_last_declare_job_sent(&self_mutex, m.request_id) {
+                                Ok(Some(last_declare)) => last_declare,
+                                Ok(None) => {
+                                    warn!(
+                                        request_id = m.request_id,
+                                        "ignoring unknown or late mining-job declaration success"
+                                    );
+                                    continue;
+                                }
                                 Err(e) => {
                                     error!("{e}");
                                     ProxyState::update_jd_state(JdState::Down);
@@ -363,6 +362,7 @@ impl JobDeclarator {
                         let id = last_declare.template.template_id;
                         let merkle_path = last_declare.template.merkle_path.clone();
                         let template = last_declare.template;
+                        let downstream_job = last_declare.downstream_job;
 
                         // TODO where we should have a sort of signaling that is green after
                         // that the token has been updated so that on_set_new_prev_hash know it
@@ -377,6 +377,7 @@ impl JobDeclarator {
                                         merkle_path,
                                         template,
                                         last_declare.coinbase_pool_output,
+                                        downstream_job,
                                     ),
                                 );
                             }) {
@@ -410,13 +411,23 @@ impl JobDeclarator {
                                     template.coinbase_tx_value_remaining,
                                     pool_outs,
                                     template.coinbase_tx_locktime,
-                                    template.template_id
+                                    template.template_id,
+                                    downstream_job,
                                     ).await {error!("Failed to set custom jobd: {e}"); ProxyState::update_jd_state(JdState::Down);break;},
                                 None => panic!("Invalid state we received a NewTemplate not future, without having received a set new prev hash")
                             }
                         }
                     }
                     Ok(SendTo::None(Some(JobDeclaration::DeclareMiningJobError(m)))) => {
+                        let removed = self_mutex
+                            .safe_lock(|state| {
+                                state.last_declare_mining_jobs_sent.remove(&m.request_id)
+                            })
+                            .unwrap_or(None);
+                        if removed.is_some() {
+                            super::IS_CUSTOM_JOB_SET
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         error!("Job is not verified: {:?}", m);
                     }
                     Ok(SendTo::None(None)) => (),
@@ -471,7 +482,7 @@ impl JobDeclarator {
                 error!("{}", Error::JobDeclaratorMutexCorrupted);
                 return;
             };
-            let (job, up, merkle_path, template, mut pool_outs) = loop {
+            let (job, up, merkle_path, template, mut pool_outs, downstream_job) = loop {
                 match self_mutex.safe_lock(|s| {
                     if s.set_new_prev_hash_counter > 1
                         && s.last_set_new_prev_hash != Some(set_new_prev_hash.clone())
@@ -480,13 +491,20 @@ impl JobDeclarator {
                         s.set_new_prev_hash_counter -= 1;
                         Some(None)
                     } else {
-                        s.future_jobs
-                            .remove(&id)
-                            .map(|(job, merkle_path, template, pool_outs)| {
+                        s.future_jobs.remove(&id).map(
+                            |(job, merkle_path, template, pool_outs, downstream_job)| {
                                 s.future_jobs = HashMap::with_hasher(BuildNoHashHasher::default());
                                 s.set_new_prev_hash_counter -= 1;
-                                Some((job, s.up.clone(), merkle_path, template, pool_outs))
-                            })
+                                Some((
+                                    job,
+                                    s.up.clone(),
+                                    merkle_path,
+                                    template,
+                                    pool_outs,
+                                    downstream_job,
+                                ))
+                            },
+                        )
                     }
                 }) {
                     Ok(Some(Some(future_job_tuple))) => break future_job_tuple,
@@ -522,6 +540,7 @@ impl JobDeclarator {
                 pool_outs,
                 template.coinbase_tx_locktime,
                 template.template_id,
+                downstream_job,
             )
             .await
             {
@@ -534,20 +553,20 @@ impl JobDeclarator {
     }
 
     async fn allocate_tokens(self_mutex: &Arc<Mutex<Self>>, token_to_allocate: u32) {
-        for i in 0..token_to_allocate {
+        for _ in 0..token_to_allocate {
+            let (request_id, sender) =
+                match self_mutex.safe_lock(|state| (state.req_ids.next(), state.sender.clone())) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        error!(%error, "Job declarator state is unavailable");
+                        ProxyState::update_jd_state(JdState::Down);
+                        return;
+                    }
+                };
             let message = JobDeclaration::AllocateMiningJobToken(AllocateMiningJobToken {
                 user_identifier: "todo".to_string().try_into().expect("Infallible operation"),
-                request_id: i,
+                request_id,
             });
-            let sender = match self_mutex.safe_lock(|s| s.sender.clone()) {
-                Ok(sender) => sender,
-                Err(e) => {
-                    error!("{e}");
-                    //Poison lock
-                    ProxyState::update_jd_state(JdState::Down);
-                    return;
-                }
-            };
 
             // Safe unwrap message is build above and is valid, below can never panic
             let frame: StdFrame = PoolMessages::JobDeclaration(message)

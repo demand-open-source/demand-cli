@@ -155,7 +155,7 @@ pub fn relay_up(
                     break;
                 };
             } else {
-                panic!("Internal Mining downstream try to send invalid message");
+                error!("Dropping invalid internal mining message; keeping the proxy alive");
             }
         }
     });

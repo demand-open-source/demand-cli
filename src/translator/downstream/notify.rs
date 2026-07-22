@@ -1,6 +1,7 @@
 use crate::proxy_state::{DownstreamType, ProxyState};
 use crate::translator::downstream::SUBSCRIBE_TIMEOUT_SECS;
 use crate::translator::error::Error;
+use crate::translator::MiningNotify;
 
 use super::{downstream::Downstream, task_manager::TaskManager};
 use roles_logic_sv2::utils::Mutex;
@@ -18,10 +19,11 @@ fn current_or_initial_job(downstream: &mut Downstream) -> server_to_client::Noti
     }
 
     let mut first_job = downstream.first_job.clone();
-    downstream.recent_jobs.add_job(
+    downstream.recent_jobs.add_job_with_binding(
         &mut first_job,
         downstream.version_rolling_mask.clone(),
         difficulty,
+        downstream.first_job_merge_mining_binding_id,
     );
     first_job
 }
@@ -29,7 +31,7 @@ fn current_or_initial_job(downstream: &mut Downstream) -> server_to_client::Noti
 pub async fn start_notify(
     task_manager: Arc<Mutex<TaskManager>>,
     downstream: Arc<Mutex<Downstream>>,
-    mut rx_sv1_notify: broadcast::Receiver<server_to_client::Notify<'static>>,
+    mut rx_sv1_notify: broadcast::Receiver<MiningNotify>,
     host: String,
     connection_id: u32,
 ) -> Result<(), Error<'static>> {
@@ -126,7 +128,7 @@ pub async fn start_notify(
                 warn!("Translator impossible to start update task: {e}");
             } else if authorized_in_time {
                 loop {
-                    let mut sv1_mining_notify_msg = match rx_sv1_notify.recv().await {
+                    let mining_notify = match rx_sv1_notify.recv().await {
                         Ok(msg) => msg,
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!(
@@ -137,14 +139,21 @@ pub async fn start_notify(
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     };
+                    let mut sv1_mining_notify_msg = mining_notify.notify;
+                    let merge_mining_binding_id = mining_notify.merge_mining_binding_id;
 
                     if downstream
                         .safe_lock(|d| {
                             d.first_job = sv1_mining_notify_msg.clone();
+                            d.first_job_merge_mining_binding_id = merge_mining_binding_id;
                             let mask = d.version_rolling_mask.clone();
                             let difficulty = d.current_difficulty();
-                            d.recent_jobs
-                                .add_job(&mut sv1_mining_notify_msg, mask, difficulty);
+                            d.recent_jobs.add_job_with_binding(
+                                &mut sv1_mining_notify_msg,
+                                mask,
+                                difficulty,
+                                merge_mining_binding_id,
+                            );
                             debug!(
                                 "Downstream {}: Added job_id {} to recent_notifies. Current jobs: {:?}",
                                 connection_id,

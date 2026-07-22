@@ -176,7 +176,7 @@ pub fn validate_share(
     request: &client_to_server::Submit<'static>,
     job: &Notify<'static>,
     difficulty: f32,
-    extranonce1: Vec<u8>,
+    extranonce1: &[u8],
     version_rolling_mask: Option<sv1_api::utils::HexU32Be>,
 ) -> bool {
     if share_log_enabled() {
@@ -200,20 +200,15 @@ pub fn validate_share(
     }
 
     let mut extranonce = Vec::new();
-    extranonce.extend_from_slice(extranonce1.as_ref());
+    extranonce.extend_from_slice(extranonce1);
     extranonce.extend_from_slice(request.extra_nonce2.0.as_ref());
     let extranonce: &[u8] = extranonce.as_ref();
 
-    let job_version = job.version.0;
-    let request_version = request
-        .version_bits
-        .clone()
-        .map(|vb| vb.0)
-        .unwrap_or(job_version);
-    let mask = version_rolling_mask
-        .unwrap_or(sv1_api::utils::HexU32Be(0x1FFFE000_u32))
-        .0;
-    let version = (job_version & !mask) | (request_version & mask);
+    let version = effective_version(
+        job.version.0,
+        request.version_bits.as_ref(),
+        version_rolling_mask.as_ref(),
+    );
 
     let mut hash = get_hash(
         request.nonce.0,
@@ -244,6 +239,16 @@ pub fn validate_share(
 
     error!("Share rejected: Does not meet job difficulty");
     false
+}
+
+pub(crate) fn effective_version(
+    job_version: u32,
+    request_version: Option<&sv1_api::utils::HexU32Be>,
+    version_rolling_mask: Option<&sv1_api::utils::HexU32Be>,
+) -> u32 {
+    let request_version = request_version.map_or(job_version, |version| version.0);
+    let mask = version_rolling_mask.map_or(0x1fff_e000_u32, |mask| mask.0);
+    (job_version & !mask) | (request_version & mask)
 }
 
 pub fn submit_error_to_rejection_reason(error_code: &str) -> RejectionReason {

@@ -32,6 +32,7 @@ mod debug_timing;
 mod ingress;
 pub use config::Configuration;
 pub mod jd_client;
+mod merge_mining;
 mod minin_pool_connection;
 mod monitor;
 mod prioritized_transactions;
@@ -309,8 +310,10 @@ async fn initialize_proxy(
         }
         let server_handle =
             tokio::spawn(api::start(router.clone(), stats_sender, downstream_handoff));
-        abort_handles.push((server_handle.into(), "api_server".to_string()));
-        match monitor(router, abort_handles, epsilon, shutdown_signal.clone()).await {
+        let api_server_abortable: AbortOnDrop = server_handle.into();
+        let reconnect = monitor(router, abort_handles, epsilon, shutdown_signal.clone()).await;
+        drop(api_server_abortable);
+        match reconnect {
             Reconnect::NewUpstream(new_pool_addr) => {
                 ProxyState::update_proxy_state_up();
                 pool_addr = Some(new_pool_addr);

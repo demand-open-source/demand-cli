@@ -9,7 +9,11 @@ mod utils;
 use bitcoin::Address;
 use error::Error;
 
-use roles_logic_sv2::{parsers::Mining, utils::Mutex};
+use roles_logic_sv2::{
+    mining_sv2::{NewExtendedMiningJob, SetNewPrevHash},
+    parsers::Mining,
+    utils::Mutex,
+};
 use tracing::error;
 
 use std::sync::Arc;
@@ -27,6 +31,21 @@ use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
 use self::upstream::diff_management::UpstreamDifficultyConfig;
 mod task_manager;
 use task_manager::TaskManager;
+
+#[derive(Debug, Clone)]
+pub(crate) struct MiningNotify {
+    pub(crate) notify: server_to_client::Notify<'static>,
+    pub(crate) merge_mining_binding_id: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) enum BridgeWork {
+    NewExtendedMiningJob {
+        job: NewExtendedMiningJob<'static>,
+        merge_mining_binding_id: Option<u64>,
+    },
+    SetNewPrevHash(SetNewPrevHash<'static>),
+}
 
 pub async fn start(
     downstreams: TReceiver<crate::DownstreamConnection>,
@@ -63,16 +82,10 @@ pub async fn start(
     let (tx_sv2_submit_shares_ext, rx_sv2_submit_shares_ext) =
         channel(crate::TRANSLATOR_BUFFER_SIZE);
 
-    // Sender/Receiver to send a SV2 `SetNewPrevHash` message from the `Upstream` to the `Bridge`
-    // (Sender<SetNewPrevHash<'static>>, Receiver<SetNewPrevHash<'static>>)
-    let (tx_sv2_set_new_prev_hash, rx_sv2_set_new_prev_hash) =
-        channel(crate::TRANSLATOR_BUFFER_SIZE);
-
-    // Sender/Receiver to send a SV2 `NewExtendedMiningJob` message from the `Upstream` to the
-    // `Bridge`
-    // (Sender<NewExtendedMiningJob<'static>>, Receiver<NewExtendedMiningJob<'static>>)
-    let (tx_sv2_new_ext_mining_job, rx_sv2_new_ext_mining_job) =
-        channel(crate::TRANSLATOR_BUFFER_SIZE);
+    // One FIFO preserves the pool's ordering between jobs and prevhash transitions. Processing
+    // these message types in separate tasks can pair a post-prevhash job with stale factory state
+    // even though both source streams were individually ordered.
+    let (tx_bridge_work, rx_bridge_work) = channel(crate::TRANSLATOR_BUFFER_SIZE);
 
     // Sender/Receiver to send a new extranonce from the `Upstream` to this `main` function to be
     // passed to the `Downstream` upon a Downstream role connection
@@ -83,8 +96,8 @@ pub async fn start(
 
     // Sender/Receiver to send SV1 `mining.notify` message from the `Bridge` to the `Downstream`
     let (tx_sv1_notify, _): (
-        broadcast::Sender<server_to_client::Notify>,
-        broadcast::Receiver<server_to_client::Notify>,
+        broadcast::Sender<MiningNotify>,
+        broadcast::Receiver<MiningNotify>,
     ) = broadcast::channel(crate::TRANSLATOR_BUFFER_SIZE);
 
     let channel_nominal_hashrate = 0.0;
@@ -97,8 +110,7 @@ pub async fn start(
 
     // Instantiate a new `Upstream` (SV2 Pool)
     let upstream = upstream::Upstream::new(
-        tx_sv2_set_new_prev_hash,
-        tx_sv2_new_ext_mining_job,
+        tx_bridge_work,
         crate::MIN_EXTRANONCE_SIZE - 1,
         tx_sv2_extranonce,
         target.clone(),
@@ -162,20 +174,14 @@ pub async fn start(
                 }
             };
 
-            let bridge_aborter = match proxy::Bridge::start(
-                b.clone(),
-                rx_sv2_set_new_prev_hash,
-                rx_sv2_new_ext_mining_job,
-                rx_sv1_bridge,
-            )
-            .await
-            {
-                Ok(abortable) => abortable,
-                Err(e) => {
-                    error!("Failed to start bridge: {e}");
-                    return;
-                }
-            };
+            let bridge_aborter =
+                match proxy::Bridge::start(b.clone(), rx_bridge_work, rx_sv1_bridge).await {
+                    Ok(abortable) => abortable,
+                    Err(e) => {
+                        error!("Failed to start bridge: {e}");
+                        return;
+                    }
+                };
 
             let downstream_aborter = match downstream::Downstream::accept_connections(
                 tx_sv1_bridge,

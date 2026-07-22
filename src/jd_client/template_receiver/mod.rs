@@ -2,7 +2,8 @@ mod task_manager;
 use crate::proxy_state::{DownstreamType, JdState, TpState};
 use crate::shared::utils::AbortOnDrop;
 use crate::{
-    jd_client::mining_downstream::DownstreamMiningNode as Downstream, proxy_state::ProxyState,
+    jd_client::mining_downstream::{DownstreamJob, DownstreamMiningNode as Downstream},
+    proxy_state::ProxyState,
 };
 
 use super::{error::Error, job_declarator::JobDeclarator};
@@ -41,7 +42,29 @@ pub struct TemplateRx {
     down: Arc<Mutex<Downstream>>,
     new_template_message: Option<NewTemplate<'static>>,
     miner_coinbase_output: Vec<u8>,
+    merge_mining_enabled: bool,
     test_only_do_not_send_solution_to_tp: bool,
+}
+
+fn coinbase_capacity_with_merge_mining(base: u32, enabled: bool) -> (u32, Option<usize>) {
+    if !enabled {
+        return (base, None);
+    }
+    match base.checked_add(crate::merge_mining::RESERVED_COINBASE_OUTPUT_BYTES) {
+        Some(advertised) => (
+            advertised,
+            Some(crate::merge_mining::RESERVED_COINBASE_OUTPUT_BYTES as usize),
+        ),
+        None => (base, None),
+    }
+}
+
+fn will_publish_template(
+    wait_for_last_template_to_be_completed: bool,
+    go_to_next_template: bool,
+    discard_last_and_use_this: bool,
+) -> bool {
+    wait_for_last_template_to_be_completed || (!go_to_next_template && discard_last_and_use_this)
 }
 
 impl TemplateRx {
@@ -101,6 +124,7 @@ impl TemplateRx {
             down,
             new_template_message: None,
             miner_coinbase_output: encoded_outputs,
+            merge_mining_enabled: crate::merge_mining::enabled(),
             test_only_do_not_send_solution_to_tp,
         }));
 
@@ -212,6 +236,12 @@ impl TemplateRx {
             .safe_lock(|s| s.miner_coinbase_output.clone())
             .map_err(|_| Error::TemplateRxMutexCorrupted)?;
         let miner_name = crate::config::Configuration::miner_name();
+        let merge_mining_enabled = self_mutex
+            .safe_lock(|template_rx| template_rx.merge_mining_enabled)
+            .map_err(|_| Error::TemplateRxMutexCorrupted)?;
+        if merge_mining_enabled {
+            crate::merge_mining::global().begin_template_session();
+        }
         let main_task = {
             let self_mutex = self_mutex.clone();
             //? check
@@ -219,6 +249,9 @@ impl TemplateRx {
                 // Send CoinbaseOutputDataSize size to TP
                 let mut pending_new_template: Option<NewTemplate<'static>> = None;
                 let mut pending_tx_data_template_id: Option<u64> = None;
+                let mut pending_downstream_job: Option<DownstreamJob> = None;
+                let mut pending_template_generation: Option<u64> = None;
+                let mut merge_mining_reserved_bytes = None;
                 loop {
                     if last_token.is_none() {
                         let jd = match self_mutex.safe_lock(|s| s.jd.clone()) {
@@ -240,11 +273,17 @@ impl TemplateRx {
 
                     if !coinbase_output_max_additional_size_sent {
                         coinbase_output_max_additional_size_sent = true;
-                        Self::send_max_coinbase_size(
-                            &self_mutex,
+                        let (advertised_size, reserved_bytes) = coinbase_capacity_with_merge_mining(
                             coinbase_output_max_additional_size,
-                        )
-                        .await;
+                            merge_mining_enabled,
+                        );
+                        merge_mining_reserved_bytes = reserved_bytes;
+                        if merge_mining_enabled && reserved_bytes.is_none() {
+                            warn!(
+                                "Cannot reserve merge-mining coinbase output capacity; continuing with Bitcoin-only templates"
+                            );
+                        }
+                        Self::send_max_coinbase_size(&self_mutex, advertised_size).await;
                     }
 
                     let ready_for_new_template = super::IS_NEW_TEMPLATE_HANDLED
@@ -360,6 +399,96 @@ impl TemplateRx {
                                     let discard_last_and_use_this =
                                         !last_is_future && !wait_for_last_template_to_be_completed;
 
+                                    let will_publish_template = will_publish_template(
+                                        wait_for_last_template_to_be_completed,
+                                        go_to_next_template,
+                                        discard_last_and_use_this,
+                                    );
+
+                                    if will_publish_template {
+                                        pending_downstream_job = None;
+                                        pending_template_generation = None;
+                                        if let Some(reserved_bytes) = merge_mining_reserved_bytes {
+                                            let pristine_template = m.clone();
+                                            let pool_output_count = last_token
+                                                .as_ref()
+                                                .and_then(|token| token.as_ref())
+                                                .and_then(|token| {
+                                                    Downstream::decode_pool_coinbase_outputs(
+                                                        token.coinbase_output.as_ref(),
+                                                    )
+                                                    .ok()
+                                                })
+                                                .map_or(usize::MAX, |outputs| outputs.len());
+                                            match crate::merge_mining::global()
+                                                .apply_to_template_with_pool_output_count(
+                                                    &mut m,
+                                                    reserved_bytes,
+                                                    pool_output_count,
+                                                ) {
+                                                Ok(true) => {
+                                                    pending_template_generation =
+                                                        crate::merge_mining::global()
+                                                            .template_generation(m.template_id);
+                                                    if let Some(template_generation) =
+                                                        pending_template_generation
+                                                    {
+                                                        let pool_output = last_token
+                                                            .as_ref()
+                                                            .and_then(|token| token.as_ref())
+                                                            .map(|token| {
+                                                                token.coinbase_output.to_vec()
+                                                            });
+                                                        let preview = pool_output
+                                                            .as_deref()
+                                                            .ok_or(crate::jd_client::error::Error::Unrecoverable)
+                                                            .and_then(|pool_output| {
+                                                                Downstream::preview_template_job(
+                                                                    &down,
+                                                                    m.clone(),
+                                                                    pool_output,
+                                                                )
+                                                                .map(|_| ())
+                                                            });
+                                                        if let Err(error) = preview {
+                                                            crate::merge_mining::global()
+                                                                .discard_template_generation(
+                                                                    template_generation,
+                                                                );
+                                                            pending_template_generation = None;
+                                                            m = pristine_template;
+                                                            warn!(
+                                                                template_id = m.template_id,
+                                                                %error,
+                                                                "RSK candidate job preflight failed; using the pristine Bitcoin template"
+                                                            );
+                                                        } else {
+                                                            info!(
+                                                                template_id = m.template_id,
+                                                                "added RSK commitment to canonical Bitcoin mining job"
+                                                            );
+                                                        }
+                                                    } else {
+                                                        m = pristine_template;
+                                                        warn!(
+                                                            template_id = m.template_id,
+                                                            "RSK context was unavailable; using the pristine Bitcoin template"
+                                                        );
+                                                    }
+                                                }
+                                                Ok(false) => {}
+                                                Err(error) => {
+                                                    m = pristine_template;
+                                                    warn!(
+                                                        template_id = m.template_id,
+                                                        %error,
+                                                        "RSK commitment was not applied; using the pristine Bitcoin template"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     if wait_for_last_template_to_be_completed {
                                         info!("wait_for_last_template_to_be_completed");
                                         if new_phash {
@@ -388,19 +517,27 @@ impl TemplateRx {
                                             None => break,
                                         };
                                         let pool_output = token.coinbase_output.to_vec();
-                                        if let Err(e) = Downstream::on_new_template(
+                                        match Downstream::on_new_template(
                                             &down,
                                             m.clone(),
                                             &pool_output[..],
+                                            pending_template_generation,
                                         )
                                         .await
                                         {
-                                            error!("{e:?}");
-                                            // Update global downstream state to down
-                                            ProxyState::update_downstream_state(
-                                                DownstreamType::JdClientMiningDownstream,
-                                            );
-                                        };
+                                            Ok(job) => pending_downstream_job = job,
+                                            Err(e) => {
+                                                super::IS_NEW_TEMPLATE_HANDLED.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                error!("{e:?}");
+                                                // Update global downstream state to down
+                                                ProxyState::update_downstream_state(
+                                                    DownstreamType::JdClientMiningDownstream,
+                                                );
+                                            }
+                                        }
                                     } else if go_to_next_template {
                                         // last_is_future	this_future	new_phash wait  next   discard
                                         // 1)true           false	    true	  true	true
@@ -447,19 +584,27 @@ impl TemplateRx {
                                             None => break,
                                         };
                                         let pool_output = token.coinbase_output.to_vec();
-                                        if let Err(e) = Downstream::on_new_template(
+                                        match Downstream::on_new_template(
                                             &down,
                                             m.clone(),
                                             &pool_output[..],
+                                            pending_template_generation,
                                         )
                                         .await
                                         {
-                                            error!("{e:?}");
-                                            // Update global downstream state to down
-                                            ProxyState::update_downstream_state(
-                                                DownstreamType::JdClientMiningDownstream,
-                                            );
-                                        };
+                                            Ok(job) => pending_downstream_job = job,
+                                            Err(e) => {
+                                                super::IS_NEW_TEMPLATE_HANDLED.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                error!("{e:?}");
+                                                // Update global downstream state to down
+                                                ProxyState::update_downstream_state(
+                                                    DownstreamType::JdClientMiningDownstream,
+                                                );
+                                            }
+                                        }
                                     } else {
                                         unreachable!();
                                     }
@@ -484,14 +629,25 @@ impl TemplateRx {
                                         tokio::task::yield_now().await;
                                     }
                                     info!("IS_NEW_TEMPLATE_HANDLED ok");
+                                    if crate::merge_mining::enabled() {
+                                        if let Ok(prev_hash) =
+                                            <[u8; 32]>::try_from(m.prev_hash.to_vec())
+                                        {
+                                            crate::merge_mining::global().record_chain_state(
+                                                m.template_id,
+                                                prev_hash,
+                                                m.n_bits,
+                                            );
+                                        }
+                                    }
                                     if let Some(jd) = jd.as_ref() {
                                         if let Err(e) = super::job_declarator::JobDeclarator::on_set_new_prev_hash(
-                                    jd.clone(),
-                                    m.clone(),
-                                ).await {
-                                    error!("{e:?}");
-                                    ProxyState::update_jd_state(JdState::Down); break;
-                                };
+                                            jd.clone(),
+                                            m.clone(),
+                                        ).await {
+                                            error!("{e:?}");
+                                            ProxyState::update_jd_state(JdState::Down); break;
+                                        };
                                     }
                                     if let Err(e) = Downstream::on_set_new_prev_hash(&down, m).await
                                     {
@@ -518,6 +674,8 @@ impl TemplateRx {
                                             error!("TemplateRx mutex poisoned: {e}");
                                             ProxyState::update_tp_state(TpState::Down);
                                             pending_tx_data_template_id = None;
+                                            pending_downstream_job = None;
+                                            pending_template_generation = None;
                                             last_token = None;
                                             continue;
                                         }
@@ -527,6 +685,8 @@ impl TemplateRx {
                                         None => {
                                             ProxyState::update_tp_state(TpState::Down);
                                             pending_tx_data_template_id = None;
+                                            pending_downstream_job = None;
+                                            pending_template_generation = None;
                                             last_token = None;
                                             continue;
                                         }
@@ -537,22 +697,39 @@ impl TemplateRx {
                                             m.template_id
                                         );
                                         pending_tx_data_template_id = None;
+                                        pending_downstream_job = None;
+                                        pending_template_generation = None;
                                         last_token = None;
                                         continue;
+                                    }
+                                    let transactions = m.transaction_list.into_inner();
+                                    let excess_data = m.excess_data;
+                                    if merge_mining_enabled {
+                                        if let Some(template_generation) =
+                                            pending_template_generation
+                                        {
+                                            crate::merge_mining::global().record_transaction_count(
+                                                template_generation,
+                                                transactions.len(),
+                                            );
+                                        }
                                     }
                                     let token = match last_token.take() {
                                         Some(Some(token)) => token,
                                         Some(None) => break,
                                         None => break,
                                     };
+                                    let downstream_job = pending_downstream_job.take();
+                                    pending_template_generation = None;
                                     pending_tx_data_template_id = None;
                                     let jd = jd.clone();
                                     tokio::task::spawn(async move {
-                                        let transactions_data = m.transaction_list;
-                                        let excess_data = m.excess_data;
+                                        let transactions_data = transactions.into();
                                         let mining_token = token.mining_job_token.to_vec();
                                         let pool_coinbase_out = token.coinbase_output.to_vec();
-                                        if let Some(jd) = jd.as_ref() {
+                                        if let (Some(jd), Some(downstream_job)) =
+                                            (jd.as_ref(), downstream_job)
+                                        {
                                             if let Err(e) = super::job_declarator::JobDeclarator::on_new_template(
                                                 jd,
                                                 new_template_message,
@@ -560,6 +737,7 @@ impl TemplateRx {
                                                 transactions_data,
                                                 excess_data,
                                                 pool_coinbase_out,
+                                                downstream_job,
                                             )
                                             .await {
                                                 error!("{e:?}");
@@ -571,6 +749,8 @@ impl TemplateRx {
                                 Some(TemplateDistribution::RequestTransactionDataError(m)) => {
                                     if pending_tx_data_template_id == Some(m.template_id) {
                                         pending_tx_data_template_id = None;
+                                        pending_downstream_job = None;
+                                        pending_template_generation = None;
                                         last_token = None;
                                     }
                                     warn!("The prev_hash of the template requested to Template Provider no longer points to the latest tip. Continuing work on the updated template.")
@@ -653,6 +833,53 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::Duration;
+
+    #[test]
+    fn merge_mining_capacity_is_reserved_only_when_configured() {
+        assert_eq!(coinbase_capacity_with_merge_mining(1, false), (1, None));
+        assert_eq!(
+            coinbase_capacity_with_merge_mining(1, true),
+            (
+                1 + crate::merge_mining::RESERVED_COINBASE_OUTPUT_BYTES,
+                Some(crate::merge_mining::RESERVED_COINBASE_OUTPUT_BYTES as usize)
+            )
+        );
+        assert_eq!(
+            coinbase_capacity_with_merge_mining(u32::MAX, true),
+            (u32::MAX, None)
+        );
+    }
+
+    #[test]
+    fn merge_mining_preparation_matches_template_publication_precedence() {
+        let cases = [
+            (true, true, true, true),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, false, false, true),
+            (false, true, true, true),
+            (false, true, false, true),
+            (false, false, true, false),
+            (false, false, false, true),
+        ];
+
+        for (last_is_future, current_is_future, new_phash, expected) in cases {
+            let wait_for_last_template_to_be_completed = last_is_future || !new_phash;
+            let go_to_next_template = !current_is_future && new_phash;
+            let discard_last_and_use_this =
+                !last_is_future && !wait_for_last_template_to_be_completed;
+
+            assert_eq!(
+                will_publish_template(
+                    wait_for_last_template_to_be_completed,
+                    go_to_next_template,
+                    discard_last_and_use_this,
+                ),
+                expected,
+                "last_is_future={last_is_future}, current_is_future={current_is_future}, new_phash={new_phash}"
+            );
+        }
+    }
 
     fn make_new_template(template_id: u64, future_template: bool) -> NewTemplate<'static> {
         let coinbase_prefix: B0255<'static> = Vec::new()
@@ -853,6 +1080,7 @@ mod tests {
             down,
             new_template_message: None,
             miner_coinbase_output: encoded_outputs,
+            merge_mining_enabled: false,
             test_only_do_not_send_solution_to_tp: true,
         }));
         let _abortable = TemplateRx::start_templates(self_mutex, tp_to_client_rx)

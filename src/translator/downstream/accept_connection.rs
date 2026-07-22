@@ -4,13 +4,13 @@ use crate::{
     proxy_state::{DownstreamType, ProxyState},
     translator::{
         error::Error, proxy::Bridge, upstream::diff_management::UpstreamDifficultyConfig,
+        MiningNotify,
     },
 };
 
 use super::{downstream::Downstream, task_manager::TaskManager, DownstreamMessages};
 use roles_logic_sv2::utils::Mutex;
 use std::sync::Arc;
-use sv1_api::server_to_client;
 use tokio::sync::{
     broadcast,
     mpsc::{Receiver, Sender},
@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 pub async fn start_accept_connection(
     task_manager: Arc<Mutex<TaskManager>>,
     tx_sv1_submit: Sender<DownstreamMessages>,
-    tx_mining_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+    tx_mining_notify: broadcast::Sender<MiningNotify>,
     bridge: Arc<Mutex<super::super::proxy::Bridge>>,
     upstream_difficulty_config: Arc<Mutex<UpstreamDifficultyConfig>>,
     mut downstreams: Receiver<crate::DownstreamConnection>,

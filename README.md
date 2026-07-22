@@ -121,6 +121,73 @@ POOL_ADDRESSES=pool-a.example.com:20000,pool-b.example.com:20000 \
 ./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
 ```
 
+### 4.3 RSK merge mining
+
+See [MERGE_MINING.md](MERGE_MINING.md) for the proxy design, safety model, complete bridge HTTP
+contract, RskJ proof format, byte-order rules, and a bridge conformance checklist.
+
+RSK merge mining requires Job Declaration mode (`--tp-address`), a Template Provider that honors
+the advertised coinbase-output allowance, RskJ, and the `demand-rsk-op-return-bridge` service from
+the adjacent DEMAND repository. The client reserves 100 additional serialized coinbase-output
+bytes when it advertises capacity to the Template Provider. If that reservation or an RSK
+operation fails, the original Bitcoin template and Bitcoin share paths remain authoritative.
+
+Before an RSK proof can be queued, the client also enforces RskJ's raw-coinbase rule: the desired
+payload must start at the last raw `RSKBLOCK:` marker and no more than 128 bytes may follow its hash
+in the witness-stripped coinbase. It validates the prospective outputs plus locktime before
+publishing the job, including markers that could be assembled across serialized field boundaries.
+
+Configure a non-empty secret on the DMND client and run it with the Template Provider:
+
+```sh
+API_BIND_ADDRESS=127.0.0.1 \
+API_SECRET=<shared-secret> \
+TOKEN=<DMND-token> \
+./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
+```
+
+RskJ's HTTP RPC configuration must enable both merge-mining work and the miner server:
+
+```text
+-Drpc.modules.mnr.enabled=true -Dminer.server.enabled=true
+```
+
+From `../demand/rust-backend`, run the bridge with the same secret:
+
+```sh
+DMND_CLIENT_API_SECRET=<shared-secret> \
+DMND_CLIENT_OP_RETURN_URL=http://127.0.0.1:3001/api/coinbase/op-return \
+DMND_CLIENT_FOUND_JOB_URL=http://127.0.0.1:3001/api/merge-mining/found-job \
+RSK_RPC_URL=http://127.0.0.1:4444 \
+cargo run -p demand-rsk-op-return-bridge
+```
+
+The companion bridge interoperates with this proxy but currently relies on the proxy and RskJ for
+some proof-coherence validation, and its pending proof retry queue has no hard item cap. See the
+production validation and bounded-state requirements in
+[MERGE_MINING.md](MERGE_MINING.md#5-byte-order-and-proof-validation) when building or hardening a
+bridge across a separate trust boundary.
+
+The bridge posts each atomic RSK payload/target pair to the first endpoint and destructively polls
+proof candidates from the second. The client keeps at most 32 proof candidates in memory and drops
+the oldest candidate on overflow; no merge-mining queue operation blocks Bitcoin share handling.
+Merge mining never lowers a miner's normal Bitcoin difficulty. The bounded MM observer evaluates
+every authenticated, structurally valid share the miner submits before normal Bitcoin-difficulty
+filtering. If the RSK target is easier than the miner's assigned target, however, the ASIC does not
+report every RSK-only hash and those unreported hashes cannot be observed. This intentional
+stability-first policy avoids increasing miner traffic or changing Bitcoin difficulty.
+
+Run the bridge and DMND client as separate supervised processes. A bridge crash or restart must not
+restart the DMND client. Whenever the DMND client process restarts, restart the bridge after the
+client API is healthy so the bridge reposts the current RSK work. Pool or Job Declaration
+reconnects inside the same DMND client process retain the desired pair. Synchronize the client and
+bridge hosts to UTC with NTP or chrony because proof expiration uses the client's
+`observed_at_unix_ts` value.
+
+The merge-mining endpoints use a shared secret in request data and do not provide TLS. Keep the API
+on a trusted network or place it behind an authenticated TLS reverse proxy and firewall; do not
+expose port 3001 directly to the Internet.
+
 ## 5. Connect Your Miners
 
 With Bitcoin Core, sv2-tp, and the DMND Client all running, point your ASICs at the machine running the DMND Client:
