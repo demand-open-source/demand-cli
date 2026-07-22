@@ -13,7 +13,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
 };
-use sv1_api::{client_to_server::Submit, server_to_client, utils::HexU32Be};
+use sv1_api::{client_to_server::Submit, utils::HexU32Be};
 use tokio::sync::broadcast;
 
 use super::{
@@ -23,6 +23,7 @@ use super::{
             UpstreamSubmitShare,
         },
         error::{Error, ProxyResult},
+        MiningNotify,
     },
     task_manager::TaskManager,
 };
@@ -30,7 +31,10 @@ use crate::{
     proxy_state::{ProxyState, TranslatorState, UpstreamType},
     share_log_enabled,
     shared::utils::AbortOnDrop,
-    translator::utils::{allow_submit_share, submit_error_to_rejection_reason},
+    translator::{
+        utils::{allow_submit_share, submit_error_to_rejection_reason},
+        BridgeWork,
+    },
 };
 use lazy_static::lazy_static;
 use roles_logic_sv2::{channel_logic::channel_factory::OnNewShare, Error as RolesLogicError};
@@ -38,6 +42,12 @@ use tracing::{debug, error, info, warn};
 
 lazy_static! {
     static ref SUBMIT_FAIL_COUNTER: AtomicU32 = AtomicU32::new(0);
+}
+
+#[derive(Debug, Clone)]
+struct BoundExtendedJob {
+    job: NewExtendedMiningJob<'static>,
+    merge_mining_binding_id: Option<u64>,
 }
 
 /// Bridge between the SV2 `Upstream` and SV1 `Downstream` responsible for the following messaging
@@ -51,7 +61,7 @@ pub struct Bridge {
     tx_sv2_submit_shares_ext: tokio::sync::mpsc::Sender<UpstreamSubmitShare>,
     /// Sends SV1 `mining.notify` message (translated from the SV2 `SetNewPrevHash` and
     /// `NewExtendedMiningJob` messages stored in the `NextMiningNotify`) to the `Downstream`.
-    tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+    tx_sv1_notify: broadcast::Sender<MiningNotify>,
     /// Stores the most recent SV1 `mining.notify` values to be sent to the `Downstream` upon
     /// receiving a new SV2 `SetNewPrevHash` and `NewExtendedMiningJob` messages **before** any
     /// Downstream role connects to the proxy.
@@ -62,9 +72,9 @@ pub struct Bridge {
     /// first notify values to be relayed to the `Downstream` once a Downstream role connects. Once
     /// a Downstream role connects and receives the first notify values, this member field is no
     /// longer used.
-    last_notify: Option<server_to_client::Notify<'static>>,
+    last_notify: Option<MiningNotify>,
     pub(self) channel_factory: ProxyExtendedChannelFactory,
-    future_jobs: Vec<NewExtendedMiningJob<'static>>,
+    future_jobs: Vec<BoundExtendedJob>,
     last_p_hash: Option<SetNewPrevHash<'static>>,
     target: Arc<Mutex<Vec<u8>>>,
 }
@@ -97,7 +107,7 @@ impl Bridge {
     /// Instantiate a new `Bridge`.
     pub fn new(
         tx_sv2_submit_shares_ext: tokio::sync::mpsc::Sender<UpstreamSubmitShare>,
-        tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+        tx_sv1_notify: broadcast::Sender<MiningNotify>,
         extranonces: ExtendedExtranonce,
         target: Arc<Mutex<Vec<u8>>>,
         channel_id: u32,
@@ -182,8 +192,7 @@ impl Bridge {
     /// respective roles.
     pub async fn start(
         self_: Arc<Mutex<Self>>,
-        rx_sv2_set_new_prev_hash: tokio::sync::mpsc::Receiver<SetNewPrevHash<'static>>,
-        rx_sv2_new_ext_mining_job: tokio::sync::mpsc::Receiver<NewExtendedMiningJob<'static>>,
+        rx_bridge_work: tokio::sync::mpsc::Receiver<BridgeWork>,
         rx_sv1_downstream: tokio::sync::mpsc::Receiver<DownstreamMessages>,
     ) -> Result<AbortOnDrop, Error<'static>> {
         let task_manager = TaskManager::initialize();
@@ -192,20 +201,11 @@ impl Bridge {
             .map_err(|_| Error::BridgeTaskManagerMutexPoisoned)?
             .ok_or(Error::BridgeTaskManagerFailed)?;
 
-        let new_prev_hash_handler =
-            Self::handle_new_prev_hash(self_.clone(), rx_sv2_set_new_prev_hash)?;
-        let new_ext_m_job_handler =
-            Self::handle_new_extended_mining_job(self_.clone(), rx_sv2_new_ext_mining_job)?;
+        let upstream_work_handler = Self::handle_upstream_work(self_.clone(), rx_bridge_work)?;
         let downs_message_handler = Self::handle_downstream_messages(self_, rx_sv1_downstream);
-        TaskManager::add_handle_new_prev_hash(task_manager.clone(), new_prev_hash_handler.into())
+        TaskManager::add_handle_upstream_work(task_manager.clone(), upstream_work_handler.into())
             .await
             .map_err(|_| Error::BridgeTaskManagerFailed)?;
-        TaskManager::add_handle_new_extended_mining_job(
-            task_manager.clone(),
-            new_ext_m_job_handler.into(),
-        )
-        .await
-        .map_err(|_| Error::BridgeTaskManagerFailed)?;
         TaskManager::add_handle_downstream_messages(
             task_manager.clone(),
             downs_message_handler.into(),
@@ -527,13 +527,8 @@ impl Bridge {
     async fn handle_new_prev_hash_(
         self_: Arc<Mutex<Self>>,
         sv2_set_new_prev_hash: SetNewPrevHash<'static>,
-        tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+        tx_sv1_notify: broadcast::Sender<MiningNotify>,
     ) -> Result<(), Error<'static>> {
-        while !super::super::upstream::upstream::IS_NEW_JOB_HANDLED
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            tokio::task::yield_now().await;
-        }
         self_
             .safe_lock(|s| s.last_p_hash = Some(sv2_set_new_prev_hash.clone()))
             .map_err(|_| Error::BridgeMutexPoisoned)?;
@@ -559,20 +554,23 @@ impl Bridge {
 
         let mut match_a_future_job = false;
         while let Some(job) = future_jobs.pop() {
-            if job.job_id == sv2_set_new_prev_hash.job_id {
+            if job.job.job_id == sv2_set_new_prev_hash.job_id {
                 // Create the mining.notify to be sent to the Downstream.
                 let notify = super::super::proxy::next_mining_notify::create_notify(
                     sv2_set_new_prev_hash.clone(),
-                    job,
+                    job.job,
                     true,
                     extranonce_len,
                 );
 
                 // Get the sender to send the mining.notify to the Downstream
+                let notify = MiningNotify {
+                    notify,
+                    merge_mining_binding_id: job.merge_mining_binding_id,
+                };
+                crate::merge_mining::set_active_job_binding(notify.merge_mining_binding_id);
                 if tx_sv1_notify.send(notify.clone()).is_err() {
-                    error!("Failed to send mining.notify");
-                    // Update translator state to down
-                    ProxyState::update_translator_state(TranslatorState::Down);
+                    debug!("mining.notify has no current listeners");
                 };
                 match_a_future_job = true;
                 self_
@@ -580,7 +578,14 @@ impl Bridge {
                         s.last_notify = Some(notify);
                     })
                     .map_err(|_| Error::BridgeMutexPoisoned)?;
+                for discarded in future_jobs.drain(..) {
+                    crate::merge_mining::clear_pending_job_binding(
+                        discarded.merge_mining_binding_id,
+                    );
+                }
                 break;
+            } else {
+                crate::merge_mining::clear_pending_job_binding(job.merge_mining_binding_id);
             }
         }
         if !match_a_future_job {
@@ -589,59 +594,11 @@ impl Bridge {
         Ok(())
     }
 
-    /// Receives a SV2 `SetNewPrevHash` message from the `Upstream` and creates a SV1
-    /// `mining.notify` message (in conjunction with a previously received SV2
-    /// `NewExtendedMiningJob` message) which is sent to the `Downstream`. The protocol requires
-    /// that before every received `SetNewPrevHash`, a `NewExtendedMiningJob` with a
-    /// corresponding `job_id` has already been received. If this is not the case, an error has
-    /// occurred on the Upstream pool role and the connection will close.
-    fn handle_new_prev_hash(
-        self_: Arc<Mutex<Self>>,
-        mut rx_sv2_set_new_prev_hash: tokio::sync::mpsc::Receiver<SetNewPrevHash<'static>>,
-    ) -> Result<JoinHandle<()>, Error<'static>> {
-        info!("Received SV2 SetNewPrevHash messages from Pool");
-        let tx_sv1_notify = self_
-            .safe_lock(|s| s.tx_sv1_notify.clone())
-            .map_err(|_| Error::BridgeMutexPoisoned)?;
-        Ok(tokio::task::spawn(async move {
-            loop {
-                // Receive `SetNewPrevHash` from `Upstream`
-                let sv2_set_new_prev_hash: SetNewPrevHash =
-                    match rx_sv2_set_new_prev_hash.recv().await {
-                        Some(set_new_prev_hash) => set_new_prev_hash,
-                        None => {
-                            error!("Failed to receive SetNewPrevHash");
-                            ProxyState::update_translator_state(TranslatorState::Down);
-                            break;
-                        }
-                    };
-                let mut dbg_prev_hash = sv2_set_new_prev_hash.prev_hash.to_vec();
-                dbg_prev_hash.reverse();
-                debug!(
-                    "Received NewPrevHash {} for channel {} with job {}",
-                    dbg_prev_hash.as_hex(),
-                    sv2_set_new_prev_hash.channel_id,
-                    sv2_set_new_prev_hash.job_id
-                );
-                if let Err(e) = Self::handle_new_prev_hash_(
-                    self_.clone(),
-                    sv2_set_new_prev_hash,
-                    tx_sv1_notify.clone(),
-                )
-                .await
-                {
-                    error!("Failed to handle SetNewPrevHash: {e}");
-                    ProxyState::update_upstream_state(UpstreamType::TranslatorUpstream);
-                    return;
-                }
-            }
-        }))
-    }
-
     async fn handle_new_extended_mining_job_(
         self_: Arc<Mutex<Self>>,
         sv2_new_extended_mining_job: NewExtendedMiningJob<'static>,
-        tx_sv1_notify: broadcast::Sender<server_to_client::Notify<'static>>,
+        tx_sv1_notify: broadcast::Sender<MiningNotify>,
+        merge_mining_binding_id: Option<u64>,
     ) -> Result<(), Error<'static>> {
         // convert to non segwit jobs so we dont have to depend if miner's support segwit or not
         self_
@@ -654,13 +611,20 @@ impl Bridge {
                 Error::RolesSv2Logic(RolesLogicError::JobIsNotFutureButPrevHashNotPresent)
             })?;
 
-        let extranonce_len = self_.safe_lock(|s| s.channel_factory.get_extranonce_len())?;
+        let extranonce_len = self_
+            .safe_lock(|s| s.channel_factory.get_extranonce_len())
+            .map_err(|_| Error::BridgeMutexPoisoned)?;
 
         // If future_job=true, this job is meant for a future SetNewPrevHash that the proxy
         // has yet to receive. Insert this new job into the job_mapper .
         if sv2_new_extended_mining_job.is_future() {
             self_
-                .safe_lock(|s| s.future_jobs.push(sv2_new_extended_mining_job.clone()))
+                .safe_lock(|s| {
+                    s.future_jobs.push(BoundExtendedJob {
+                        job: sv2_new_extended_mining_job.clone(),
+                        merge_mining_binding_id,
+                    })
+                })
                 .map_err(|_| Error::BridgeMutexPoisoned)?;
             Ok(())
 
@@ -685,9 +649,17 @@ impl Bridge {
                 extranonce_len,
             );
             // Get the sender to send the mining.notify to the Downstream
-            tx_sv1_notify
-                .send(notify.clone())
-                .map_err(|_| Error::AsyncChannelError)?;
+            let notify = MiningNotify {
+                notify,
+                merge_mining_binding_id,
+            };
+            crate::merge_mining::set_active_job_binding(notify.merge_mining_binding_id);
+            if tx_sv1_notify.send(notify.clone()).is_err() {
+                debug!(
+                    job_id = sv2_new_extended_mining_job.job_id,
+                    "mining.notify has no current listeners"
+                );
+            }
 
             self_
                 .safe_lock(|s| {
@@ -698,54 +670,68 @@ impl Bridge {
         }
     }
 
-    /// Receives a SV2 `NewExtendedMiningJob` message from the `Upstream`. If `future_job=true`,
-    /// this job is intended for a future SV2 `SetNewPrevHash` that has yet to be received. This
-    /// job is stored until a SV2 `SetNewPrevHash` message with a corresponding `job_id` is
-    /// received. If `future_job=false`, this job is intended for the SV2 `SetNewPrevHash` that is
-    /// currently being mined on. In this case, a SV1 `mining.notify` is created and is sent to the
-    /// `Downstream`. If `future_job=false` but this job's `job_id` does not match the current SV2
-    /// `SetNewPrevHash` `job_id`, an error has occurred on the Upstream pool role and the
-    /// connection will close.
-    fn handle_new_extended_mining_job(
+    /// Processes jobs and prevhash transitions from one FIFO so their upstream ordering cannot
+    /// be inverted by independently scheduled bridge tasks.
+    fn handle_upstream_work(
         self_: Arc<Mutex<Self>>,
-        mut rx_sv2_new_ext_mining_job: tokio::sync::mpsc::Receiver<NewExtendedMiningJob<'static>>,
+        mut receiver: tokio::sync::mpsc::Receiver<BridgeWork>,
     ) -> Result<JoinHandle<()>, Error<'static>> {
         let tx_sv1_notify = self_
             .safe_lock(|s| s.tx_sv1_notify.clone())
             .map_err(|_| Error::BridgeMutexPoisoned)?;
-        debug!("Starting handle_new_extended_mining_job task");
+        debug!("Starting ordered upstream work handler");
         Ok(tokio::task::spawn(async move {
-            loop {
-                // Receive `NewExtendedMiningJob` from `Upstream`
-                let sv2_new_extended_mining_job: NewExtendedMiningJob =
-                    match rx_sv2_new_ext_mining_job.recv().await {
-                        Some(sv2_new_extended_mining_job) => sv2_new_extended_mining_job,
-                        None => {
-                            error!("Failed to receive NewExtendedMiningJob from upstream");
-                            ProxyState::update_translator_state(TranslatorState::Down);
-                            break;
+            while let Some(work) = receiver.recv().await {
+                match work {
+                    BridgeWork::SetNewPrevHash(set_new_prev_hash) => {
+                        let mut dbg_prev_hash = set_new_prev_hash.prev_hash.to_vec();
+                        dbg_prev_hash.reverse();
+                        debug!(
+                            "Received NewPrevHash {} for channel {} with job {}",
+                            dbg_prev_hash.as_hex(),
+                            set_new_prev_hash.channel_id,
+                            set_new_prev_hash.job_id
+                        );
+                        if let Err(e) = Self::handle_new_prev_hash_(
+                            self_.clone(),
+                            set_new_prev_hash,
+                            tx_sv1_notify.clone(),
+                        )
+                        .await
+                        {
+                            error!("Failed to handle SetNewPrevHash: {e}");
+                            ProxyState::update_upstream_state(UpstreamType::TranslatorUpstream);
+                            return;
                         }
-                    };
-                if let Err(e) = Self::handle_new_extended_mining_job_(
-                    self_.clone(),
-                    sv2_new_extended_mining_job,
-                    tx_sv1_notify.clone(),
-                )
-                .await
-                {
-                    error!("Failed to handle NewExtendedMiningJob {e}",);
-                    ProxyState::update_translator_state(TranslatorState::Down);
-                };
-                super::super::upstream::upstream::IS_NEW_JOB_HANDLED
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    BridgeWork::NewExtendedMiningJob {
+                        job: new_job,
+                        merge_mining_binding_id,
+                    } => {
+                        if let Err(e) = Self::handle_new_extended_mining_job_(
+                            self_.clone(),
+                            new_job,
+                            tx_sv1_notify.clone(),
+                            merge_mining_binding_id,
+                        )
+                        .await
+                        {
+                            error!("Failed to handle NewExtendedMiningJob {e}",);
+                            ProxyState::update_translator_state(TranslatorState::Down);
+                            return;
+                        };
+                    }
+                }
             }
+            error!("Failed to receive ordered upstream work");
+            ProxyState::update_translator_state(TranslatorState::Down);
         }))
     }
 }
 #[derive(Debug)]
 pub struct OpenSv1Downstream {
     pub channel_id: u32,
-    pub last_notify: Option<server_to_client::Notify<'static>>,
+    pub last_notify: Option<MiningNotify>,
     pub extranonce: Vec<u8>,
     pub extranonce2_len: u16,
 }
@@ -822,7 +808,7 @@ mod test {
         }
     }
 
-    fn seed_bridge_job(bridge: &mut Bridge) {
+    fn test_extended_job(job_id: u32) -> NewExtendedMiningJob<'static> {
         let out_id = bitcoin::hashes::sha256d::Hash::from_slice(&[0_u8; 32]).unwrap();
         let previous_output = bitcoin::OutPoint {
             txid: bitcoin::Txid::from_raw_hash(out_id),
@@ -841,6 +827,19 @@ mod test {
             output: vec![],
         };
         let tx = bitcoin::consensus::serialize(&tx);
+        NewExtendedMiningJob {
+            channel_id: 1,
+            job_id,
+            min_ntime: binary_sv2::Sv2Option::new(Some(TEST_NTIME)),
+            version: 0,
+            version_rolling_allowed: false,
+            merkle_path: vec![].into(),
+            coinbase_tx_prefix: tx[0..42].to_vec().try_into().unwrap(),
+            coinbase_tx_suffix: tx[58..].to_vec().try_into().unwrap(),
+        }
+    }
+
+    fn seed_bridge_job(bridge: &mut Bridge) {
         let prev_hash = SetNewPrevHash {
             channel_id: 1,
             job_id: TEST_JOB_ID,
@@ -849,20 +848,51 @@ mod test {
             nbits: 0x1d00ffff,
         };
         bridge.channel_factory.on_new_prev_hash(prev_hash).unwrap();
-        let new_mining_job = NewExtendedMiningJob {
-            channel_id: 1,
-            job_id: TEST_JOB_ID,
-            min_ntime: binary_sv2::Sv2Option::new(Some(TEST_NTIME)),
-            version: 0,
-            version_rolling_allowed: false,
-            merkle_path: vec![].into(),
-            coinbase_tx_prefix: tx[0..42].to_vec().try_into().unwrap(),
-            coinbase_tx_suffix: tx[58..].to_vec().try_into().unwrap(),
-        };
         bridge
             .channel_factory
-            .on_new_extended_mining_job(new_mining_job)
+            .on_new_extended_mining_job(test_extended_job(TEST_JOB_ID))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_job_without_notify_receivers_does_not_fail_the_bridge() {
+        let extranonces = ExtendedExtranonce::new(0..6, 6..8, 8..16);
+        let bridge = test_utils::create_bridge(extranonces).expect("bridge");
+        let prev_hash = SetNewPrevHash {
+            channel_id: 1,
+            job_id: TEST_JOB_ID,
+            prev_hash: [3; 32].into(),
+            min_ntime: TEST_NTIME,
+            nbits: 0x1d00ffff,
+        };
+        bridge
+            .safe_lock(|bridge| {
+                bridge.last_p_hash = Some(prev_hash.clone());
+                bridge.channel_factory.on_new_prev_hash(prev_hash)
+            })
+            .expect("bridge lock")
+            .expect("prevhash");
+        let (notify_tx, notify_rx) = broadcast::channel(1);
+        drop(notify_rx);
+
+        Bridge::handle_new_extended_mining_job_(
+            bridge.clone(),
+            test_extended_job(TEST_JOB_ID),
+            notify_tx,
+            Some(42),
+        )
+        .await
+        .expect("a job with MM metadata must follow the normal bridge path");
+
+        let binding_id = bridge
+            .safe_lock(|bridge| {
+                bridge
+                    .last_notify
+                    .as_ref()
+                    .and_then(|notify| notify.merge_mining_binding_id)
+            })
+            .expect("bridge lock");
+        assert_eq!(binding_id, Some(42));
     }
 
     fn classify_submit(

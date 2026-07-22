@@ -11,6 +11,7 @@ use axum::{
 };
 use routes::Api;
 use stats::StatsSender;
+use tracing::{error, info};
 
 // Holds shared state (like the router) that so that it can be accessed in all routes.
 #[derive(Clone)]
@@ -53,6 +54,14 @@ pub(crate) async fn start(
     };
     let app = AxumRouter::new()
         .route("/api/health", get(Api::health_check))
+        .route(
+            "/api/coinbase/op-return",
+            post(crate::merge_mining::set_pair_api),
+        )
+        .route(
+            "/api/merge-mining/found-job",
+            get(crate::merge_mining::poll_found_job_api),
+        )
         .route("/api/tx/submit/{tx}", post(Api::send_tx_to_bitcoind))
         .route(
             "/api/tx/prioritized",
@@ -66,10 +75,22 @@ pub(crate) async fn start(
         .with_state(state);
 
     let api_server_port = crate::config::Configuration::api_server_port();
-    let api_server_addr = format!("0.0.0.0:{api_server_port}");
-    let listener = tokio::net::TcpListener::bind(api_server_addr)
-        .await
-        .expect("Invalid server address");
-    println!("API Server listening on port {api_server_port}");
-    axum::serve(listener, app).await.unwrap();
+    let api_bind_address =
+        std::env::var("API_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let api_server_addr = format!("{api_bind_address}:{api_server_port}");
+    loop {
+        let listener = match tokio::net::TcpListener::bind(&api_server_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!(%error, %api_server_addr, "API server could not bind; mining remains active");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        info!(%api_server_addr, "API server listening");
+        if let Err(error) = axum::serve(listener, app.clone()).await {
+            error!(%error, "API server stopped; mining remains active");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }

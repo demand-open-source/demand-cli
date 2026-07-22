@@ -2,7 +2,7 @@ use crate::config::Configuration;
 use codec_sv2::{StandardEitherFrame, StandardSv2Frame};
 use rand::distributions::{Alphanumeric, DistString};
 use roles_logic_sv2::{
-    common_messages_sv2::{Protocol, SetupConnection},
+    common_messages_sv2::{Protocol, SetupConnection, SetupConnectionSuccess},
     handlers::common::{ParseUpstreamCommonMessages, SendTo},
     parsers::PoolMessages,
     routing_logic::{CommonRoutingLogic, NoRouting},
@@ -10,12 +10,15 @@ use roles_logic_sv2::{
 };
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
-use tracing::error;
+use tracing::{error, warn};
 
 pub type Message = PoolMessages<'static>;
 pub type StdFrame = StandardSv2Frame<Message>;
 pub type EitherFrame = StandardEitherFrame<Message>;
-pub struct SetupConnectionHandler {}
+#[derive(Default)]
+pub struct SetupConnectionHandler {
+    setup_succeeded: bool,
+}
 
 impl SetupConnectionHandler {
     fn get_setup_connection_message(proxy_address: SocketAddr) -> SetupConnection<'static> {
@@ -78,35 +81,67 @@ impl SetupConnectionHandler {
             .ok_or(crate::jd_client::error::Error::Unrecoverable)?
             .msg_type();
         let payload = incoming.payload();
+        let handler = Arc::new(Mutex::new(SetupConnectionHandler::default()));
         ParseUpstreamCommonMessages::handle_message_common(
-            Arc::new(Mutex::new(SetupConnectionHandler {})),
+            handler.clone(),
             message_type,
             payload,
             CommonRoutingLogic::None,
         )?;
-        Ok(())
+        let setup_succeeded = handler
+            .safe_lock(|state| state.setup_succeeded)
+            .map_err(|_| crate::jd_client::error::Error::JobDeclaratorMutexCorrupted)?;
+        if setup_succeeded {
+            Ok(())
+        } else {
+            Err(crate::jd_client::error::Error::Unrecoverable)
+        }
     }
 }
 
 impl ParseUpstreamCommonMessages<NoRouting> for SetupConnectionHandler {
     fn handle_setup_connection_success(
         &mut self,
-        _: roles_logic_sv2::common_messages_sv2::SetupConnectionSuccess,
+        _: SetupConnectionSuccess,
     ) -> Result<roles_logic_sv2::handlers::common::SendTo, roles_logic_sv2::errors::Error> {
+        self.setup_succeeded = true;
         Ok(SendTo::None(None))
     }
 
     fn handle_setup_connection_error(
         &mut self,
-        _: roles_logic_sv2::common_messages_sv2::SetupConnectionError,
+        message: roles_logic_sv2::common_messages_sv2::SetupConnectionError,
     ) -> Result<roles_logic_sv2::handlers::common::SendTo, roles_logic_sv2::errors::Error> {
-        todo!()
+        warn!(?message, "Job Declaration setup was rejected");
+        Ok(SendTo::None(None))
     }
 
     fn handle_channel_endpoint_changed(
         &mut self,
-        _: roles_logic_sv2::common_messages_sv2::ChannelEndpointChanged,
+        message: roles_logic_sv2::common_messages_sv2::ChannelEndpointChanged,
     ) -> Result<roles_logic_sv2::handlers::common::SendTo, roles_logic_sv2::errors::Error> {
-        todo!()
+        warn!(
+            ?message,
+            "Unexpected channel endpoint change during Job Declaration setup"
+        );
+        Ok(SendTo::None(None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_success_with_zero_flags_is_accepted() {
+        let mut handler = SetupConnectionHandler::default();
+        handler
+            .handle_setup_connection_success(SetupConnectionSuccess {
+                used_version: 2,
+                flags: 0,
+            })
+            .expect("setup success");
+
+        assert!(handler.setup_succeeded);
     }
 }

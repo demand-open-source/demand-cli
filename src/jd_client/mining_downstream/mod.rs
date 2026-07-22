@@ -1,21 +1,24 @@
 mod task_manager;
 use crate::{
-    proxy_state::{DownstreamType, JdState, ProxyState},
+    proxy_state::{DownstreamType, JdState, ProxyState, UpstreamType},
     shared::utils::AbortOnDrop,
 };
 use tokio::time::{timeout, Duration};
 
 use super::{job_declarator::JobDeclarator, mining_upstream::Upstream as UpstreamMiningNode};
 use crate::jd_client::error::Error as JdClientError;
+use binary_sv2::B064K;
 use roles_logic_sv2::{
     channel_logic::channel_factory::{OnNewShare, PoolChannelFactory, Share},
     common_properties::{CommonDownstreamData, IsDownstream, IsMiningDownstream},
     errors::Error,
     handlers::mining::{ParseDownstreamMiningMessages, SendTo, SupportedChannelTypes},
-    job_creator::JobsCreators,
+    job_creator::{tx_outputs_to_costum_scripts, JobsCreators},
     mining_sv2::*,
     parsers::{Mining, MiningDeviceMessages},
-    template_distribution_sv2::{NewTemplate, SubmitSolution},
+    template_distribution_sv2::{
+        NewTemplate, SetNewPrevHash as TemplateSetNewPrevHash, SubmitSolution,
+    },
     utils::Mutex,
 };
 use task_manager::TaskManager;
@@ -33,6 +36,15 @@ pub type Message = MiningDeviceMessages<'static>;
 pub type StdFrame = StandardSv2Frame<Message>;
 pub type EitherFrame = StandardEitherFrame<Message>;
 
+const MAX_SUPPORTED_COINBASE_OUTPUTS: usize = 252;
+
+#[derive(Clone, Debug)]
+pub(crate) struct DownstreamJob {
+    pub(crate) local_job_id: u32,
+    pub(crate) coinbase_tx_prefix: B064K<'static>,
+    pub(crate) coinbase_tx_suffix: B064K<'static>,
+}
+
 /// 1 to 1 connection with a downstream node that implement the mining (sub)protocol can be either
 /// a mining device or a downstream proxy.
 /// A downstream can only be linked with an upstream at a time. Support multi upstrems for
@@ -45,8 +57,6 @@ pub struct DownstreamMiningNode {
     solution_sender: TSender<SubmitSolution<'static>>,
     withhold: bool,
     miner_coinbase_output: Vec<TxOut>,
-    // used to retreive the job id of the share that we send upstream
-    last_template_id: u64,
     pub jd: Option<Arc<Mutex<JobDeclarator>>>,
 }
 
@@ -114,6 +124,80 @@ use core::convert::TryInto;
 use std::sync::Arc;
 
 impl DownstreamMiningNode {
+    pub(crate) fn decode_pool_coinbase_outputs(
+        mut encoded_outputs: &[u8],
+    ) -> Result<Vec<TxOut>, JdClientError> {
+        let mut outputs = Vec::new();
+        while !encoded_outputs.is_empty() {
+            outputs.push(
+                TxOut::consensus_decode(&mut encoded_outputs)
+                    .map_err(|_| JdClientError::Unrecoverable)?,
+            );
+        }
+        Ok(outputs)
+    }
+
+    pub(crate) fn preview_template_job(
+        self_mutex: &Arc<Mutex<Self>>,
+        template: NewTemplate<'static>,
+        pool_output: &[u8],
+    ) -> Result<(B064K<'static>, B064K<'static>), JdClientError> {
+        let extranonce_len = self_mutex
+            .safe_lock(|state| {
+                state
+                    .status
+                    .get_channel()
+                    .map(|channel| channel.get_extranonce_len())
+            })
+            .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)?
+            .map_err(JdClientError::RolesSv2Logic)?;
+        let pool_outputs = Self::decode_pool_coinbase_outputs(pool_output)?;
+        Self::preview_template_job_with_extranonce(template, pool_outputs, extranonce_len)
+    }
+
+    fn preview_template_job_with_extranonce(
+        mut template: NewTemplate<'static>,
+        pool_outputs: Vec<TxOut>,
+        extranonce_len: usize,
+    ) -> Result<(B064K<'static>, B064K<'static>), JdClientError> {
+        if pool_outputs.is_empty() {
+            return Err(JdClientError::Unrecoverable);
+        }
+        let extranonce_len =
+            u8::try_from(extranonce_len).map_err(|_| JdClientError::Unrecoverable)?;
+        let mut creator = JobsCreators::new(extranonce_len);
+        // The throwaway creator only computes the exact coinbase fields. Its pinned
+        // implementation increments template_id without checking overflow, so never pass it a
+        // peer-controlled ID.
+        template.template_id = 0;
+        let job = creator
+            .on_new_template(&mut template, true, pool_outputs, 0)
+            .map_err(JdClientError::RolesSv2Logic)?;
+        Ok((job.coinbase_tx_prefix, job.coinbase_tx_suffix))
+    }
+
+    fn validate_final_coinbase_output_count(
+        template: &NewTemplate<'static>,
+        additional_output_count: usize,
+    ) -> Result<(), JdClientError> {
+        // JobsCreators uses the serialized outputs, rather than trusting the declared count.
+        let template_output_count =
+            tx_outputs_to_costum_scripts(template.coinbase_tx_outputs.as_ref()).len();
+        let final_output_count = template_output_count
+            .checked_add(additional_output_count)
+            .ok_or(JdClientError::UnsupportedCoinbaseOutputCount {
+                count: usize::MAX,
+                max: MAX_SUPPORTED_COINBASE_OUTPUTS,
+            })?;
+        if final_output_count > MAX_SUPPORTED_COINBASE_OUTPUTS {
+            return Err(JdClientError::UnsupportedCoinbaseOutputCount {
+                count: final_output_count,
+                max: MAX_SUPPORTED_COINBASE_OUTPUTS,
+            });
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         sender: TSender<Mining<'static>>,
@@ -134,10 +218,6 @@ impl DownstreamMiningNode {
             solution_sender,
             withhold,
             miner_coinbase_output,
-            // set it to an arbitrary value cause when we use it we always updated it.
-            // Is used before sending the share to upstream in the main loop when we have a share.
-            // Is upated in the message handler that si called earlier in the main loop.
-            last_template_id: 0,
             jd,
         }
     }
@@ -257,42 +337,40 @@ impl DownstreamMiningNode {
             }
             Ok(SendTo::RelayNewMessage(Mining::SubmitSharesExtended(mut share))) => {
                 tokio::task::spawn(async move {
-                    // If we have a realy new message it means that we are in a pooled mining mods.
-                    if let Some(upstream_mutex) = self_mutex
-                        .safe_lock(|s| s.status.get_upstream())
-                        .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)
-                        .unwrap()
+                    let local_job_id = share.job_id;
+                    let upstream_mutex = match self_mutex
+                        .safe_lock(|state| state.status.get_upstream())
                     {
-                        // When re receive SetupConnectionSuccess we link the last_template_id with the
-                        // pool's job_id. The below return as soon as we have a pairable job id for the
-                        // template_id associated with this share.
-                        let last_template_id = self_mutex
-                            .safe_lock(|s| s.last_template_id)
-                            .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)
-                            .unwrap();
-                        let job_id_future =
-                            UpstreamMiningNode::get_job_id(&upstream_mutex, last_template_id);
-                        //?check
-                        if let Ok(Ok(job_id)) =
-                            timeout(Duration::from_secs(20), job_id_future).await
-                        {
-                            share.job_id = job_id;
-                            debug!(
-                                "Sending valid block solution upstream, with job_id {}",
-                                job_id
+                        Ok(Some(upstream)) => upstream,
+                        Ok(None) => {
+                            error!("Upstream is unavailable while relaying a share");
+                            ProxyState::update_downstream_state(
+                                DownstreamType::JdClientMiningDownstream,
                             );
-                            let message = Mining::SubmitSharesExtended(share);
-                            UpstreamMiningNode::send(&upstream_mutex, message)
-                                .await
-                                .unwrap();
-                        } else {
-                            error!("Timeout getting job_id for last_template_id: {last_template_id}, discard share");
+                            return;
+                        }
+                        Err(error) => {
+                            error!(%error, "Downstream state is unavailable while relaying a share");
+                            ProxyState::update_downstream_state(
+                                DownstreamType::JdClientMiningDownstream,
+                            );
+                            return;
+                        }
+                    };
+
+                    let job_id_future =
+                        UpstreamMiningNode::get_job_id(&upstream_mutex, local_job_id);
+                    if let Ok(Ok(job_id)) = timeout(Duration::from_secs(20), job_id_future).await {
+                        share.job_id = job_id;
+                        debug!("Relaying share upstream with pool job_id {}", job_id);
+                        let message = Mining::SubmitSharesExtended(share);
+                        if let Err(error) = UpstreamMiningNode::send(&upstream_mutex, message).await
+                        {
+                            error!(%error, "Failed to relay share upstream");
+                            ProxyState::update_upstream_state(UpstreamType::JDCMiningUpstream);
                         }
                     } else {
-                        error!("Upstream is None Here");
-                        ProxyState::update_downstream_state(
-                            DownstreamType::JdClientMiningDownstream,
-                        );
+                        error!(local_job_id, "Timeout getting pool job id; discard share");
                     }
                 });
             }
@@ -343,11 +421,12 @@ impl DownstreamMiningNode {
             .map_err(|_| JdClientError::Unrecoverable)
     }
 
-    pub async fn on_new_template(
+    pub(crate) async fn on_new_template(
         self_mutex: &Arc<Mutex<Self>>,
         mut new_template: NewTemplate<'static>,
         pool_output: &[u8],
-    ) -> Result<(), JdClientError> {
+        template_generation: Option<u64>,
+    ) -> Result<Option<DownstreamJob>, JdClientError> {
         // Make sure to set the template handled to true since we do not have a channel opened yet
         // and template can not be handled without it we will lock template handling forever.
         if !self_mutex
@@ -355,54 +434,57 @@ impl DownstreamMiningNode {
             .map_err(|e| Error::PoisonLock(e.to_string()))?
         {
             super::IS_NEW_TEMPLATE_HANDLED.store(true, std::sync::atomic::Ordering::Release);
-            return Ok(());
+            return Ok(None);
         }
-        let mut pool_out = &pool_output[0..];
-        let pool_output =
-            TxOut::consensus_decode(&mut pool_out).expect("Upstream sent an invalid coinbase");
+        let pool_outputs = Self::decode_pool_coinbase_outputs(pool_output)?;
+        Self::validate_final_coinbase_output_count(&new_template, pool_outputs.len())?;
 
-        let to_send = {
-            let pool_outputs = self_mutex
-                .safe_lock(|s| {
-                    let channel = s.status.get_channel().map_err(JdClientError::RolesSv2Logic);
-
-                    match channel {
-                        Ok(channel) => {
-                            channel.update_pool_outputs(vec![pool_output]);
-                            match channel.on_new_template(&mut new_template) {
-                                Ok(pool_outputs) => Ok(pool_outputs),
-                                Err(e) => Err(JdClientError::RolesSv2Logic(e)),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                })
-                .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)?;
-            pool_outputs?
-        };
+        let to_send = self_mutex
+            .safe_lock(|state| {
+                let channel = state
+                    .status
+                    .get_channel()
+                    .map_err(JdClientError::RolesSv2Logic)?;
+                channel.update_pool_outputs(pool_outputs);
+                channel
+                    .on_new_template(&mut new_template)
+                    .map_err(JdClientError::RolesSv2Logic)
+            })
+            .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)??;
 
         // to_send is HashMap<channel_id, messages_to_send> but here we have only one downstream so
         // only one channel opened downstream. That means that we can take all the messages in the
         // map and send them downstream.
-        let to_send = to_send.into_values();
-        for message in to_send {
-            let message = if let Mining::NewExtendedMiningJob(job) = message {
-                let jd = self_mutex
-                    .safe_lock(|s| s.jd.clone())
-                    .map_err(|_| JdClientError::JobDeclaratorMutexCorrupted)?
-                    .ok_or({
-                        // Propagate error. The caller will restart proxy
-                        JdClientError::JdMissing
-                    })?;
-                jd.safe_lock(|jd| jd.coinbase_tx_prefix = job.coinbase_tx_prefix.clone())
-                    .map_err(|_| JdClientError::JobDeclaratorMutexCorrupted)?;
-                jd.safe_lock(|jd| jd.coinbase_tx_suffix = job.coinbase_tx_suffix.clone())
-                    .map_err(|_| JdClientError::JobDeclaratorMutexCorrupted)?;
-
-                Mining::NewExtendedMiningJob(job)
+        let messages = to_send.into_values().collect::<Vec<_>>();
+        let downstream_job = messages.iter().find_map(|message| {
+            if let Mining::NewExtendedMiningJob(job) = message {
+                Some(DownstreamJob {
+                    local_job_id: job.job_id,
+                    coinbase_tx_prefix: job.coinbase_tx_prefix.clone(),
+                    coinbase_tx_suffix: job.coinbase_tx_suffix.clone(),
+                })
             } else {
-                message
-            };
+                None
+            }
+        });
+
+        if crate::merge_mining::enabled() {
+            if let Some(job) = &downstream_job {
+                let bound = template_generation.is_some_and(|generation| {
+                    crate::merge_mining::global().bind_job_generation(
+                        job.local_job_id,
+                        generation,
+                        job.coinbase_tx_prefix.to_vec(),
+                        job.coinbase_tx_suffix.to_vec(),
+                    )
+                });
+                if !bound {
+                    crate::merge_mining::global().announce_unbound_job(job.local_job_id);
+                }
+            }
+        }
+
+        for message in messages {
             Self::send(self_mutex, message)
                 .await
                 .map_err(|_| Error::DownstreamDown)?; // Caller will restart proxy
@@ -410,12 +492,12 @@ impl DownstreamMiningNode {
         // See coment on the definition of the global for memory
         // ordering
         super::IS_NEW_TEMPLATE_HANDLED.store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
+        Ok(downstream_job)
     }
 
     pub async fn on_set_new_prev_hash(
         self_mutex: &Arc<Mutex<Self>>,
-        new_prev_hash: roles_logic_sv2::template_distribution_sv2::SetNewPrevHash<'static>,
+        new_prev_hash: TemplateSetNewPrevHash<'static>,
     ) -> Result<(), JdClientError> {
         if !self_mutex
             .safe_lock(|s| s.status.have_channel())
@@ -594,12 +676,11 @@ impl
                 error!("Share do not meet downstream target");
                 Ok(SendTo::Respond(Mining::SubmitSharesError(s)))
             }
-            OnNewShare::SendSubmitShareUpstream((m, Some(template_id))) => {
+            OnNewShare::SendSubmitShareUpstream((m, Some(_template_id))) => {
                 if !self.status.is_solo_miner() {
                     match m {
                         Share::Extended(share) => {
                             let for_upstream = Mining::SubmitSharesExtended(share);
-                            self.last_template_id = template_id;
                             Ok(SendTo::RelayNewMessage(for_upstream))
                         }
                         // We are in an extended channel shares are extended
@@ -653,7 +734,6 @@ impl
 
                         // Safe unwrap alreay checked if it cointains upstream with is_solo_miner
                         if !self.withhold && !self.status.is_solo_miner() {
-                            self.last_template_id = template_id;
                             let for_upstream = Mining::SubmitSharesExtended(share);
                             Ok(SendTo::RelayNewMessage(for_upstream))
                         } else {
@@ -680,3 +760,147 @@ impl
     }
 }
 impl IsMiningDownstream for DownstreamMiningNode {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{consensus::serialize, script::PushBytesBuf, Amount, ScriptBuf};
+
+    fn template_with_outputs(actual_count: usize, declared_count: u32) -> NewTemplate<'static> {
+        let output = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        };
+        let outputs = (0..actual_count)
+            .flat_map(|_| serialize(&output))
+            .collect::<Vec<_>>();
+        NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 0,
+            coinbase_tx_version: 0,
+            coinbase_prefix: Vec::new().try_into().expect("empty prefix"),
+            coinbase_tx_input_sequence: 0,
+            coinbase_tx_value_remaining: 0,
+            coinbase_tx_outputs_count: declared_count,
+            coinbase_tx_outputs: outputs.try_into().expect("serialized outputs"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Vec::new().into(),
+        }
+    }
+
+    #[test]
+    fn normal_coinbase_accepts_252_final_outputs() {
+        let template = template_with_outputs(250, 250);
+        assert!(DownstreamMiningNode::validate_final_coinbase_output_count(&template, 2,).is_ok());
+    }
+
+    #[test]
+    fn normal_coinbase_rejects_253_final_outputs() {
+        let template = template_with_outputs(251, 251);
+        assert!(matches!(
+            DownstreamMiningNode::validate_final_coinbase_output_count(&template, 2,),
+            Err(JdClientError::UnsupportedCoinbaseOutputCount {
+                count: 253,
+                max: MAX_SUPPORTED_COINBASE_OUTPUTS,
+            })
+        ));
+    }
+
+    #[test]
+    fn normal_coinbase_uses_serialized_instead_of_declared_output_count() {
+        let template = template_with_outputs(252, 251);
+        assert!(matches!(
+            DownstreamMiningNode::validate_final_coinbase_output_count(&template, 1,),
+            Err(JdClientError::UnsupportedCoinbaseOutputCount { count: 253, .. })
+        ));
+    }
+
+    #[test]
+    fn decodes_every_pool_coinbase_output() {
+        let outputs = vec![
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            },
+            TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::new(),
+            },
+        ];
+        let encoded = outputs.iter().flat_map(serialize).collect::<Vec<_>>();
+        assert_eq!(
+            DownstreamMiningNode::decode_pool_coinbase_outputs(&encoded)
+                .expect("valid pool outputs"),
+            outputs
+        );
+    }
+
+    #[test]
+    fn merge_preview_rejects_only_the_modified_b064k_boundary_job() {
+        let mut template_outputs = (0..6)
+            .map(|_| TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51; 9_360]),
+            })
+            .collect::<Vec<_>>();
+        template_outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 9_246]),
+        });
+        let pristine_outputs = template_outputs
+            .iter()
+            .flat_map(serialize)
+            .collect::<Vec<_>>();
+        assert_eq!(pristine_outputs.len(), 65_483);
+
+        let pristine = NewTemplate {
+            template_id: u64::MAX,
+            future_template: true,
+            version: 0,
+            coinbase_tx_version: 2,
+            coinbase_prefix: vec![1, 1, 0].try_into().expect("valid BIP34 test prefix"),
+            coinbase_tx_input_sequence: 0,
+            coinbase_tx_value_remaining: 1,
+            coinbase_tx_outputs_count: 7,
+            coinbase_tx_outputs: pristine_outputs
+                .clone()
+                .try_into()
+                .expect("pristine outputs"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Vec::new().into(),
+        };
+        let pool_outputs = vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new(),
+        }];
+
+        let (_, pristine_suffix) = DownstreamMiningNode::preview_template_job_with_extranonce(
+            pristine.clone(),
+            pool_outputs.clone(),
+            32,
+        )
+        .expect("pristine job must fit");
+        assert_eq!(pristine_suffix.as_ref().len(), u16::MAX as usize);
+
+        let payload = [b"RSKBLOCK:".as_slice(), &[0_u8; 32]].concat();
+        let push = PushBytesBuf::try_from(payload).expect("valid OP_RETURN payload");
+        let merge_output = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(push),
+        };
+        let mut modified_outputs = pristine_outputs;
+        modified_outputs.extend_from_slice(&serialize(&merge_output));
+        assert_eq!(modified_outputs.len(), u16::MAX as usize);
+        let mut modified = pristine;
+        modified.coinbase_tx_outputs_count += 1;
+        modified.coinbase_tx_outputs = modified_outputs.try_into().expect("modified outputs fit");
+
+        assert!(DownstreamMiningNode::preview_template_job_with_extranonce(
+            modified,
+            pool_outputs,
+            32,
+        )
+        .is_err());
+    }
+}

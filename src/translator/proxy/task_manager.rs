@@ -8,9 +8,8 @@ use tracing::warn;
 #[derive(Debug)]
 #[allow(dead_code)]
 enum Task {
-    NewExtendedMiningJob(AbortOnDrop),
+    UpstreamWork(AbortOnDrop),
     DownstreamMessages(AbortOnDrop),
-    NewPrevHash(AbortOnDrop),
 }
 
 pub struct TaskManager {
@@ -41,23 +40,13 @@ impl TaskManager {
         self.abort.take()
     }
 
-    pub async fn add_handle_new_extended_mining_job(
+    pub async fn add_handle_upstream_work(
         self_: Arc<Mutex<Self>>,
         abortable: AbortOnDrop,
     ) -> Result<(), ()> {
         let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
         send_task
-            .send(Task::NewExtendedMiningJob(abortable))
-            .await
-            .map_err(|_| ())
-    }
-    pub async fn add_handle_new_prev_hash(
-        self_: Arc<Mutex<Self>>,
-        abortable: AbortOnDrop,
-    ) -> Result<(), ()> {
-        let send_task = self_.safe_lock(|s| s.send_task.clone()).unwrap();
-        send_task
-            .send(Task::NewPrevHash(abortable))
+            .send(Task::UpstreamWork(abortable))
             .await
             .map_err(|_| ())
     }

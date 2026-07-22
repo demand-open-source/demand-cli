@@ -30,6 +30,10 @@ pub enum Error {
     Uint256Conversion(ParseIntError),
     Infallible(std::convert::Infallible),
     Unrecoverable,
+    UnsupportedCoinbaseOutputCount {
+        count: usize,
+        max: usize,
+    },
     TaskManagerFailed,
     JdClientMutexCorrupted,
 
@@ -68,6 +72,10 @@ impl fmt::Display for Error {
             VecToSlice32(ref e) => write!(f, "Standard Error: `{e:?}`"),
             Infallible(ref e) => write!(f, "Infallible Error:`{e:?}`"),
             Unrecoverable => write!(f, "Unrecoverable Error"),
+            UnsupportedCoinbaseOutputCount { count, max } => write!(
+                f,
+                "Coinbase transaction has {count} outputs; at most {max} outputs are supported"
+            ),
             JdClientMutexCorrupted => write!(f, "JdClient mutex Corrupted"),
             TaskManagerFailed => write!(f, "Failed to add Task in JdClient TaskManager"),
 

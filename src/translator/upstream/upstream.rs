@@ -12,8 +12,8 @@ use roles_logic_sv2::{
         mining::{ParseUpstreamMiningMessages, SendTo},
     },
     mining_sv2::{
-        ExtendedExtranonce, Extranonce, NewExtendedMiningJob, OpenExtendedMiningChannel,
-        SetCustomMiningJob, SetNewPrevHash, SubmitSharesExtended,
+        ExtendedExtranonce, Extranonce, OpenExtendedMiningChannel, SetCustomMiningJob,
+        SubmitSharesExtended,
     },
     parsers::Mining,
     routing_logic::{MiningRoutingLogic, NoRouting},
@@ -21,10 +21,7 @@ use roles_logic_sv2::{
     utils::Mutex,
     Error as RolesLogicError,
 };
-use std::{
-    collections::BTreeMap,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     sync::{
         mpsc::{Receiver as TReceiver, Sender as TSender},
@@ -38,11 +35,10 @@ use super::task_manager::TaskManager;
 use crate::{
     proxy_state::{ProxyState, UpstreamType},
     shared::utils::AbortOnDrop,
-    translator::utils::submit_error_to_rejection_reason,
+    translator::{utils::submit_error_to_rejection_reason, BridgeWork},
 };
 use bitcoin::BlockHash;
 
-pub static IS_NEW_JOB_HANDLED: AtomicBool = AtomicBool::new(true);
 /// Represents the currently active `prevhash` of the mining job being worked on OR being submitted
 /// from the Downstream role.
 #[derive(Debug, Clone)]
@@ -65,12 +61,9 @@ pub struct Upstream {
     last_job_id: Option<u32>,
     /// Bytes used as implicit first part of `extranonce`.
     extranonce_prefix: Option<Vec<u8>>,
-    /// Sends SV2 `SetNewPrevHash` messages to be translated (along with SV2 `NewExtendedMiningJob`
-    /// messages) into SV1 `mining.notify` messages. Received and translated by the `Bridge`.
-    tx_sv2_set_new_prev_hash: tokio::sync::mpsc::Sender<SetNewPrevHash<'static>>,
-    /// Sends SV2 `NewExtendedMiningJob` messages to be translated (along with SV2 `SetNewPrevHash`
-    /// messages) into SV1 `mining.notify` messages. Received and translated by the `Bridge`.
-    tx_sv2_new_ext_mining_job: tokio::sync::mpsc::Sender<NewExtendedMiningJob<'static>>,
+    /// Preserves the upstream order between jobs and prevhash transitions until the `Bridge`
+    /// translates them into SV1 `mining.notify` messages.
+    tx_bridge_work: tokio::sync::mpsc::Sender<BridgeWork>,
     /// Sends the extranonce1 and the channel id received in the SV2 `OpenExtendedMiningChannelSuccess` message to be
     /// used by the `Downstream` and sent to the Downstream role in a SV2 `mining.subscribe`
     /// response message. Passed to the `Downstream` on connection creation.
@@ -111,8 +104,7 @@ impl Upstream {
     /// from the `Downstream`.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
-        tx_sv2_set_new_prev_hash: tokio::sync::mpsc::Sender<SetNewPrevHash<'static>>,
-        tx_sv2_new_ext_mining_job: tokio::sync::mpsc::Sender<NewExtendedMiningJob<'static>>,
+        tx_bridge_work: tokio::sync::mpsc::Sender<BridgeWork>,
         min_extranonce_size: u16,
         tx_sv2_extranonce: tokio::sync::mpsc::Sender<(ExtendedExtranonce, u32)>,
         target: Arc<Mutex<Vec<u8>>>,
@@ -121,8 +113,7 @@ impl Upstream {
     ) -> ProxyResult<'static, Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
             extranonce_prefix: None,
-            tx_sv2_set_new_prev_hash,
-            tx_sv2_new_ext_mining_job,
+            tx_bridge_work,
             channel_id: None,
             job_id: None,
             last_job_id: None,
@@ -281,17 +272,15 @@ impl Upstream {
         diff_update_rx: watch::Receiver<u64>,
     ) -> ProxyResult<'static, (AbortOnDrop, AbortOnDrop)> {
         let clone = self_.clone();
-        let (tx_frame, tx_sv2_extranonce, tx_sv2_new_ext_mining_job, tx_sv2_set_new_prev_hash) =
-            clone
-                .safe_lock(|s| {
-                    (
-                        s.sender.clone(),
-                        s.tx_sv2_extranonce.clone(),
-                        s.tx_sv2_new_ext_mining_job.clone(),
-                        s.tx_sv2_set_new_prev_hash.clone(),
-                    )
-                })
-                .map_err(|_| Error::TranslatorUpstreamMutexPoisoned)?;
+        let (tx_frame, tx_sv2_extranonce, tx_bridge_work) = clone
+            .safe_lock(|s| {
+                (
+                    s.sender.clone(),
+                    s.tx_sv2_extranonce.clone(),
+                    s.tx_bridge_work.clone(),
+                )
+            })
+            .map_err(|_| Error::TranslatorUpstreamMutexPoisoned)?;
         let diff_manager_handle = {
             let self_ = self_.clone();
             task::spawn(async move { Self::run_diff_management(self_, diff_update_rx).await })
@@ -378,17 +367,42 @@ impl Upstream {
                                 }
                                 Mining::NewExtendedMiningJob(m) => {
                                     info!("Parsing incoming NewExtendedMiningJob message from Pool for Channel Id: {}", m.channel_id);
+                                    // Claim feature metadata at the same point as the job itself.
+                                    // The legacy translator coalesces future jobs, so deferring this
+                                    // claim until Bridge delivery would leave bindings for dropped
+                                    // futures at the head of the queue.
+                                    let merge_mining_binding_id =
+                                        crate::merge_mining::claim_job_binding_pending(m.job_id);
                                     if m.is_future() {
-                                        future_j = Some(m)
+                                        if let Some((_, replaced_binding_id)) =
+                                            future_j.replace((m, merge_mining_binding_id))
+                                        {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                replaced_binding_id,
+                                            );
+                                        }
                                     } else {
                                         let job_id = m.job_id;
                                         if let Err(e) = self_.safe_lock(|s| {
                                             let _ = s.job_id.insert(job_id);
                                         }) {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                merge_mining_binding_id,
+                                            );
                                             error!("Translator upstream mutex poisoned: {e}");
                                             return;
                                         };
-                                        if tx_sv2_new_ext_mining_job.send(m).await.is_err() {
+                                        if tx_bridge_work
+                                            .send(BridgeWork::NewExtendedMiningJob {
+                                                job: m,
+                                                merge_mining_binding_id,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                merge_mining_binding_id,
+                                            );
                                             error!("Failed to send NewExtendedMiningJob");
                                             return;
                                         };
@@ -396,24 +410,48 @@ impl Upstream {
                                 }
                                 Mining::SetNewPrevHash(m) => {
                                     info!("Parsing incoming SetNewPrevHash message from Pool for Channel Id: {}", m.channel_id);
-                                    if let Some(j) = future_j.clone() {
+                                    if let Some((j, merge_mining_binding_id)) = future_j.clone() {
                                         future_j = None;
                                         let job_id = m.job_id;
                                         if let Err(e) = self_.safe_lock(|s| {
                                             let _ = s.job_id.insert(job_id);
                                         }) {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                merge_mining_binding_id,
+                                            );
                                             error!("Translator upstream mutex poisoned: {e}");
                                             return;
                                         };
-                                        if tx_sv2_new_ext_mining_job.send(j).await.is_err() {
+                                        if tx_bridge_work
+                                            .send(BridgeWork::NewExtendedMiningJob {
+                                                job: j,
+                                                merge_mining_binding_id,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                merge_mining_binding_id,
+                                            );
                                             error!("Failed to send NewExtendedMiningJob");
                                             return;
                                         };
-                                        if tx_sv2_set_new_prev_hash.send(m).await.is_err() {
+                                        if tx_bridge_work
+                                            .send(BridgeWork::SetNewPrevHash(m))
+                                            .await
+                                            .is_err()
+                                        {
+                                            crate::merge_mining::clear_pending_job_binding(
+                                                merge_mining_binding_id,
+                                            );
                                             error!("Failed to send SetNewPrevHash");
                                             return;
                                         };
-                                    } else if tx_sv2_set_new_prev_hash.send(m).await.is_err() {
+                                    } else if tx_bridge_work
+                                        .send(BridgeWork::SetNewPrevHash(m))
+                                        .await
+                                        .is_err()
+                                    {
                                         error!("Failed to send SetNewPrevHash");
                                         return;
                                     }
@@ -829,7 +867,6 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         if self.is_work_selection_enabled() {
             Ok(SendTo::None(None))
         } else {
-            IS_NEW_JOB_HANDLED.store(false, std::sync::atomic::Ordering::SeqCst);
             if !m.version_rolling_allowed {
                 warn!("VERSION ROLLING NOT ALLOWED IS A TODO");
                 // todo!()
@@ -933,15 +970,39 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use tokio::time::{timeout, Duration};
 
+    fn bridge_job(
+        job_id: u32,
+        future: bool,
+    ) -> roles_logic_sv2::mining_sv2::NewExtendedMiningJob<'static> {
+        roles_logic_sv2::mining_sv2::NewExtendedMiningJob {
+            channel_id: 1,
+            job_id,
+            min_ntime: binary_sv2::Sv2Option::new(if future { None } else { Some(1_700_000_000) }),
+            version: 0,
+            version_rolling_allowed: false,
+            merkle_path: vec![].into(),
+            coinbase_tx_prefix: Vec::new().try_into().expect("empty prefix"),
+            coinbase_tx_suffix: Vec::new().try_into().expect("empty suffix"),
+        }
+    }
+
+    fn bridge_prev_hash(job_id: u32) -> roles_logic_sv2::mining_sv2::SetNewPrevHash<'static> {
+        roles_logic_sv2::mining_sv2::SetNewPrevHash {
+            channel_id: 1,
+            job_id,
+            prev_hash: [3; 32].into(),
+            min_ntime: 1_700_000_000,
+            nbits: 0x1d00ffff,
+        }
+    }
+
     async fn test_upstream() -> Arc<Mutex<Upstream>> {
-        let (tx_sv2_set_new_prev_hash, _rx_sv2_set_new_prev_hash) = mpsc::channel(1);
-        let (tx_sv2_new_ext_mining_job, _rx_sv2_new_ext_mining_job) = mpsc::channel(1);
+        let (tx_bridge_work, _rx_bridge_work) = mpsc::channel(1);
         let (tx_sv2_extranonce, _rx_sv2_extranonce) = mpsc::channel(1);
         let (sender, _receiver) = mpsc::channel(1);
 
         Upstream::new(
-            tx_sv2_set_new_prev_hash,
-            tx_sv2_new_ext_mining_job,
+            tx_bridge_work,
             crate::MIN_EXTRANONCE_SIZE - 1,
             tx_sv2_extranonce,
             Arc::new(Mutex::new(vec![0; 32])),
@@ -952,6 +1013,75 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bridge_work_preserves_cross_type_source_order() {
+        let (tx_bridge_work, mut rx_bridge_work) = mpsc::channel(4);
+        let (tx_sv2_extranonce, _rx_sv2_extranonce) = mpsc::channel(1);
+        let (sender, _receiver) = mpsc::channel(1);
+        let (difficulty_config, diff_update_rx) =
+            UpstreamDifficultyConfig::new(crate::CHANNEL_DIFF_UPDTATE_INTERVAL, 0.0);
+        let upstream = Upstream::new(
+            tx_bridge_work,
+            crate::MIN_EXTRANONCE_SIZE - 1,
+            tx_sv2_extranonce,
+            Arc::new(Mutex::new(vec![0; 32])),
+            Arc::new(Mutex::new(difficulty_config)),
+            sender,
+        )
+        .await
+        .expect("upstream");
+        let (incoming_tx, incoming_rx) = mpsc::channel(4);
+        let (diff_manager, main_loop) =
+            Upstream::parse_incoming(upstream, incoming_rx, diff_update_rx).expect("parser");
+
+        incoming_tx
+            .send(Mining::SetNewPrevHash(bridge_prev_hash(10)))
+            .await
+            .expect("prevhash");
+        incoming_tx
+            .send(Mining::NewExtendedMiningJob(bridge_job(10, false)))
+            .await
+            .expect("nonfuture job");
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), rx_bridge_work.recv())
+                .await
+                .expect("work timeout"),
+            Some(BridgeWork::SetNewPrevHash(message)) if message.job_id == 10
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), rx_bridge_work.recv())
+                .await
+                .expect("work timeout"),
+            Some(BridgeWork::NewExtendedMiningJob { job, .. }) if job.job_id == 10
+        ));
+
+        incoming_tx
+            .send(Mining::NewExtendedMiningJob(bridge_job(11, true)))
+            .await
+            .expect("future job");
+        incoming_tx
+            .send(Mining::SetNewPrevHash(bridge_prev_hash(11)))
+            .await
+            .expect("prevhash");
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), rx_bridge_work.recv())
+                .await
+                .expect("work timeout"),
+            Some(BridgeWork::NewExtendedMiningJob { job, .. }) if job.job_id == 11
+        ));
+        assert!(matches!(
+            timeout(Duration::from_secs(1), rx_bridge_work.recv())
+                .await
+                .expect("work timeout"),
+            Some(BridgeWork::SetNewPrevHash(message)) if message.job_id == 11
+        ));
+
+        drop(diff_manager);
+        drop(main_loop);
     }
 
     #[tokio::test]
@@ -1056,16 +1186,14 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_signal_emits_update_channel_before_periodic_interval() {
-        let (tx_sv2_set_new_prev_hash, _rx_sv2_set_new_prev_hash) = mpsc::channel(1);
-        let (tx_sv2_new_ext_mining_job, _rx_sv2_new_ext_mining_job) = mpsc::channel(1);
+        let (tx_bridge_work, _rx_bridge_work) = mpsc::channel(1);
         let (tx_sv2_extranonce, _rx_sv2_extranonce) = mpsc::channel(1);
         let (sender, mut receiver) = mpsc::channel(4);
         let (difficulty_config, diff_update_rx) =
             UpstreamDifficultyConfig::new(crate::CHANNEL_DIFF_UPDTATE_INTERVAL, 0.0);
         let difficulty_config = Arc::new(Mutex::new(difficulty_config));
         let upstream = Upstream::new(
-            tx_sv2_set_new_prev_hash,
-            tx_sv2_new_ext_mining_job,
+            tx_bridge_work,
             crate::MIN_EXTRANONCE_SIZE - 1,
             tx_sv2_extranonce,
             Arc::new(Mutex::new(vec![0; 32])),

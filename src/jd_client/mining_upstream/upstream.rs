@@ -2,7 +2,7 @@ use crate::jd_client::IS_CUSTOM_JOB_SET;
 use crate::proxy_state::{DownstreamType, ProxyState, TpState, UpstreamType};
 use crate::{jd_client::error::Error, jd_client::error::ProxyResult, shared::utils::AbortOnDrop};
 
-use crate::jd_client::mining_downstream::DownstreamMiningNode as Downstream;
+use crate::jd_client::mining_downstream::{DownstreamJob, DownstreamMiningNode as Downstream};
 
 use binary_sv2::{Seq0255, U256};
 use roles_logic_sv2::{
@@ -19,7 +19,10 @@ use roles_logic_sv2::{
     Error as RolesLogicError,
 };
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc::{Receiver as TReceiver, Sender as TSender};
+use tokio::sync::{
+    mpsc::{Receiver as TReceiver, Sender as TSender},
+    Mutex as TokioMutex,
+};
 use tokio::task;
 use tracing::{error, info, warn};
 
@@ -29,7 +32,7 @@ use super::task_manager::TaskManager;
 
 #[derive(Debug)]
 struct CircularBuffer {
-    buffer: VecDeque<(u64, u32)>,
+    buffer: VecDeque<(u32, u32)>,
     capacity: usize,
 }
 
@@ -41,18 +44,25 @@ impl CircularBuffer {
         }
     }
 
-    fn insert(&mut self, key: u64, value: u32) {
+    fn insert(&mut self, key: u32, value: u32) {
+        self.buffer.retain(|(existing, _)| *existing != key);
         if self.buffer.len() == self.capacity {
             self.buffer.pop_front();
         }
         self.buffer.push_back((key, value));
     }
 
-    fn get(&self, id: u64) -> Option<u32> {
+    fn get(&self, id: u32) -> Option<u32> {
         self.buffer
             .iter()
             .find_map(|&(key, value)| if key == id { Some(value) } else { None })
     }
+}
+
+#[derive(Debug)]
+struct PendingCustomJob {
+    template_id: u64,
+    downstream_job: DownstreamJob,
 }
 
 impl std::default::Default for CircularBuffer {
@@ -63,26 +73,26 @@ impl std::default::Default for CircularBuffer {
 
 #[derive(Debug, Default)]
 struct TemplateToJobId {
-    template_id_to_job_id: CircularBuffer,
-    request_id_to_template_id: HashMap<u32, u64>,
+    downstream_to_pool_job_id: CircularBuffer,
+    requests: HashMap<u32, PendingCustomJob>,
 }
 
 impl TemplateToJobId {
-    fn register_template_id(&mut self, template_id: u64, request_id: u32) {
-        self.request_id_to_template_id
-            .insert(request_id, template_id);
+    fn register_request(&mut self, request_id: u32, request: PendingCustomJob) {
+        self.requests.insert(request_id, request);
     }
 
-    fn register_job_id(&mut self, template_id: u64, job_id: u32) {
-        self.template_id_to_job_id.insert(template_id, job_id);
+    fn register_job_id(&mut self, downstream_job_id: u32, pool_job_id: u32) {
+        self.downstream_to_pool_job_id
+            .insert(downstream_job_id, pool_job_id);
     }
 
-    fn get_job_id(&mut self, template_id: u64) -> Option<u32> {
-        self.template_id_to_job_id.get(template_id)
+    fn get_job_id(&self, downstream_job_id: u32) -> Option<u32> {
+        self.downstream_to_pool_job_id.get(downstream_job_id)
     }
 
-    fn take_template_id(&mut self, request_id: u32) -> Option<u64> {
-        self.request_id_to_template_id.remove(&request_id)
+    fn take_request(&mut self, request_id: u32) -> Option<PendingCustomJob> {
+        self.requests.remove(&request_id)
     }
 
     fn new() -> Self {
@@ -108,6 +118,7 @@ pub struct Upstream {
     pub downstream: Option<Arc<Mutex<Downstream>>>,
     channel_factory: Option<PoolChannelFactory>,
     template_to_job_id: TemplateToJobId,
+    custom_job_send_lock: Arc<TokioMutex<()>>,
     req_ids: Id,
 }
 
@@ -141,12 +152,13 @@ impl Upstream {
             downstream: None,
             channel_factory: None,
             template_to_job_id: TemplateToJobId::new(),
+            custom_job_send_lock: Arc::new(TokioMutex::new(())),
             req_ids: Id::new(),
         })))
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn set_custom_jobs(
+    pub(crate) async fn set_custom_jobs(
         self_: &Arc<Mutex<Self>>,
         declare_mining_job: DeclareMiningJob<'static>,
         set_new_prev_hash: roles_logic_sv2::template_distribution_sv2::SetNewPrevHash<'static>,
@@ -159,8 +171,13 @@ impl Upstream {
         coinbase_tx_outs: Vec<u8>,
         coinbase_tx_locktime: u32,
         template_id: u64,
+        downstream_job: DownstreamJob,
     ) -> ProxyResult<()> {
         info!("Sending set custom mining job");
+        let send_lock = self_
+            .safe_lock(|state| state.custom_job_send_lock.clone())
+            .map_err(|_| Error::JdClientUpstreamMutexCorrupted)?;
+        let _send_guard = send_lock.lock().await;
         let request_id = self_
             .safe_lock(|s| s.req_ids.next())
             .map_err(|_| Error::JdClientUpstreamMutexCorrupted)?;
@@ -194,11 +211,23 @@ impl Upstream {
         let message = Mining::SetCustomMiningJob(to_send);
         self_
             .safe_lock(|s| {
-                s.template_to_job_id
-                    .register_template_id(template_id, request_id)
+                s.template_to_job_id.register_request(
+                    request_id,
+                    PendingCustomJob {
+                        template_id,
+                        downstream_job,
+                    },
+                )
             })
             .map_err(|_| Error::JdClientUpstreamMutexCorrupted)?;
-        Self::send(self_, message).await
+        if let Err(error) = Self::send(self_, message).await {
+            let _ = self_.safe_lock(|state| {
+                state.template_to_job_id.take_request(request_id);
+            });
+            IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Parses the incoming SV2 message from the Upstream role and routes the message to the
@@ -293,10 +322,13 @@ impl Upstream {
             .map_err(|_| Error::JdClientUpstreamMutexCorrupted)?
     }
 
-    pub async fn get_job_id(self_: &Arc<Mutex<Self>>, template_id: u64) -> Result<u32, Error> {
+    pub async fn get_job_id(
+        self_: &Arc<Mutex<Self>>,
+        downstream_job_id: u32,
+    ) -> Result<u32, Error> {
         loop {
             if let Some(id) = self_
-                .safe_lock(|s| s.template_to_job_id.get_job_id(template_id))
+                .safe_lock(|s| s.template_to_job_id.get_job_id(downstream_job_id))
                 .map_err(|_| Error::JdClientDownstreamMutexCorrupted)?
             {
                 return Ok(id);
@@ -567,19 +599,19 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         &mut self,
         m: roles_logic_sv2::mining_sv2::SetCustomMiningJobSuccess,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
-        if let Some(template_id) = self.template_to_job_id.take_template_id(m.request_id) {
+        if let Some(request) = self.template_to_job_id.take_request(m.request_id) {
             self.template_to_job_id
-                .register_job_id(template_id, m.job_id);
+                .register_job_id(request.downstream_job.local_job_id, m.job_id);
             info!(
                 "Set custom mining job success {}, for template {}",
-                m.job_id, template_id
+                m.job_id, request.template_id
             );
             IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
             Ok(SendTo::None(None))
         } else {
-            error!(
-                "Attention received a SetupConnectionSuccess with unknown request_id: {}",
-                m.request_id
+            warn!(
+                request_id = m.request_id,
+                "ignoring unknown or late custom-job success"
             );
             Ok(SendTo::None(None))
         }
@@ -588,9 +620,21 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
     /// Handles the SV2 `SetCustomMiningJobError` message.
     fn handle_set_custom_mining_job_error(
         &mut self,
-        _m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
+        m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
-        IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(request) = self.template_to_job_id.take_request(m.request_id) {
+            warn!(
+                template_id = request.template_id,
+                request_id = m.request_id,
+                "pool rejected custom job"
+            );
+            IS_CUSTOM_JOB_SET.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            warn!(
+                request_id = m.request_id,
+                "ignoring unknown or late custom-job rejection"
+            );
+        }
         Ok(SendTo::None(None))
     }
 
@@ -637,5 +681,64 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         } else {
             Err(RolesLogicError::DownstreamDown)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn downstream_job(local_job_id: u32) -> DownstreamJob {
+        DownstreamJob {
+            local_job_id,
+            coinbase_tx_prefix: Vec::new().try_into().expect("empty prefix"),
+            coinbase_tx_suffix: Vec::new().try_into().expect("empty suffix"),
+        }
+    }
+
+    #[test]
+    fn pool_job_mappings_are_scoped_to_the_exact_miner_job() {
+        let mut mappings = TemplateToJobId::new();
+        mappings.register_job_id(11, 101);
+        mappings.register_job_id(12, 102);
+
+        assert_eq!(mappings.get_job_id(11), Some(101));
+        assert_eq!(mappings.get_job_id(12), Some(102));
+    }
+
+    #[test]
+    fn custom_job_responses_keep_request_correlation_when_reordered() {
+        let mut mappings = TemplateToJobId::new();
+        mappings.register_request(
+            1,
+            PendingCustomJob {
+                template_id: 41,
+                downstream_job: downstream_job(11),
+            },
+        );
+        mappings.register_request(
+            2,
+            PendingCustomJob {
+                template_id: 42,
+                downstream_job: downstream_job(12),
+            },
+        );
+
+        assert_eq!(
+            mappings
+                .take_request(2)
+                .expect("second request")
+                .downstream_job
+                .local_job_id,
+            12
+        );
+        assert_eq!(
+            mappings
+                .take_request(1)
+                .expect("first request")
+                .downstream_job
+                .local_job_id,
+            11
+        );
     }
 }
