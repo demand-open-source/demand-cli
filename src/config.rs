@@ -326,10 +326,12 @@ and make that test pass."
             return (None, missing);
         }
 
-        let fee_delta = match fee_delta.trim().parse() {
-            Ok(fee_delta) => fee_delta,
-            Err(_) => return (None, vec!["RPC_FEE_DELTA"]),
+        let Ok(fee_delta) = fee_delta.trim().parse() else {
+            return (None, vec!["RPC_FEE_DELTA"]);
         };
+        if fee_delta <= 0 {
+            return (None, vec!["RPC_FEE_DELTA"]);
+        }
 
         (
             Some(BitcoindRpcConfig {
@@ -1194,5 +1196,21 @@ mod tests {
                 "API_TX_TOKEN"
             ]
         );
+    }
+
+    #[test]
+    fn prioritizing_txs_requires_a_positive_fee_delta() {
+        for fee_delta in ["0", "-100000000", "not-a-number"] {
+            let (config, missing) = Configuration::build_prioritizing_txs_config(
+                "http://127.0.0.1:8332".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+                fee_delta.to_string(),
+                "api-token".to_string(),
+            );
+
+            assert!(config.is_none());
+            assert_eq!(missing, vec!["RPC_FEE_DELTA"]);
+        }
     }
 }

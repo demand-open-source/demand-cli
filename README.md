@@ -214,21 +214,21 @@ Log in with the credentials you used during registration.
 
 > Hashrate statistics are averaged over time — the dashboard typically reflects your full hashrate well within the first hour after your miners connect. A low reading right after connecting is normal.
 
-## 7. Prioritize Transactions (optional)
+## 7. Prioritize and Deprioritize Transactions (optional)
 
-The DMND Client can expose an API endpoint that submits a raw transaction to your Bitcoin Core node and asks it to prioritize that transaction for block template selection (via the `prioritisetransaction` RPC).
+The DMND Client can expose an API endpoint that submits a raw transaction to your Bitcoin Core node and asks it to prioritize or deprioritize that transaction for block template selection (via the `prioritisetransaction` RPC).
 
-The feature is enabled **only when all** of the following are configured:
+The feature is enabled only when all of the following are configured:
 
 | Setting | CLI flag | config.toml | Env var | Description |
 |---|---|---|---|---|
 | RPC URL | `--rpc-url` | `rpc_url` | `RPC_URL` | Bitcoin Core RPC, e.g. `http://127.0.0.1:8332` |
 | RPC user | `--rpc-user` | `rpc_user` | `RPC_USER` | Bitcoin Core RPC username |
 | RPC password | `--rpc-pwd` | `rpc_pwd` | `RPC_PWD` | Bitcoin Core RPC password |
-| Fee delta | `--rpc-fee-delta` | `rpc_fee_delta` | `RPC_FEE_DELTA` | Virtual fee boost **in satoshis**, passed to `prioritisetransaction` |
+| Fee delta | `--rpc-fee-delta` | `rpc_fee_delta` | `RPC_FEE_DELTA` | Positive prioritization amount **in satoshis**, e.g. `100000000` (1 BTC) |
 | API token | `--api-tx-token` | `api_tx_token` | `API_TX_TOKEN` | Bearer token required by this API |
 
-> **Fee delta units:** `RPC_FEE_DELTA` is denominated in **satoshis**. It's a *virtual* fee adjustment used only for template selection on your node — it doesn't spend anything — but set it deliberately. `100000` (0.001 BTC virtual boost) is a reasonable starting point.
+> **Fee delta units:** `RPC_FEE_DELTA` is a positive magnitude denominated in **satoshis**. For example, configure `100000000` for a 1 BTC virtual adjustment. Prioritizing adds that amount for template selection on your node; deprioritizing removes it from an already-prioritized transaction. It doesn't spend anything.
 
 > **Security:**
 > - The tx API (default port **3001**) should never be exposed to the public internet. Bind it to localhost or protect it behind your own gateway.
@@ -242,7 +242,7 @@ TOKEN=<DMND-token> \
 RPC_URL=http://127.0.0.1:8332 \
 RPC_USER=<bitcoin-rpc-user> \
 RPC_PWD=<bitcoin-rpc-password> \
-RPC_FEE_DELTA=100000 \
+RPC_FEE_DELTA=100000000 \
 API_TX_TOKEN=<api-token> \
 ./dmnd-client -l info -d 250T --tp-address="127.0.0.1:8336"
 ```
@@ -253,19 +253,34 @@ Example `config.toml`:
 rpc_url = "http://127.0.0.1:8332"
 rpc_user = "<bitcoin-rpc-user>"
 rpc_pwd = "<bitcoin-rpc-password>"
-rpc_fee_delta = 100000
+rpc_fee_delta = 100000000
 api_tx_token = "<api-token>"
 ```
 
 ### Using the API
 
-Submit a raw transaction hex:
+Use `+` to prioritize a transaction:
 
 ```
 curl -X POST \
   -H "Authorization: Bearer <api-token>" \
-  "http://127.0.0.1:3001/api/tx/submit/<raw-transaction-hex>"
+  "http://127.0.0.1:3001/api/tx/submit/+/<raw-transaction-hex>"
 ```
+
+Use `-` to restore a prioritized transaction to its original fee rate:
+
+```
+curl -X POST \
+  -H "Authorization: Bearer <api-token>" \
+  "http://127.0.0.1:3001/api/tx/submit/-/<raw-transaction-hex>"
+```
+
+| Current state | `+` action | `-` action |
+|---|---|---|
+| Normal (`0`) | Prioritized (`+RPC_FEE_DELTA`) | No change |
+| Prioritized (`+RPC_FEE_DELTA`) | No change | Normal (`0`) |
+
+The client reads the current cumulative delta from Bitcoin Core before applying an action. It only accepts the two states above and never applies a transition that creates a negative fee delta.
 
 List currently tracked prioritized transactions:
 
@@ -289,7 +304,7 @@ The response includes the tracked transaction count, transaction hex, and live m
         "tx_hex": "<raw-transaction-hex>",
         "tx_fee": {
           "real": 0.00001000,
-          "modified": 0.00101000
+          "modified": 1.00001000
         }
       }
     ]
@@ -311,7 +326,7 @@ If the prioritization configuration is incomplete, these endpoints are disabled:
 | Miner connects but no shares yet | Normal within the first ~6 min | Wait; first share acceptance takes about 6 minutes |
 | Still no shares after 10+ min | Wrong token in password field, or `-d` far off | Re-check token; set `-d` to your least powerful machine (250T direct / 20P proxies) |
 | Dashboard shows zero / low hashrate | Statistics lag | Give it up to an hour after connecting |
-| tx API returns 503 | Prioritization config incomplete | All five settings in Section 7 must be set |
+| tx API returns 503 | Prioritization config incomplete | Set all five prioritization settings from Section 7 |
 
 Still stuck? Reach out through the support channel listed in your registration confirmation email.
 

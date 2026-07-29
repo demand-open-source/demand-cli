@@ -3,6 +3,7 @@ use bitcoin::{blockdata::transaction::Transaction, consensus::encode::deserializ
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{error::Error as StdError, fmt, time::Duration};
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -13,6 +14,7 @@ pub(crate) struct BitcoindRpc {
     user: String,
     pwd: String,
     fee_delta: i64,
+    priority_transition_lock: Mutex<()>,
 }
 
 impl BitcoindRpc {
@@ -22,10 +24,18 @@ impl BitcoindRpc {
             user,
             pwd,
             fee_delta,
+            priority_transition_lock: Mutex::new(()),
         }
     }
 
-    pub(crate) async fn submit_transaction(&self, tx: &str) -> Result<String, BitcoindRpcError> {
+    pub(crate) async fn submit_transaction(
+        &self,
+        tx: &str,
+        prioritize: bool,
+    ) -> Result<String, BitcoindRpcError> {
+        // Serialize state reads and mutations so concurrent API calls cannot move a transaction
+        // outside the two supported states.
+        let _transition_guard = self.priority_transition_lock.lock().await;
         let tx = validate_transaction_hex(tx)?;
         let transaction = transaction_from_hex(tx)?;
         let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
@@ -37,21 +47,104 @@ impl BitcoindRpc {
             )));
         }
 
-        self.prioritise_transaction(&txid).await?;
-        crate::prioritized_transactions::record(transaction);
+        let current_delta = self.current_fee_delta(&txid).await?;
+        let delta_to_apply = self.priority_delta(current_delta, prioritize)?;
+        let next_delta = current_delta + delta_to_apply;
+
+        if delta_to_apply != 0 {
+            self.prioritise_transaction(&txid, delta_to_apply).await?;
+        } else {
+            info!(
+                txid = %txid,
+                prioritize,
+                "transaction priority action is already at its boundary; no fee delta applied"
+            );
+        }
+
+        if next_delta == self.fee_delta {
+            crate::prioritized_transactions::record(transaction);
+        } else {
+            crate::prioritized_transactions::remove(&txid);
+        }
+
+        info!(
+            txid = %txid,
+            prioritize,
+            current_delta,
+            delta_to_apply,
+            next_delta,
+            "transaction priority state updated"
+        );
         Ok(txid.to_string())
     }
 
-    async fn prioritise_transaction(&self, txid: &Txid) -> Result<(), BitcoindRpcError> {
+    /// Calculates the adjustment needed to move between the only two supported states:
+    ///
+    /// | Current cumulative delta | Prioritize | Deprioritize |
+    /// |--------------------------|------------|--------------|
+    /// | `0`                      | `+fee_delta` | no-op       |
+    /// | `fee_delta`              | no-op        | `-fee_delta` |
+    ///
+    /// The negative return value is only an adjustment that restores a prioritized
+    /// transaction to zero. A negative cumulative fee delta is never a valid state.
+    fn priority_delta(
+        &self,
+        current_delta: i64,
+        prioritize: bool,
+    ) -> Result<i64, BitcoindRpcError> {
+        if ![0, self.fee_delta].contains(&current_delta) {
+            return Err(BitcoindRpcError::Prioritize(format!(
+                "transaction has unsupported fee delta {current_delta}; expected 0 or {}",
+                self.fee_delta
+            )));
+        }
+
+        Ok(match (current_delta, prioritize) {
+            (0, true) => self.fee_delta,
+            (current_delta, false) if current_delta == self.fee_delta => -self.fee_delta,
+            _ => 0,
+        })
+    }
+
+    async fn current_fee_delta(&self, txid: &Txid) -> Result<i64, BitcoindRpcError> {
+        let (status, text) = self
+            .send_request("getprioritisedtransactions", json!([]))
+            .await?;
+        let result = RpcResponse::from_response(status, &text)
+            .map_err(|e| BitcoindRpcError::Prioritize(e.to_string()))?
+            .ok_or_else(|| {
+                BitcoindRpcError::InvalidResponse(format!(
+                    "missing getprioritisedtransactions result from bitcoind: {text}"
+                ))
+            })?;
+        let Some(priority) = result.get(txid.to_string()) else {
+            return Ok(0);
+        };
+
+        priority
+            .get("fee_delta")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                BitcoindRpcError::InvalidResponse(format!(
+                    "missing or invalid fee_delta for transaction {txid}: {text}"
+                ))
+            })
+    }
+
+    async fn prioritise_transaction(
+        &self,
+        txid: &Txid,
+        fee_delta: i64,
+    ) -> Result<(), BitcoindRpcError> {
         let (status, text) = self
             .send_request(
                 "prioritisetransaction",
-                json!([txid.to_string(), 0, self.fee_delta]),
+                json!([txid.to_string(), 0, fee_delta]),
             )
             .await?;
         info!(
             txid = %txid,
-            fee_delta = self.fee_delta,
+            fee_delta,
             %status,
             response = %text,
             "bitcoind prioritisetransaction response"
@@ -393,6 +486,14 @@ mod tests {
                         "id": "dmnd-client"
                     })),
                 ),
+                Some("getprioritisedtransactions") => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "result": {},
+                        "error": null,
+                        "id": "dmnd-client"
+                    })),
+                ),
                 Some("prioritisetransaction") => (
                     StatusCode::OK,
                     Json(json!({
@@ -440,7 +541,7 @@ mod tests {
         );
 
         let txid = rpc
-            .submit_transaction(RAW_TX)
+            .submit_transaction(RAW_TX, true)
             .await
             .expect("already-in-mempool tx should still be prioritized");
 
@@ -451,6 +552,12 @@ mod tests {
             .await
             .expect("sendrawtransaction request");
         assert_eq!(submit_request["method"], "sendrawtransaction");
+
+        let priorities_request = received_requests
+            .recv()
+            .await
+            .expect("getprioritisedtransactions request");
+        assert_eq!(priorities_request["method"], "getprioritisedtransactions");
 
         let prioritize_request = received_requests
             .recv()
@@ -463,6 +570,32 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn transaction_priority_actions_only_toggle_between_zero_and_configured_delta() {
+        let rpc = BitcoindRpc::new(
+            "http://127.0.0.1:8332".to_string(),
+            "user".to_string(),
+            "password".to_string(),
+            100_000_000,
+        );
+        let cases = [
+            (0, true, 100_000_000),
+            (100_000_000, true, 0),
+            (100_000_000, false, -100_000_000),
+            (0, false, 0),
+        ];
+
+        for (current_delta, prioritize, expected_delta) in cases {
+            assert_eq!(
+                rpc.priority_delta(current_delta, prioritize).unwrap(),
+                expected_delta
+            );
+        }
+        assert!(rpc.priority_delta(-100_000_000, true).is_err());
+        assert!(rpc.priority_delta(-100_000_000, false).is_err());
+        assert!(rpc.priority_delta(1, true).is_err());
     }
 }
 

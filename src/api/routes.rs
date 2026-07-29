@@ -157,8 +157,21 @@ impl Api {
     pub async fn send_tx_to_bitcoind(
         State(state): State<AppState>,
         headers: HeaderMap,
-        Path(tx): Path<String>,
+        Path((action, tx)): Path<(String, String)>,
     ) -> impl IntoResponse {
+        let prioritize = match action.as_str() {
+            "+" => true,
+            "-" => false,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(APIResponse::<String>::error(Some(
+                        "transaction priority action must be '+' or '-'".to_string(),
+                    ))),
+                )
+            }
+        };
+
         let Some(prioritizing_txs) = state.prioritizing_txs.as_ref() else {
             warn!("PRIORITIZING TXS NOT ENABLED");
             return (
@@ -179,9 +192,13 @@ impl Api {
             );
         }
 
-        match prioritizing_txs.rpc.submit_transaction(&tx).await {
+        match prioritizing_txs
+            .rpc
+            .submit_transaction(&tx, prioritize)
+            .await
+        {
             Ok(txid) => {
-                info!("transaction sent to bitcoind: {txid}");
+                info!(%txid, prioritize, "transaction sent to bitcoind");
                 (StatusCode::OK, Json(APIResponse::success(Some(txid))))
             }
             Err(e) => {
@@ -373,7 +390,7 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
     let response = Api::send_tx_to_bitcoind(
         State(state),
         axum::http::HeaderMap::new(),
-        Path("00".to_string()),
+        Path(("+".to_string(), "00".to_string())),
     )
     .await
     .into_response();
@@ -409,7 +426,7 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
     let response = Api::send_tx_to_bitcoind(
         State(state),
         axum::http::HeaderMap::new(),
-        Path("00".to_string()),
+        Path(("+".to_string(), "00".to_string())),
     )
     .await
     .into_response();

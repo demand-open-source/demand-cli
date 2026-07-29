@@ -62,7 +62,10 @@ pub(crate) async fn start(
             "/api/merge-mining/found-job",
             get(crate::merge_mining::poll_found_job_api),
         )
-        .route("/api/tx/submit/{tx}", post(Api::send_tx_to_bitcoind))
+        .route(
+            "/api/tx/submit/{action}/{tx}",
+            post(Api::send_tx_to_bitcoind),
+        )
         .route(
             "/api/tx/prioritized",
             get(Api::get_prioritized_transactions),
