@@ -280,7 +280,7 @@ curl -X POST \
 | Normal (`0`) | Prioritized (`+RPC_FEE_DELTA`) | No change |
 | Prioritized (`+RPC_FEE_DELTA`) | No change | Normal (`0`) |
 
-The client reads the current cumulative delta from Bitcoin Core before applying an action. It only accepts the two states above and never applies a transition that creates a negative fee delta.
+The client reads the current cumulative delta from Bitcoin Core before applying an action. It only accepts the two states above and never applies a transition that creates a negative fee delta. The `+` action submits the raw transaction to the node before prioritizing it; the `-` action derives the txid locally and never submits the transaction.
 
 List currently tracked prioritized transactions:
 

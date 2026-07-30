@@ -194,15 +194,15 @@ impl Api {
 
         match prioritizing_txs
             .rpc
-            .submit_transaction(&tx, prioritize)
+            .update_transaction_priority(&tx, prioritize)
             .await
         {
             Ok(txid) => {
-                info!(%txid, prioritize, "transaction sent to bitcoind");
+                info!(%txid, prioritize, "transaction priority request completed");
                 (StatusCode::OK, Json(APIResponse::success(Some(txid))))
             }
             Err(e) => {
-                error!("Failed to send transaction to bitcoind: {e}");
+                error!("Failed to update transaction priority: {e}");
                 (
                     e.status_code(),
                     Json(APIResponse::error(Some(e.to_string()))),

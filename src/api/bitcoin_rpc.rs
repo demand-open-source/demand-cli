@@ -28,7 +28,7 @@ impl BitcoindRpc {
         }
     }
 
-    pub(crate) async fn submit_transaction(
+    pub(crate) async fn update_transaction_priority(
         &self,
         tx: &str,
         prioritize: bool,
@@ -38,13 +38,19 @@ impl BitcoindRpc {
         let _transition_guard = self.priority_transition_lock.lock().await;
         let tx = validate_transaction_hex(tx)?;
         let transaction = transaction_from_hex(tx)?;
-        let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
-        let txid = txid_from_sendrawtransaction_response(&transaction, status, &text)?;
-        let computed_txid = transaction.compute_txid();
-        if txid != computed_txid {
-            return Err(BitcoindRpcError::InvalidResponse(format!(
-                "bitcoind returned txid {txid}, but transaction hex decodes to {computed_txid}"
-            )));
+        let txid = transaction.compute_txid();
+
+        // Prioritizing may introduce a new transaction to the node. Deprioritizing only
+        // reverses an existing virtual fee adjustment, so it must never submit the transaction.
+        if prioritize {
+            let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
+            let submitted_txid =
+                txid_from_sendrawtransaction_response(&transaction, status, &text)?;
+            if submitted_txid != txid {
+                return Err(BitcoindRpcError::InvalidResponse(format!(
+                    "bitcoind returned txid {submitted_txid}, but transaction hex decodes to {txid}"
+                )));
+            }
         }
 
         let current_delta = self.current_fee_delta(&txid).await?;
@@ -455,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_transaction_prioritizes_when_tx_is_already_in_mempool() {
+    async fn update_transaction_priority_prioritizes_when_tx_is_already_in_mempool() {
         #[derive(Clone)]
         struct MockBitcoindState {
             requests: UnboundedSender<Value>,
@@ -541,7 +547,7 @@ mod tests {
         );
 
         let txid = rpc
-            .submit_transaction(RAW_TX, true)
+            .update_transaction_priority(RAW_TX, true)
             .await
             .expect("already-in-mempool tx should still be prioritized");
 
@@ -567,6 +573,119 @@ mod tests {
         assert_eq!(
             prioritize_request["params"],
             json!([expected_txid, 0, 100_000_000])
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deprioritizing_does_not_submit_the_transaction() {
+        #[derive(Clone)]
+        struct MockBitcoindState {
+            requests: UnboundedSender<Value>,
+            prioritized_txid: String,
+        }
+
+        async fn mock_bitcoind(
+            State(state): State<MockBitcoindState>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            state
+                .requests
+                .send(body)
+                .expect("test should receive bitcoind request");
+
+            match method.as_deref() {
+                Some("getprioritisedtransactions") => {
+                    let mut priorities = serde_json::Map::new();
+                    priorities.insert(state.prioritized_txid, json!({"fee_delta": 100_000_000}));
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "result": priorities,
+                            "error": null,
+                            "id": "dmnd-client"
+                        })),
+                    )
+                }
+                Some("prioritisetransaction") => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "result": true,
+                        "error": null,
+                        "id": "dmnd-client"
+                    })),
+                ),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "result": null,
+                        "error": {
+                            "code": -32601,
+                            "message": "unexpected method"
+                        },
+                        "id": "dmnd-client"
+                    })),
+                ),
+            }
+        }
+
+        let expected_txid = transaction_from_hex(RAW_TX)
+            .expect("valid test transaction")
+            .compute_txid();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server local addr");
+        let (requests, mut received_requests) = unbounded_channel();
+        let app = Router::new()
+            .route("/", post(mock_bitcoind))
+            .with_state(MockBitcoindState {
+                requests,
+                prioritized_txid: expected_txid.to_string(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let rpc = BitcoindRpc::new(
+            format!("http://{addr}"),
+            "user".to_string(),
+            "password".to_string(),
+            100_000_000,
+        );
+
+        let txid = rpc
+            .update_transaction_priority(RAW_TX, false)
+            .await
+            .expect("prioritized transaction should be restored to its original fee rate");
+
+        assert_eq!(txid, expected_txid.to_string());
+
+        let priorities_request = received_requests
+            .recv()
+            .await
+            .expect("getprioritisedtransactions request");
+        assert_eq!(priorities_request["method"], "getprioritisedtransactions");
+
+        let deprioritize_request = received_requests
+            .recv()
+            .await
+            .expect("prioritisetransaction request");
+        assert_eq!(deprioritize_request["method"], "prioritisetransaction");
+        assert_eq!(
+            deprioritize_request["params"],
+            json!([expected_txid, 0, -100_000_000])
+        );
+        assert!(
+            received_requests.try_recv().is_err(),
+            "deprioritizing must not send any additional request such as sendrawtransaction"
         );
 
         server.abort();
