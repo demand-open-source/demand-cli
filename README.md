@@ -216,7 +216,7 @@ Log in with the credentials you used during registration.
 
 ## 7. Prioritize and Deprioritize Transactions (optional)
 
-The DMND Client can expose an API endpoint that submits a raw transaction to your Bitcoin Core node and asks it to prioritize or deprioritize that transaction for block template selection (via the `prioritisetransaction` RPC).
+The DMND Client can expose an API endpoint that prioritizes or deprioritizes a transaction for block template selection (via the `prioritisetransaction` RPC), conditionally submitting the raw transaction to your Bitcoin Core node when prioritizing it.
 
 The feature is enabled only when all of the following are configured:
 
@@ -280,7 +280,7 @@ curl -X POST \
 | Normal (`0`) | Prioritized (`+RPC_FEE_DELTA`) | No change |
 | Prioritized (`+RPC_FEE_DELTA`) | No change | Normal (`0`) |
 
-The client reads the current cumulative delta from Bitcoin Core before applying an action. It only accepts the two states above and never applies a transition that creates a negative fee delta. The `+` action submits the raw transaction to the node before prioritizing it; the `-` action derives the txid locally and never submits the transaction.
+The client reads the current cumulative delta from Bitcoin Core before applying an action. It only accepts the two states above and never applies a transition that creates a negative fee delta. For the `+` action, the client applies the priority delta first, then checks the mempool and submits the raw transaction only when it is not already present. This lets Bitcoin Core evaluate a newly submitted transaction using its modified fee. The `-` action derives the txid locally and never submits the transaction.
 
 List currently tracked prioritized transactions:
 

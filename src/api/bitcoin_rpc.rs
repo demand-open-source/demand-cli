@@ -40,19 +40,6 @@ impl BitcoindRpc {
         let transaction = transaction_from_hex(tx)?;
         let txid = transaction.compute_txid();
 
-        // Prioritizing may introduce a new transaction to the node. Deprioritizing only
-        // reverses an existing virtual fee adjustment, so it must never submit the transaction.
-        if prioritize {
-            let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
-            let submitted_txid =
-                txid_from_sendrawtransaction_response(&transaction, status, &text)?;
-            if submitted_txid != txid {
-                return Err(BitcoindRpcError::InvalidResponse(format!(
-                    "bitcoind returned txid {submitted_txid}, but transaction hex decodes to {txid}"
-                )));
-            }
-        }
-
         let current_delta = self.current_fee_delta(&txid).await?;
         let delta_to_apply = self.priority_delta(current_delta, prioritize)?;
         let next_delta = current_delta + delta_to_apply;
@@ -65,6 +52,20 @@ impl BitcoindRpc {
                 prioritize,
                 "transaction priority action is already at its boundary; no fee delta applied"
             );
+        }
+
+        // Bitcoin Core remembers a priority delta even when the transaction is not in its
+        // mempool. Apply the delta first so a low-fee transaction is evaluated with its
+        // modified fee when submitted. Deprioritizing never submits the transaction.
+        if prioritize && !self.transaction_in_mempool(&txid.to_string()).await? {
+            let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
+            let submitted_txid =
+                txid_from_sendrawtransaction_response(&transaction, status, &text)?;
+            if submitted_txid != txid {
+                return Err(BitcoindRpcError::InvalidResponse(format!(
+                    "bitcoind returned txid {submitted_txid}, but transaction hex decodes to {txid}"
+                )));
+            }
         }
 
         if next_delta == self.fee_delta {
@@ -289,7 +290,7 @@ fn txid_from_sendrawtransaction_response(
             info!(
                 txid = %txid,
                 response = %text,
-                "transaction already in bitcoind mempool; prioritizing existing transaction"
+                "transaction already in bitcoind mempool after its priority was applied"
             );
             return Ok(txid);
         }
@@ -405,7 +406,10 @@ mod tests {
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use serde_json::json;
     use serde_json::Value;
-    use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+    use tokio::{
+        sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        task::JoinHandle,
+    };
 
     const RAW_TX: &str = concat!(
         "01000000",
@@ -419,6 +423,117 @@ mod tests {
         "00",
         "00000000",
     );
+
+    #[derive(Clone)]
+    struct MockPrioritizeState {
+        requests: UnboundedSender<Value>,
+        expected_txid: String,
+        transaction_in_mempool: bool,
+    }
+
+    async fn mock_prioritize_bitcoind(
+        State(state): State<MockPrioritizeState>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let method = body
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        state
+            .requests
+            .send(body)
+            .expect("test should receive bitcoind request");
+
+        match method.as_deref() {
+            Some("getprioritisedtransactions") => (
+                StatusCode::OK,
+                Json(json!({
+                    "result": {},
+                    "error": null,
+                    "id": "dmnd-client"
+                })),
+            ),
+            Some("prioritisetransaction") => (
+                StatusCode::OK,
+                Json(json!({
+                    "result": true,
+                    "error": null,
+                    "id": "dmnd-client"
+                })),
+            ),
+            Some("getmempoolentry") if state.transaction_in_mempool => (
+                StatusCode::OK,
+                Json(json!({
+                    "result": {},
+                    "error": null,
+                    "id": "dmnd-client"
+                })),
+            ),
+            Some("getmempoolentry") => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "result": null,
+                    "error": {
+                        "code": -5,
+                        "message": "Transaction not in mempool"
+                    },
+                    "id": "dmnd-client"
+                })),
+            ),
+            Some("sendrawtransaction") => (
+                StatusCode::OK,
+                Json(json!({
+                    "result": state.expected_txid,
+                    "error": null,
+                    "id": "dmnd-client"
+                })),
+            ),
+            _ => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "result": null,
+                    "error": {
+                        "code": -32601,
+                        "message": "unknown method"
+                    },
+                    "id": "dmnd-client"
+                })),
+            ),
+        }
+    }
+
+    async fn start_mock_prioritize_bitcoind(
+        transaction_in_mempool: bool,
+    ) -> (BitcoindRpc, UnboundedReceiver<Value>, JoinHandle<()>) {
+        let expected_txid = transaction_from_hex(RAW_TX)
+            .expect("valid test transaction")
+            .compute_txid();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server local addr");
+        let (requests, received_requests) = unbounded_channel();
+        let app = Router::new()
+            .route("/", post(mock_prioritize_bitcoind))
+            .with_state(MockPrioritizeState {
+                requests,
+                expected_txid: expected_txid.to_string(),
+                transaction_in_mempool,
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+        let rpc = BitcoindRpc::new(
+            format!("http://{addr}"),
+            "user".to_string(),
+            "password".to_string(),
+            100_000_000,
+        );
+
+        (rpc, received_requests, server)
+    }
 
     #[test]
     fn detects_bitcoind_not_in_mempool_error() {
@@ -461,90 +576,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_transaction_priority_prioritizes_when_tx_is_already_in_mempool() {
-        #[derive(Clone)]
-        struct MockBitcoindState {
-            requests: UnboundedSender<Value>,
-        }
-
-        async fn mock_bitcoind(
-            State(state): State<MockBitcoindState>,
-            Json(body): Json<Value>,
-        ) -> (StatusCode, Json<Value>) {
-            let method = body
-                .get("method")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            state
-                .requests
-                .send(body)
-                .expect("test should receive bitcoind request");
-
-            match method.as_deref() {
-                Some("sendrawtransaction") => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "result": null,
-                        "error": {
-                            "code": -27,
-                            "message": "txn-already-in-mempool"
-                        },
-                        "id": "dmnd-client"
-                    })),
-                ),
-                Some("getprioritisedtransactions") => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "result": {},
-                        "error": null,
-                        "id": "dmnd-client"
-                    })),
-                ),
-                Some("prioritisetransaction") => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "result": true,
-                        "error": null,
-                        "id": "dmnd-client"
-                    })),
-                ),
-                _ => (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "result": null,
-                        "error": {
-                            "code": -32601,
-                            "message": "unknown method"
-                        },
-                        "id": "dmnd-client"
-                    })),
-                ),
-            }
-        }
-
+    async fn prioritizing_does_not_submit_a_transaction_already_in_mempool() {
         let expected_txid = transaction_from_hex(RAW_TX)
             .expect("valid test transaction")
             .compute_txid();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("test server should bind");
-        let addr = listener.local_addr().expect("test server local addr");
-        let (requests, mut received_requests) = unbounded_channel();
-        let app = Router::new()
-            .route("/", post(mock_bitcoind))
-            .with_state(MockBitcoindState { requests });
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("test server should run");
-        });
-
-        let rpc = BitcoindRpc::new(
-            format!("http://{addr}"),
-            "user".to_string(),
-            "password".to_string(),
-            100_000_000,
-        );
+        let (rpc, mut received_requests, server) = start_mock_prioritize_bitcoind(true).await;
 
         let txid = rpc
             .update_transaction_priority(RAW_TX, true)
@@ -552,12 +588,6 @@ mod tests {
             .expect("already-in-mempool tx should still be prioritized");
 
         assert_eq!(txid, expected_txid.to_string());
-
-        let submit_request = received_requests
-            .recv()
-            .await
-            .expect("sendrawtransaction request");
-        assert_eq!(submit_request["method"], "sendrawtransaction");
 
         let priorities_request = received_requests
             .recv()
@@ -573,6 +603,52 @@ mod tests {
         assert_eq!(
             prioritize_request["params"],
             json!([expected_txid, 0, 100_000_000])
+        );
+
+        let mempool_request = received_requests
+            .recv()
+            .await
+            .expect("getmempoolentry request");
+        assert_eq!(mempool_request["method"], "getmempoolentry");
+        assert_eq!(mempool_request["params"], json!([expected_txid]));
+        assert!(
+            received_requests.try_recv().is_err(),
+            "an already-present transaction must not be submitted again"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prioritizing_submits_a_missing_transaction_after_applying_the_delta() {
+        let expected_txid = transaction_from_hex(RAW_TX)
+            .expect("valid test transaction")
+            .compute_txid();
+        let (rpc, mut received_requests, server) = start_mock_prioritize_bitcoind(false).await;
+
+        let txid = rpc
+            .update_transaction_priority(RAW_TX, true)
+            .await
+            .expect("missing transaction should be prioritized before it is submitted");
+
+        assert_eq!(txid, expected_txid.to_string());
+
+        let expected_methods = [
+            "getprioritisedtransactions",
+            "prioritisetransaction",
+            "getmempoolentry",
+            "sendrawtransaction",
+        ];
+        for expected_method in expected_methods {
+            let request = received_requests
+                .recv()
+                .await
+                .expect("expected bitcoind request");
+            assert_eq!(request["method"], expected_method);
+        }
+        assert!(
+            received_requests.try_recv().is_err(),
+            "prioritizing a missing transaction should issue exactly four requests"
         );
 
         server.abort();
