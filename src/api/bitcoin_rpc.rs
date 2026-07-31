@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{error::Error as StdError, fmt, time::Duration};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -32,7 +32,7 @@ impl BitcoindRpc {
         &self,
         tx: &str,
         prioritize: bool,
-    ) -> Result<String, BitcoindRpcError> {
+    ) -> Result<String, PriorityUpdateError> {
         // Serialize state reads and mutations so concurrent API calls cannot move a transaction
         // outside the two supported states.
         let _transition_guard = self.priority_transition_lock.lock().await;
@@ -45,7 +45,17 @@ impl BitcoindRpc {
         let next_delta = current_delta + delta_to_apply;
 
         if delta_to_apply != 0 {
-            self.prioritise_transaction(&txid, delta_to_apply).await?;
+            self.apply_priority_delta(
+                &transaction,
+                current_delta,
+                delta_to_apply,
+                if prioritize {
+                    PriorityUpdateOperation::Prioritize
+                } else {
+                    PriorityUpdateOperation::Deprioritize
+                },
+            )
+            .await?;
         } else {
             info!(
                 txid = %txid,
@@ -57,22 +67,87 @@ impl BitcoindRpc {
         // Bitcoin Core remembers a priority delta even when the transaction is not in its
         // mempool. Apply the delta first so a low-fee transaction is evaluated with its
         // modified fee when submitted. Deprioritizing never submits the transaction.
-        if prioritize && !self.transaction_in_mempool(&txid.to_string()).await? {
-            let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
-            let submitted_txid =
-                txid_from_sendrawtransaction_response(&transaction, status, &text)?;
-            if submitted_txid != txid {
-                return Err(BitcoindRpcError::InvalidResponse(format!(
-                    "bitcoind returned txid {submitted_txid}, but transaction hex decodes to {txid}"
-                )));
+        if prioritize {
+            let transaction_in_mempool = match self.transaction_in_mempool(&txid.to_string()).await
+            {
+                Ok(in_mempool) => in_mempool,
+                Err(source) => {
+                    return Err(self
+                        .fail_after_priority_applied(
+                            &transaction,
+                            current_delta,
+                            delta_to_apply,
+                            PriorityUpdateOperation::CheckMempool,
+                            source,
+                        )
+                        .await);
+                }
+            };
+
+            if !transaction_in_mempool {
+                let submission_result = async {
+                    let (status, text) =
+                        self.send_request("sendrawtransaction", json!([tx])).await?;
+                    let submitted_txid =
+                        txid_from_sendrawtransaction_response(&transaction, status, &text)?;
+                    if submitted_txid != txid {
+                        return Err(BitcoindRpcError::InvalidResponse(format!(
+                            "bitcoind returned txid {submitted_txid}, but transaction hex decodes to {txid}"
+                        )));
+                    }
+                    Ok(())
+                }
+                .await;
+
+                if let Err(source) = submission_result {
+                    if source.may_have_applied_mutation() {
+                        match self.transaction_in_mempool(&txid.to_string()).await {
+                            Ok(true) => {
+                                warn!(
+                                    txid = %txid,
+                                    error = %source,
+                                    "sendrawtransaction returned an ambiguous error, but reconciliation found the transaction in the mempool"
+                                );
+                            }
+                            Ok(false) => {
+                                return Err(self
+                                    .fail_after_priority_applied(
+                                        &transaction,
+                                        current_delta,
+                                        delta_to_apply,
+                                        PriorityUpdateOperation::Submit,
+                                        source,
+                                    )
+                                    .await);
+                            }
+                            Err(reconciliation_error) => {
+                                return Err(self
+                                    .indeterminate_submission_error(
+                                        &transaction,
+                                        current_delta,
+                                        delta_to_apply,
+                                        source,
+                                        reconciliation_error,
+                                    )
+                                    .await);
+                            }
+                        }
+                    } else {
+                        return Err(self
+                            .fail_after_priority_applied(
+                                &transaction,
+                                current_delta,
+                                delta_to_apply,
+                                PriorityUpdateOperation::Submit,
+                                source,
+                            )
+                            .await);
+                    }
+                }
             }
         }
 
-        if next_delta == self.fee_delta {
-            crate::prioritized_transactions::record(transaction);
-        } else {
-            crate::prioritized_transactions::remove(&txid);
-        }
+        self.sync_transaction_tracking(&transaction, next_delta);
 
         info!(
             txid = %txid,
@@ -83,6 +158,205 @@ impl BitcoindRpc {
             "transaction priority state updated"
         );
         Ok(txid.to_string())
+    }
+
+    async fn apply_priority_delta(
+        &self,
+        transaction: &Transaction,
+        current_delta: i64,
+        delta_to_apply: i64,
+        operation: PriorityUpdateOperation,
+    ) -> Result<(), PriorityUpdateError> {
+        let txid = transaction.compute_txid();
+        let target_delta = current_delta + delta_to_apply;
+        let Err(source) = self.prioritise_transaction(&txid, delta_to_apply).await else {
+            return Ok(());
+        };
+
+        if !source.may_have_applied_mutation() {
+            return Err(PriorityUpdateError::MutationFailed {
+                operation,
+                source,
+                observed_delta: Some(current_delta),
+            });
+        }
+
+        match self.current_fee_delta(&txid).await {
+            Ok(observed_delta) if observed_delta == target_delta => {
+                warn!(
+                    txid = %txid,
+                    %operation,
+                    error = %source,
+                    observed_delta,
+                    "priority mutation returned an ambiguous error, but reconciliation confirmed it succeeded"
+                );
+                self.sync_transaction_tracking(transaction, observed_delta);
+                Ok(())
+            }
+            Ok(observed_delta) if observed_delta == current_delta => {
+                self.sync_transaction_tracking(transaction, observed_delta);
+                Err(PriorityUpdateError::MutationFailed {
+                    operation,
+                    source,
+                    observed_delta: Some(observed_delta),
+                })
+            }
+            Ok(observed_delta) => {
+                self.sync_transaction_tracking(transaction, observed_delta);
+                Err(PriorityUpdateError::StateIndeterminate {
+                    operation,
+                    source,
+                    details: format!(
+                        "reconciliation observed unsupported fee delta {observed_delta}; expected {current_delta} or {target_delta}"
+                    ),
+                })
+            }
+            Err(reconciliation_error) => Err(PriorityUpdateError::StateIndeterminate {
+                operation,
+                source,
+                details: format!(
+                    "could not reconcile the fee delta after the ambiguous error: {reconciliation_error}"
+                ),
+            }),
+        }
+    }
+
+    async fn fail_after_priority_applied(
+        &self,
+        transaction: &Transaction,
+        original_delta: i64,
+        applied_delta: i64,
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+    ) -> PriorityUpdateError {
+        if applied_delta == 0 {
+            return PriorityUpdateError::OperationFailed { operation, source };
+        }
+
+        match self
+            .rollback_priority_delta(transaction, original_delta, applied_delta)
+            .await
+        {
+            RollbackOutcome::Restored => PriorityUpdateError::OperationRolledBack {
+                operation,
+                source,
+            },
+            RollbackOutcome::Failed {
+                rollback_error,
+                observed_delta,
+            } => PriorityUpdateError::RollbackFailed {
+                operation,
+                source,
+                rollback_error,
+                observed_delta,
+            },
+            RollbackOutcome::Indeterminate {
+                rollback_error,
+                reconciliation_error,
+            } => PriorityUpdateError::StateIndeterminate {
+                operation,
+                source,
+                details: format!(
+                    "rollback also failed ambiguously ({rollback_error}), and its result could not be reconciled: {reconciliation_error}"
+                ),
+            },
+        }
+    }
+
+    async fn indeterminate_submission_error(
+        &self,
+        transaction: &Transaction,
+        original_delta: i64,
+        applied_delta: i64,
+        source: BitcoindRpcError,
+        reconciliation_error: BitcoindRpcError,
+    ) -> PriorityUpdateError {
+        let rollback_details = if applied_delta == 0 {
+            "no new priority delta was applied, so no rollback was required".to_string()
+        } else {
+            match self
+                .rollback_priority_delta(transaction, original_delta, applied_delta)
+                .await
+            {
+                RollbackOutcome::Restored => {
+                    "the newly applied priority delta was rolled back".to_string()
+                }
+                RollbackOutcome::Failed {
+                    rollback_error,
+                    observed_delta,
+                } => format!(
+                    "priority rollback failed ({rollback_error}); reconciliation observed fee delta {observed_delta}"
+                ),
+                RollbackOutcome::Indeterminate {
+                    rollback_error,
+                    reconciliation_error,
+                } => format!(
+                    "priority rollback failed ambiguously ({rollback_error}) and could not be reconciled ({reconciliation_error})"
+                ),
+            }
+        };
+
+        PriorityUpdateError::StateIndeterminate {
+            operation: PriorityUpdateOperation::Submit,
+            source,
+            details: format!(
+                "could not determine whether the transaction reached the mempool ({reconciliation_error}); {rollback_details}"
+            ),
+        }
+    }
+
+    async fn rollback_priority_delta(
+        &self,
+        transaction: &Transaction,
+        original_delta: i64,
+        applied_delta: i64,
+    ) -> RollbackOutcome {
+        let txid = transaction.compute_txid();
+        match self.prioritise_transaction(&txid, -applied_delta).await {
+            Ok(()) => {
+                self.sync_transaction_tracking(transaction, original_delta);
+                RollbackOutcome::Restored
+            }
+            Err(rollback_error) => {
+                error!(
+                    txid = %txid,
+                    error = %rollback_error,
+                    "failed to roll back newly applied transaction priority delta"
+                );
+                match self.current_fee_delta(&txid).await {
+                    Ok(observed_delta) if observed_delta == original_delta => {
+                        warn!(
+                            txid = %txid,
+                            error = %rollback_error,
+                            observed_delta,
+                            "priority rollback returned an error, but reconciliation confirmed the original delta was restored"
+                        );
+                        self.sync_transaction_tracking(transaction, observed_delta);
+                        RollbackOutcome::Restored
+                    }
+                    Ok(observed_delta) => {
+                        self.sync_transaction_tracking(transaction, observed_delta);
+                        RollbackOutcome::Failed {
+                            rollback_error,
+                            observed_delta,
+                        }
+                    }
+                    Err(reconciliation_error) => RollbackOutcome::Indeterminate {
+                        rollback_error,
+                        reconciliation_error,
+                    },
+                }
+            }
+        }
+    }
+
+    fn sync_transaction_tracking(&self, transaction: &Transaction, observed_delta: i64) {
+        let txid = transaction.compute_txid();
+        if observed_delta == self.fee_delta {
+            crate::prioritized_transactions::record(transaction.clone());
+        } else if observed_delta == 0 {
+            crate::prioritized_transactions::remove(&txid);
+        }
     }
 
     /// Calculates the adjustment needed to move between the only two supported states:
@@ -157,10 +431,19 @@ impl BitcoindRpc {
             "bitcoind prioritisetransaction response"
         );
 
-        let result = RpcResponse::from_response(status, &text)
-            .map_err(|e| BitcoindRpcError::Prioritize(e.to_string()))?;
+        let response = RpcResponse::decode(status, &text)?;
+        if let Some(error) = response.error {
+            return Err(BitcoindRpcError::Prioritize(format!(
+                "bitcoind RPC error while updating transaction priority: {error}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(BitcoindRpcError::Other(format!(
+                "bitcoind HTTP {status}: {text}"
+            )));
+        }
 
-        match result.and_then(|value| value.as_bool()) {
+        match response.result.and_then(|value| value.as_bool()) {
             Some(true) => Ok(()),
             Some(false) => Err(BitcoindRpcError::Prioritize(format!(
                 "bitcoind returned false for prioritisetransaction: {text}"
@@ -406,6 +689,10 @@ mod tests {
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use serde_json::json;
     use serde_json::Value;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
+    };
     use tokio::{
         sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
         task::JoinHandle,
@@ -535,6 +822,210 @@ mod tests {
         (rpc, received_requests, server)
     }
 
+    #[derive(Clone, Copy)]
+    enum SubmissionBehavior {
+        Rejected,
+        AmbiguousApplied,
+        AmbiguousNotApplied,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FailurePathConfig {
+        transaction_in_mempool: bool,
+        mempool_check_fails: bool,
+        submission_behavior: SubmissionBehavior,
+        ambiguous_prioritize_response: bool,
+        rollback_fails: bool,
+    }
+
+    #[derive(Clone)]
+    struct FailurePathState {
+        requests: UnboundedSender<Value>,
+        expected_txid: String,
+        fee_delta: Arc<AtomicI64>,
+        transaction_in_mempool: Arc<AtomicBool>,
+        config: FailurePathConfig,
+    }
+
+    fn mock_rpc_response(result: Value, error: Value) -> String {
+        json!({
+            "result": result,
+            "error": error,
+            "id": "dmnd-client"
+        })
+        .to_string()
+    }
+
+    async fn mock_failure_path_bitcoind(
+        State(state): State<FailurePathState>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, String) {
+        let method = body
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        state
+            .requests
+            .send(body.clone())
+            .expect("test should receive bitcoind request");
+
+        match method.as_deref() {
+            Some("getprioritisedtransactions") => {
+                let fee_delta = state.fee_delta.load(Ordering::SeqCst);
+                let mut priorities = serde_json::Map::new();
+                if fee_delta != 0 {
+                    priorities.insert(
+                        state.expected_txid.clone(),
+                        json!({ "fee_delta": fee_delta }),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    mock_rpc_response(Value::Object(priorities), Value::Null),
+                )
+            }
+            Some("prioritisetransaction") => {
+                let delta = body
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .and_then(|params| params.get(2))
+                    .and_then(Value::as_i64)
+                    .expect("prioritisetransaction fee delta");
+
+                if delta < 0 && state.config.rollback_fails {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        mock_rpc_response(
+                            Value::Null,
+                            json!({
+                                "code": -1,
+                                "message": "rollback rejected"
+                            }),
+                        ),
+                    );
+                }
+
+                state.fee_delta.fetch_add(delta, Ordering::SeqCst);
+                if delta > 0 && state.config.ambiguous_prioritize_response {
+                    (StatusCode::OK, "{".to_string())
+                } else {
+                    (
+                        StatusCode::OK,
+                        mock_rpc_response(Value::Bool(true), Value::Null),
+                    )
+                }
+            }
+            Some("getmempoolentry") if state.config.mempool_check_fails => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                mock_rpc_response(
+                    Value::Null,
+                    json!({
+                        "code": -1,
+                        "message": "mempool query failed"
+                    }),
+                ),
+            ),
+            Some("getmempoolentry") if state.transaction_in_mempool.load(Ordering::SeqCst) => {
+                (StatusCode::OK, mock_rpc_response(json!({}), Value::Null))
+            }
+            Some("getmempoolentry") => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                mock_rpc_response(
+                    Value::Null,
+                    json!({
+                        "code": -5,
+                        "message": "Transaction not in mempool"
+                    }),
+                ),
+            ),
+            Some("sendrawtransaction") => match state.config.submission_behavior {
+                SubmissionBehavior::Rejected => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    mock_rpc_response(
+                        Value::Null,
+                        json!({
+                            "code": -26,
+                            "message": "mandatory-script-verify-flag-failed"
+                        }),
+                    ),
+                ),
+                SubmissionBehavior::AmbiguousApplied => {
+                    state.transaction_in_mempool.store(true, Ordering::SeqCst);
+                    (StatusCode::OK, "{".to_string())
+                }
+                SubmissionBehavior::AmbiguousNotApplied => (StatusCode::OK, "{".to_string()),
+            },
+            _ => (
+                StatusCode::BAD_REQUEST,
+                mock_rpc_response(
+                    Value::Null,
+                    json!({
+                        "code": -32601,
+                        "message": "unknown method"
+                    }),
+                ),
+            ),
+        }
+    }
+
+    async fn start_failure_path_bitcoind(
+        config: FailurePathConfig,
+    ) -> (
+        BitcoindRpc,
+        UnboundedReceiver<Value>,
+        FailurePathState,
+        JoinHandle<()>,
+    ) {
+        let expected_txid = transaction_from_hex(RAW_TX)
+            .expect("valid test transaction")
+            .compute_txid();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server local addr");
+        let (requests, received_requests) = unbounded_channel();
+        let state = FailurePathState {
+            requests,
+            expected_txid: expected_txid.to_string(),
+            fee_delta: Arc::new(AtomicI64::new(0)),
+            transaction_in_mempool: Arc::new(AtomicBool::new(config.transaction_in_mempool)),
+            config,
+        };
+        let app = Router::new()
+            .route("/", post(mock_failure_path_bitcoind))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+        let rpc = BitcoindRpc::new(
+            format!("http://{addr}"),
+            "user".to_string(),
+            "password".to_string(),
+            100_000_000,
+        );
+
+        (rpc, received_requests, state, server)
+    }
+
+    async fn assert_request_methods(
+        received_requests: &mut UnboundedReceiver<Value>,
+        expected_methods: &[&str],
+    ) {
+        for expected_method in expected_methods {
+            let request = received_requests
+                .recv()
+                .await
+                .expect("expected bitcoind request");
+            assert_eq!(request["method"], *expected_method);
+        }
+        assert!(
+            received_requests.try_recv().is_err(),
+            "mock received an unexpected extra RPC request"
+        );
+    }
+
     #[test]
     fn detects_bitcoind_not_in_mempool_error() {
         let error = json!({
@@ -650,6 +1141,270 @@ mod tests {
             received_requests.try_recv().is_err(),
             "prioritizing a missing transaction should issue exactly four requests"
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn definitive_submission_rejection_rolls_back_the_new_delta() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: false,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::Rejected,
+                ambiguous_prioritize_response: false,
+                rollback_fails: false,
+            })
+            .await;
+
+        let error = rpc
+            .update_transaction_priority(RAW_TX, true)
+            .await
+            .expect_err("rejected transaction submission should fail");
+
+        assert!(matches!(
+            error,
+            super::PriorityUpdateError::OperationRolledBack {
+                operation: super::PriorityUpdateOperation::Submit,
+                ..
+            }
+        ));
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 0);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getmempoolentry",
+                "sendrawtransaction",
+                "prioritisetransaction",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mempool_check_failure_rolls_back_the_new_delta() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: false,
+                mempool_check_fails: true,
+                submission_behavior: SubmissionBehavior::Rejected,
+                ambiguous_prioritize_response: false,
+                rollback_fails: false,
+            })
+            .await;
+
+        let error = rpc
+            .update_transaction_priority(RAW_TX, true)
+            .await
+            .expect_err("mempool query failure should fail the update");
+
+        assert!(matches!(
+            error,
+            super::PriorityUpdateError::OperationRolledBack {
+                operation: super::PriorityUpdateOperation::CheckMempool,
+                ..
+            }
+        ));
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 0);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getmempoolentry",
+                "prioritisetransaction",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_submission_error_is_success_when_reconciliation_finds_the_transaction() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: false,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::AmbiguousApplied,
+                ambiguous_prioritize_response: false,
+                rollback_fails: false,
+            })
+            .await;
+
+        rpc.update_transaction_priority(RAW_TX, true)
+            .await
+            .expect("mempool reconciliation should confirm submission");
+
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 100_000_000);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getmempoolentry",
+                "sendrawtransaction",
+                "getmempoolentry",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_submission_error_rolls_back_when_reconciliation_finds_no_transaction() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: false,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::AmbiguousNotApplied,
+                ambiguous_prioritize_response: false,
+                rollback_fails: false,
+            })
+            .await;
+
+        let error = rpc
+            .update_transaction_priority(RAW_TX, true)
+            .await
+            .expect_err("unconfirmed transaction submission should fail");
+
+        assert!(matches!(
+            error,
+            super::PriorityUpdateError::OperationRolledBack {
+                operation: super::PriorityUpdateOperation::Submit,
+                ..
+            }
+        ));
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 0);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getmempoolentry",
+                "sendrawtransaction",
+                "getmempoolentry",
+                "prioritisetransaction",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_prioritization_error_is_reconciled_before_submission() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: true,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::Rejected,
+                ambiguous_prioritize_response: true,
+                rollback_fails: false,
+            })
+            .await;
+
+        rpc.update_transaction_priority(RAW_TX, true)
+            .await
+            .expect("fee delta reconciliation should confirm prioritization");
+
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 100_000_000);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getprioritisedtransactions",
+                "getmempoolentry",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_reports_the_retained_delta() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: false,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::Rejected,
+                ambiguous_prioritize_response: false,
+                rollback_fails: true,
+            })
+            .await;
+
+        let error = rpc
+            .update_transaction_priority(RAW_TX, true)
+            .await
+            .expect_err("submission and rollback failures should be reported");
+        let error_message = error.to_string();
+
+        assert!(matches!(
+            error,
+            super::PriorityUpdateError::RollbackFailed {
+                operation: super::PriorityUpdateOperation::Submit,
+                observed_delta: 100_000_000,
+                ..
+            }
+        ));
+        assert!(error_message.contains("priority rollback failed"));
+        assert!(error_message.contains("fee delta 100000000"));
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 100_000_000);
+        assert_request_methods(
+            &mut received_requests,
+            &[
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "getmempoolentry",
+                "sendrawtransaction",
+                "prioritisetransaction",
+                "getprioritisedtransactions",
+            ],
+        )
+        .await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_deprioritization_returns_an_error_and_keeps_the_observed_delta() {
+        let (rpc, mut received_requests, state, server) =
+            start_failure_path_bitcoind(FailurePathConfig {
+                transaction_in_mempool: true,
+                mempool_check_fails: false,
+                submission_behavior: SubmissionBehavior::Rejected,
+                ambiguous_prioritize_response: false,
+                rollback_fails: true,
+            })
+            .await;
+        state.fee_delta.store(100_000_000, Ordering::SeqCst);
+
+        let error = rpc
+            .update_transaction_priority(RAW_TX, false)
+            .await
+            .expect_err("rejected deprioritization should fail");
+
+        assert!(matches!(
+            error,
+            super::PriorityUpdateError::MutationFailed {
+                operation: super::PriorityUpdateOperation::Deprioritize,
+                observed_delta: Some(100_000_000),
+                ..
+            }
+        ));
+        assert_eq!(state.fee_delta.load(Ordering::SeqCst), 100_000_000);
+        assert_request_methods(
+            &mut received_requests,
+            &["getprioritisedtransactions", "prioritisetransaction"],
+        )
+        .await;
 
         server.abort();
     }
@@ -816,6 +1571,15 @@ impl BitcoindRpcError {
             | BitcoindRpcError::Prioritize(_) => StatusCode::BAD_GATEWAY,
         }
     }
+
+    fn may_have_applied_mutation(&self) -> bool {
+        matches!(
+            self,
+            BitcoindRpcError::Timeout(_)
+                | BitcoindRpcError::Other(_)
+                | BitcoindRpcError::InvalidResponse(_)
+        )
+    }
 }
 
 impl From<reqwest::Error> for BitcoindRpcError {
@@ -849,4 +1613,130 @@ impl fmt::Display for BitcoindRpcError {
             | BitcoindRpcError::Prioritize(msg) => f.write_str(msg),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PriorityUpdateOperation {
+    Prioritize,
+    Deprioritize,
+    CheckMempool,
+    Submit,
+}
+
+impl fmt::Display for PriorityUpdateOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PriorityUpdateOperation::Prioritize => "prioritisetransaction",
+            PriorityUpdateOperation::Deprioritize => "deprioritizing transaction",
+            PriorityUpdateOperation::CheckMempool => "getmempoolentry",
+            PriorityUpdateOperation::Submit => "sendrawtransaction",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PriorityUpdateError {
+    Rpc(BitcoindRpcError),
+    MutationFailed {
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+        observed_delta: Option<i64>,
+    },
+    OperationFailed {
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+    },
+    OperationRolledBack {
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+    },
+    RollbackFailed {
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+        rollback_error: BitcoindRpcError,
+        observed_delta: i64,
+    },
+    StateIndeterminate {
+        operation: PriorityUpdateOperation,
+        source: BitcoindRpcError,
+        details: String,
+    },
+}
+
+impl PriorityUpdateError {
+    pub(crate) fn status_code(&self) -> StatusCode {
+        match self {
+            PriorityUpdateError::Rpc(source)
+            | PriorityUpdateError::MutationFailed { source, .. }
+            | PriorityUpdateError::OperationFailed { source, .. }
+            | PriorityUpdateError::OperationRolledBack { source, .. } => source.status_code(),
+            PriorityUpdateError::RollbackFailed { .. }
+            | PriorityUpdateError::StateIndeterminate { .. } => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
+impl From<BitcoindRpcError> for PriorityUpdateError {
+    fn from(error: BitcoindRpcError) -> Self {
+        PriorityUpdateError::Rpc(error)
+    }
+}
+
+impl fmt::Display for PriorityUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PriorityUpdateError::Rpc(source) => source.fmt(f),
+            PriorityUpdateError::MutationFailed {
+                operation,
+                source,
+                observed_delta,
+            } => {
+                write!(f, "{operation} failed: {source}")?;
+                if let Some(observed_delta) = observed_delta {
+                    write!(
+                        f,
+                        "; reconciliation observed fee delta {observed_delta}"
+                    )?;
+                }
+                Ok(())
+            }
+            PriorityUpdateError::OperationFailed { operation, source } => {
+                write!(f, "{operation} failed: {source}")
+            }
+            PriorityUpdateError::OperationRolledBack { operation, source } => write!(
+                f,
+                "{operation} failed: {source}; the newly applied priority delta was rolled back"
+            ),
+            PriorityUpdateError::RollbackFailed {
+                operation,
+                source,
+                rollback_error,
+                observed_delta,
+            } => write!(
+                f,
+                "{operation} failed: {source}; priority rollback failed: {rollback_error}; reconciliation observed fee delta {observed_delta}"
+            ),
+            PriorityUpdateError::StateIndeterminate {
+                operation,
+                source,
+                details,
+            } => write!(
+                f,
+                "{operation} failed ambiguously: {source}; final state is indeterminate: {details}"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RollbackOutcome {
+    Restored,
+    Failed {
+        rollback_error: BitcoindRpcError,
+        observed_delta: i64,
+    },
+    Indeterminate {
+        rollback_error: BitcoindRpcError,
+        reconciliation_error: BitcoindRpcError,
+    },
 }
