@@ -6,7 +6,7 @@ use stratum_apps as _;
 #[cfg(all(not(target_os = "windows"), feature = "jemalloc"))]
 use jemallocator::Jemalloc;
 use router::Router;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 #[cfg(all(not(target_os = "windows"), feature = "jemalloc"))]
 #[global_allocator]
@@ -276,7 +276,7 @@ async fn initialize_proxy(
             }
         };
         let (tx_list_sender, tx_list_receiver) = channel::<TxListWithResponse>(10);
-        let (jd_event_broadcaster, _) = broadcast::channel(100);
+        let (jd_event_broadcaster, _) = watch::channel(None);
 
         if let Some(_tp_addr) = tp {
             jdc_abortable = jd_client::start(

@@ -275,24 +275,9 @@ impl JobDeclarator {
                 .as_secs(),
         );
 
-        // Send the template notification to all subscribed WebSocket clients.
-        // If no receivers are currently subscribed (via ws_event_handler), this will return an error — which is expected.
-        // Try to send the template notification, retrying if there are no receivers available.
-        let mut sent = false;
-        let start = std::time::Instant::now();
-        while !sent && start.elapsed().as_secs_f32() < 5.0 {
-            if jd_event_broadcaster
-                .send(template_notification.clone())
-                .is_ok()
-            {
-                sent = true;
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-        if !sent {
-            error!("Failed to send template notification after multiple attempts, no receivers available");
-        }
+        // Retain the latest notification so a dashboard that connects after the
+        // template arrives can still receive it.
+        jd_event_broadcaster.send_replace(Some(template_notification));
 
         let transaction_timeout = Configuration::custom_job_timeout();
         let timeout_start = std::time::Instant::now();
@@ -318,9 +303,7 @@ impl JobDeclarator {
                             .unwrap_or_default()
                             .as_secs(),
                     );
-                    if let Err(e) = jd_event_broadcaster.send(tx_list_received_notification) {
-                        error!("Failed to send tx list received notification: {}", e);
-                    }
+                    jd_event_broadcaster.send_replace(Some(tx_list_received_notification));
                     break (tx_list, response_sender);
                 }
                 Ok(Err(_)) => {
@@ -337,9 +320,7 @@ impl JobDeclarator {
                                     .unwrap_or_default()
                                     .as_secs(),
                             );
-                            if let Err(e) = jd_event_broadcaster.send(no_list_notification) {
-                                error!("Failed to send no tx list provided notification: {}", e);
-                            }
+                            jd_event_broadcaster.send_replace(Some(no_list_notification));
                             break (fallback_tx_list, None);
                         } else {
                             error!("Transaction timeout reached and no template provider transaction list available");

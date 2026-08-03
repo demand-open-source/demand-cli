@@ -648,6 +648,11 @@ async fn health_check_reports_full_translator_handoff() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
+        rpc: None,
+        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
+        tx_list_sender: tokio::sync::mpsc::channel(1).0,
+        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
+        db: None,
     };
 
     let response = Api::health_check(State(state)).await.into_response();
@@ -670,6 +675,11 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: None,
+        rpc: None,
+        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
+        tx_list_sender: tokio::sync::mpsc::channel(1).0,
+        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
+        db: None,
     };
 
     let response = Api::prioritize_transaction(
@@ -705,6 +715,11 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
+        rpc: None,
+        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
+        tx_list_sender: tokio::sync::mpsc::channel(1).0,
+        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
+        db: None,
     };
 
     let response = Api::prioritize_transaction(
@@ -1053,6 +1068,11 @@ async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
+        rpc: None,
+        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
+        tx_list_sender: tokio::sync::mpsc::channel(1).0,
+        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
+        db: None,
     };
 
     let mut headers = HeaderMap::new();

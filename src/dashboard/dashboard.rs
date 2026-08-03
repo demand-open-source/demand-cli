@@ -7,40 +7,38 @@ use mime_guess;
 
 use crate::dashboard::assets::Asset;
 
+const SPA_INDEX: &str = "index.html";
+
+fn resolve_asset_path(request_path: Option<&str>) -> String {
+    let path = request_path.unwrap_or_default().trim_matches('/');
+
+    match path {
+        "app.css" | "app.js" => path.to_string(),
+        "index.html"
+        | "overview.html"
+        | "history.html"
+        | "settings.html"
+        | "dashboard/overview.html"
+        | "dashboard/job-history.html"
+        | "dashboard/settings.html" => SPA_INDEX.to_string(),
+        path if path.contains('.') => path.to_string(),
+        _ => SPA_INDEX.to_string(),
+    }
+}
+
 /// Handles requests for static dashboard assets and routes.
 ///
-/// This function serves static files for the dashboard, handling special cases for dashboard routes and paths.
-/// - Requests for `/`, `/dashboard/`, or an empty path will serve `index.html`.
-/// - Requests for `/overview` or `/history` will serve `dashboard/overview.html` and `dashboard/history.html` respectively.
-/// - Requests for any path starting with `dashboard/` and not ending with `.html` will have `.html` appended.
-/// - If the requested asset is not found, it will serve `404.html` if available, otherwise a plain 404 response.
+/// The dashboard is a small single-page application. Its two static assets are
+/// served directly, while extensionless browser routes receive `index.html`
+/// and are resolved client-side.
 ///
 /// # Arguments
 /// * `path` - Optional path parameter specifying the requested asset or route.
 ///
 /// # Returns
-/// An HTTP response containing the asset data, a fallback `404.html`, or a plain 404 error.
+/// An HTTP response containing the asset data or a plain 404 error.
 pub async fn static_handler(path: Option<Path<String>>) -> impl IntoResponse {
-    let path = match path {
-        Some(Path(p)) => {
-            let p = p.trim_matches('/');
-            if p.is_empty() || p == "dashboard" {
-                "index.html".to_string()
-            } else {
-                p.to_string()
-            }
-        }
-        None => "index.html".to_string(),
-    };
-
-    // Handle dashboard routes specially
-    let asset_path = match path.as_str() {
-        "overview" => "dashboard/overview.html".to_string(),
-        "history" => "dashboard/history.html".to_string(),
-        "settings" => "dashboard/settings.html".to_string(),
-        p if p.starts_with("dashboard/") && !p.ends_with(".html") => format!("{}.html", p),
-        _ => path.clone(),
-    };
+    let asset_path = resolve_asset_path(path.as_ref().map(|Path(path)| path.as_str()));
 
     match Asset::get(&asset_path) {
         Some(content) => {
@@ -49,19 +47,49 @@ pub async fn static_handler(path: Option<Path<String>>) -> impl IntoResponse {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())
+                .header(header::CACHE_CONTROL, "no-cache")
                 .body(body.into())
                 .unwrap()
         }
-        None => match Asset::get("404.html") {
-            Some(content) => {
-                let body = content.data.into_owned();
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header(header::CONTENT_TYPE, "text/html")
-                    .body(body.into())
-                    .unwrap()
-            }
-            None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
-        },
+        None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_routes_resolve_to_the_spa() {
+        let overview = resolve_asset_path(Some("dashboard/overview"));
+        let history = resolve_asset_path(Some("dashboard/job-history"));
+        let settings = resolve_asset_path(Some("dashboard/settings"));
+
+        assert_eq!(overview, SPA_INDEX);
+        assert_eq!(history, SPA_INDEX);
+        assert_eq!(settings, SPA_INDEX);
+        assert_eq!(
+            resolve_asset_path(Some("dashboard/overview.html")),
+            SPA_INDEX
+        );
+        assert!(Asset::get(&overview).is_some());
+    }
+
+    #[test]
+    fn resolves_the_only_frontend_assets() {
+        let javascript = resolve_asset_path(Some("app.js"));
+        let stylesheet = resolve_asset_path(Some("app.css"));
+
+        assert_eq!(javascript, "app.js");
+        assert_eq!(stylesheet, "app.css");
+        assert!(Asset::get(&javascript).is_some());
+        assert!(Asset::get(&stylesheet).is_some());
+    }
+
+    #[test]
+    fn missing_files_remain_missing() {
+        let missing = resolve_asset_path(Some("missing.png"));
+
+        assert!(Asset::get(&missing).is_none());
     }
 }

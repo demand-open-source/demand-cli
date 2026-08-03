@@ -7,9 +7,9 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::Serialize;
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
-use tracing::{error, warn};
+use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
+use tracing::warn;
 
 use crate::api::AppState;
 
@@ -52,40 +52,34 @@ impl JobDeclarationData {
     }
 }
 
-pub type TemplateNotificationBroadcaster = broadcast::Sender<NewTemplateNotification>;
+pub type TemplateNotificationBroadcaster = watch::Sender<Option<NewTemplateNotification>>;
 
 /// Streams template event notifications to a WebSocket client as JSON messages.
 ///
-/// Listens for notifications from a broadcast channel and sends them to the connected WebSocket client.
-/// Serializes each notification to JSON and sends it as a text message. If sending fails or an error occurs,
+/// Listens for retained notifications and sends them to the connected WebSocket client.
+/// Serializes each notification to JSON and sends it as a text message. If sending fails,
 /// the loop breaks and the connection is closed.
 ///
 /// # Arguments
 /// * `socket` - The WebSocket connection to send messages to.
-/// * `subscriber` - The broadcast receiver for template notifications.
+/// * `subscriber` - The retained notification receiver.
 async fn stream_event_notifications(
     mut socket: WebSocket,
-    subscriber: broadcast::Receiver<NewTemplateNotification>,
+    subscriber: watch::Receiver<Option<NewTemplateNotification>>,
 ) {
-    let mut stream = BroadcastStream::new(subscriber);
+    let mut stream = WatchStream::new(subscriber);
 
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(notification) => {
-                if let Ok(json) = serde_json::to_string(&notification) {
-                    if socket
-                        .send(axum::extract::ws::Message::Text(json.into()))
-                        .await
-                        .is_err()
-                    {
-                        warn!("WebSocket closed while sending template notification");
-                        break;
-                    }
+    while let Some(notification) = stream.next().await {
+        if let Some(notification) = notification {
+            if let Ok(json) = serde_json::to_string(&notification) {
+                if socket
+                    .send(axum::extract::ws::Message::Text(json.into()))
+                    .await
+                    .is_err()
+                {
+                    warn!("WebSocket closed while sending template notification");
+                    break;
                 }
-            }
-            Err(e) => {
-                error!("Error receiving template notification: {}", e);
-                break;
             }
         }
     }

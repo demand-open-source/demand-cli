@@ -1093,6 +1093,7 @@ mod tests {
         Vec::<TxOut>::new()
             .consensus_encode(&mut encoded_outputs)
             .expect("encode coinbase outputs");
+        let (jd_event_broadcaster, _) = tokio::sync::watch::channel(None);
         let self_mutex = Arc::new(Mutex::new(TemplateRx {
             sender: client_to_tp_tx,
             jd: None,
@@ -1101,8 +1102,11 @@ mod tests {
             miner_coinbase_output: encoded_outputs,
             merge_mining_enabled: false,
             test_only_do_not_send_solution_to_tp: true,
+            jd_event_broadcaster,
         }));
-        let _abortable = TemplateRx::start_templates(self_mutex, tp_to_client_rx)
+        let (_tx_list_sender, tx_list_receiver) = mpsc::channel(1);
+        let tx_list_receiver = Arc::new(Mutex::new(tx_list_receiver));
+        let _abortable = TemplateRx::start_templates(self_mutex, tp_to_client_rx, tx_list_receiver)
             .await
             .expect("template receiver start");
 
