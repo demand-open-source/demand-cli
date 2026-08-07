@@ -83,6 +83,18 @@ struct Args {
     rpc_pwd: Option<String>,
     #[clap(long)]
     api_tx_token: Option<String>,
+    #[clap(long = "custom-job-timeout")]
+    custom_job_timeout: Option<u64>,
+    #[clap(long = "zmq-pub-sequence")]
+    zmq_pub_sequence: Option<String>,
+    #[clap(long = "rpc-allow-ip")]
+    rpc_allow_ip: Option<String>,
+    #[clap(long = "rpc-port")]
+    rpc_port: Option<u16>,
+    #[clap(long = "rpc-username")]
+    rpcusername: Option<String>,
+    #[clap(long = "rpc-password")]
+    rpcpassword: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -116,6 +128,12 @@ struct ConfigFile {
     rpc_user: Option<String>,
     rpc_pwd: Option<String>,
     api_tx_token: Option<String>,
+    custom_job_timeout: Option<u64>,
+    zmq_pub_sequence: Option<String>,
+    rpc_allow_ip: Option<String>,
+    rpc_port: Option<u16>,
+    rpcusername: Option<String>,
+    rpcpassword: Option<String>,
 }
 
 impl ConfigFile {
@@ -150,10 +168,15 @@ impl ConfigFile {
             rpc_user: None,
             rpc_pwd: None,
             api_tx_token: None,
+            custom_job_timeout: None,
+            zmq_pub_sequence: None,
+            rpc_allow_ip: None,
+            rpc_port: None,
+            rpcusername: None,
+            rpcpassword: None,
         }
     }
 }
-
 #[derive(Debug)]
 pub struct Configuration {
     token: Option<String>,
@@ -184,6 +207,12 @@ pub struct Configuration {
     miner_name: Option<String>,
     prioritizing_txs_config: Option<BitcoindRpcConfig>,
     missing_prioritizing_txs_variables: Vec<&'static str>,
+    custom_job_timeout: u64,
+    zmq_pub_sequence: String,
+    rpc_allow_ip: String,
+    rpc_port: u16,
+    rpcusername: String,
+    rpcpassword: String,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +275,12 @@ and make that test pass."
         rpc_user: String,
         rpc_pwd: String,
         api_tx_token: String,
+        custom_job_timeout: u64,
+        zmq_pub_sequence: String,
+        rpc_allow_ip: String,
+        rpc_port: u16,
+        rpcusername: String,
+        rpcpassword: String,
     ) -> Self {
         if let Err(error) = Self::validate_supported_delay(delay) {
             panic!("{error}");
@@ -283,6 +318,12 @@ and make that test pass."
             miner_name,
             prioritizing_txs_config,
             missing_prioritizing_txs_variables,
+            custom_job_timeout,
+            zmq_pub_sequence,
+            rpc_allow_ip,
+            rpc_port,
+            rpcusername,
+            rpcpassword,
         }
     }
 
@@ -360,6 +401,12 @@ and make that test pass."
             "user".to_string(),
             "password".to_string(),
             "api-token".to_string(),
+            30,
+            "tcp://127.0.0.1:28334".to_string(),
+            "127.0.0.1".to_string(),
+            8332,
+            "user".to_string(),
+            "password".to_string(),
         )
     }
 
@@ -541,6 +588,30 @@ and make that test pass."
         Self::cfg().miner_name.clone()
     }
 
+    pub fn custom_job_timeout() -> u64 {
+        Self::cfg().custom_job_timeout
+    }
+
+    pub fn zmq_pub_sequence() -> &'static str {
+        &Self::cfg().zmq_pub_sequence
+    }
+
+    pub fn rpc_allow_ip() -> &'static str {
+        &Self::cfg().rpc_allow_ip
+    }
+
+    pub fn rpc_port() -> u16 {
+        Self::cfg().rpc_port
+    }
+
+    pub fn rpcusername() -> &'static String {
+        &Self::cfg().rpcusername
+    }
+
+    pub fn rpcpassword() -> &'static String {
+        &Self::cfg().rpcpassword
+    }
+
     pub(crate) fn prioritizing_txs_enabled() -> bool {
         Self::cfg().prioritizing_txs_config.is_some()
     }
@@ -637,6 +708,44 @@ and make that test pass."
             .api_tx_token
             .or(config.api_tx_token)
             .or_else(|| std::env::var("API_TX_TOKEN").ok())
+            .unwrap_or_default();
+        let custom_job_timeout = args
+            .custom_job_timeout
+            .or(config.custom_job_timeout)
+            .or_else(|| {
+                std::env::var("CUSTOM_JOB_TIMEOUT")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(30);
+        let zmq_pub_sequence = args
+            .zmq_pub_sequence
+            .or(config.zmq_pub_sequence)
+            .or_else(|| std::env::var("ZMQ_PUB_SEQUENCE").ok())
+            .unwrap_or_else(|| "tcp://127.0.0.1:28334".to_string());
+        let rpc_allow_ip = args
+            .rpc_allow_ip
+            .or(config.rpc_allow_ip)
+            .or_else(|| std::env::var("RPC_ALLOW_IP").ok())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let rpc_port = args
+            .rpc_port
+            .or(config.rpc_port)
+            .or_else(|| {
+                std::env::var("RPC_PORT")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(8332);
+        let rpcusername = args
+            .rpcusername
+            .or(config.rpcusername)
+            .or_else(|| std::env::var("RPC_USERNAME").ok())
+            .unwrap_or_default();
+        let rpcpassword = args
+            .rpcpassword
+            .or(config.rpcpassword)
+            .or_else(|| std::env::var("RPC_PASSWORD").ok())
             .unwrap_or_default();
         if let Some(ref miner_name) = miner_name {
             validate_miner_name(miner_name).unwrap_or_else(|e| panic!("{e}"));
@@ -842,6 +951,12 @@ and make that test pass."
             rpc_user,
             rpc_pwd,
             api_tx_token,
+            custom_job_timeout,
+            zmq_pub_sequence,
+            rpc_allow_ip,
+            rpc_port,
+            rpcusername,
+            rpcpassword,
         )
     }
 }
