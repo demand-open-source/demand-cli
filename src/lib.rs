@@ -12,7 +12,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-use crate::api::TxListWithResponse;
 use crate::auto_update::check_update_proxy;
 use crate::shared::utils::AbortOnDrop;
 use key_utils::Secp256k1PublicKey;
@@ -34,6 +33,7 @@ mod db;
 mod debug_timing;
 mod ingress;
 pub use config::Configuration;
+mod block_templates;
 pub mod jd_client;
 mod merge_mining;
 mod minin_pool_connection;
@@ -275,17 +275,12 @@ async fn initialize_proxy(
                 return;
             }
         };
-        let (tx_list_sender, tx_list_receiver) = channel::<TxListWithResponse>(10);
-        let (jd_event_broadcaster, _) = watch::channel(None);
-
         if let Some(_tp_addr) = tp {
             jdc_abortable = jd_client::start(
                 jdc_from_translator_receiver,
                 jdc_to_translator_sender,
                 from_share_accounter_to_jdc_recv,
                 from_jdc_to_share_accounter_send,
-                tx_list_receiver,
-                jd_event_broadcaster.clone(),
             )
             .await;
             if jdc_abortable.is_none() {
@@ -334,13 +329,8 @@ async fn initialize_proxy(
         if let Some(jdc_handle) = jdc_abortable {
             abort_handles.push((jdc_handle, "jdc".to_string()));
         }
-        let server_handle = tokio::spawn(api::start(
-            router.clone(),
-            stats_sender,
-            downstream_handoff,
-            tx_list_sender,
-            jd_event_broadcaster,
-        ));
+        let server_handle =
+            tokio::spawn(api::start(router.clone(), stats_sender, downstream_handoff));
         let api_server_abortable: AbortOnDrop = server_handle.into();
         let reconnect = monitor(router, abort_handles, epsilon, shutdown_signal.clone()).await;
         drop(api_server_abortable);

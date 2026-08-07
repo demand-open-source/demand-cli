@@ -1,126 +1,160 @@
 const MAX_BLOCK_WEIGHT = 4_000_000;
 const API_POLL_INTERVAL = 4_000;
-const MEMPOOL_REFRESH_INTERVAL = 30_000;
-
-const DEFAULT_SETTINGS = Object.freeze({
-  auto_selection_enabled: false,
-  selection_strategy: "maximizeFees",
-  min_fee_rate: 1,
-  max_size: 1_000_000,
-  min_base_fee: 0,
-  max_ancestor_count: 25,
-  max_descendant_count: 25,
-  exclude_bip125_replaceable: false,
-  exclude_unbroadcast: false,
-  max_transaction_count: 100,
-  require_template: false,
-  clear_existing_selections: true,
-  periodic_enabled: false,
-  periodic_interval: 30,
-  auto_job_declaration: false,
-  auto_scroll_to_table: true,
-  show_notifications: true,
-  pause_on_selection: false,
-  clear_selection_on_job_declaration: false,
-  preserve_existing_selections: true,
-  auto_clean_invalid_transactions: true,
-});
-
-const THEME_OPTIONS = [
-  ["default", "Default"],
-  ["blue", "Blue"],
-  ["green", "Green"],
-  ["amber", "Amber"],
-  ["default-scaled", "Default · Scaled"],
-  ["blue-scaled", "Blue · Scaled"],
-  ["mono-scaled", "Mono · Scaled"],
-];
+// The event stream does not announce tip changes; this poll retires stale candidates.
+const TEMPLATE_REFRESH_INTERVAL = 5_000;
 
 const ROUTES = {
   "/dashboard/overview": "Overview",
-  "/dashboard/job-history": "Job History",
-  "/dashboard/settings": "Settings",
+  "/dashboard/job-history": "Declared templates",
 };
+
+// Ranking criteria; keys are the backend policy names. `value` is null when a
+// template cannot be scored.
+const POLICIES = [
+  {
+    key: "highest_fees",
+    label: "Highest fees",
+    copy: "The candidate that pays the most in fees.",
+    value: (template) => template.total_fees_sat,
+  },
+  {
+    key: "block_weight",
+    label: "Block weight",
+    copy: "The candidate that fills the most of a block.",
+    value: (template) => template.total_weight,
+  },
+];
+
+function policyCopy(key) {
+  return POLICIES.find((policy) => policy.key === key)?.copy || "";
+}
+
+// Ribbon sort options: arrival plus every policy criterion.
+const TEMPLATE_SORTS = [
+  {
+    key: "received",
+    label: "Arrival",
+    value: (template) => template.received_at,
+  },
+  ...POLICIES,
+];
+
+// In-memory only, since the page opened.
+const LOG_LIMIT = 100;
+
+const LOG_FILTERS = [
+  ["all", "All"],
+  ["info", "Info"],
+  ["warning", "Warnings"],
+  ["error", "Errors"],
+];
+
+// Retention choices; this bounds the database size.
+const HISTORY_RETENTIONS = [
+  [5, "last 5 blocks"],
+  [10, "last 10 blocks"],
+  [20, "last 20 blocks"],
+  ["", "until I delete"],
+];
 
 const state = {
   route: normalizeRoute(window.location.pathname),
-  theme: localStorage.getItem("demand-theme") || "default",
   mode: localStorage.getItem("demand-mode") || "light",
-  sidebarExpanded: false,
   stats: {
     loading: true,
     health: null,
     pool: null,
     aggregate: null,
     system: null,
-    miners: null,
     error: null,
     errors: {},
   },
-  mempool: [],
-  mempoolLoaded: false,
-  mempoolError: null,
-  selected: new Set(),
-  search: "",
-  filters: { feeRate: null, vsize: null, baseFee: null, depends: "" },
-  sort: { key: "feeRate", direction: "desc" },
-  tablePage: 1,
-  tablePageSize: 10,
-  tableView: "all",
-  paused: false,
-  templateId: null,
-  declaring: false,
-  autoSelecting: false,
+  // Copy-all text for the open modal; too large for a data attribute.
+  modalCopyText: "",
   logs: [],
-  settings: { ...DEFAULT_SETTINGS },
-  settingsLoaded: false,
+  logFilter: "all",
+  miners: null,
   jobs: [],
   jobPage: 1,
+  // How many blocks of history the proxy keeps; null means until deleted by hand.
+  historyKeepBlocks: 5,
   jobPerPage: 10,
   jobTotal: 0,
   jobTotalPages: 0,
   jobsLoading: false,
   jobsError: null,
-  sockets: {},
-  reconnectTimers: {},
-  periodicTimer: null,
+  // The newest template the poll has shown, so the next one is noticed.
+  newestTemplateId: null,
+  // Candidate summaries from /api/templates/recent, newest first.
+  templates: [],
+  templatesLoaded: false,
+  templatesError: null,
+  // How many candidates the backend keeps for one tip.
+  templatesCandidateLimit: null,
+  // The chosen criterion, and which candidate it currently resolves to.
+  policy: "highest_fees",
+  policyPick: null,
+  // The declaration the pool has accepted.
+  activeDeclaration: null,
+  // The template whose modal is open.
+  openTemplateId: null,
+  // How the candidate ribbon is ordered, and which kinds of candidate it shows.
+  templateSort: { key: "received", direction: "desc" },
+  templateFilter: "all",
+  // Prioritisation state; its endpoints use their own API token.
+  prioritizationEnabled: null,
+  prioritizedToken: localStorage.getItem("demand-tx-token") || "",
+  prioritized: [],
+  prioritizedError: null,
+  prioritizing: false,
+  // Current block height, used to notice tip changes.
+  blockHeight: null,
+  blockSeenAt: null,
 };
+
+// null/undefined is unknown; 0 is a real value.
+function known(value) {
+  return value !== null && value !== undefined;
+}
 
 const ICON_PATHS = {
   dashboard:
     '<rect width="6" height="6" x="3" y="3" rx="1"/><rect width="6" height="6" x="15" y="3" rx="1"/><rect width="6" height="6" x="3" y="15" rx="1"/><rect width="6" height="6" x="15" y="15" rx="1"/>',
   history:
     '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/>',
-  settings:
-    '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.74l.15-.08a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
   panel: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>',
   theme:
     '<circle cx="12" cy="12" r="9"/><path d="M12 3v18M12 12l6.4-6.4M12 12l6.4 6.4"/>',
   chart: '<path d="M3 3v18h18"/><path d="M7 16v-5M12 16V7M17 16v-9"/>',
   globe:
     '<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 0 20M12 2a15.3 15.3 0 0 0 0 20"/><path d="M8 22h8"/>',
-  monitor: '<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8M12 17v4"/>',
+  monitor:
+    '<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8M12 17v4"/>',
   server:
     '<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
-  cpu:
-    '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
+  cpu: '<rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/>',
   activity: '<path d="M3 12h4l2-7 4 14 2-7h6"/>',
   trend: '<path d="m3 17 6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
   checkCircle: '<circle cx="12" cy="12" r="10"/><path d="m8 12 3 3 5-6"/>',
   play: '<path d="m6 3 14 9-14 9z"/>',
-  sliders: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
-  pause: '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
+  sliders:
+    '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/>',
+  pause:
+    '<rect width="4" height="16" x="6" y="4" rx="1"/><rect width="4" height="16" x="14" y="4" rx="1"/>',
   sort: '<path d="m3 8 4-4 4 4M7 4v16M21 16l-4 4-4-4M17 20V4"/>',
   plus: '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
   refresh: '<path d="M20 11a8 8 0 1 0 2 5.3"/><path d="M20 4v7h-7"/>',
   user: '<path d="M19 21v-2a7 7 0 0 0-14 0v2"/><circle cx="12" cy="7" r="4"/>',
   bell: '<path d="M10.3 21a2 2 0 0 0 3.4 0M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/>',
-  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
-  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>',
+  download:
+    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  upload:
+    '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>',
   copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
-  external: '<path d="M15 3h6v6M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  external:
+    '<path d="M15 3h6v6M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   hash: '<path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/>',
   chevronLeft: '<path d="m15 18-6-6 6-6"/>',
   chevronRight: '<path d="m9 18 6-6-6-6"/>',
@@ -130,6 +164,9 @@ const ICON_PATHS = {
   trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v5M14 11v5"/>',
   undo: '<path d="M3 7v6h6"/><path d="M3 13a9 9 0 1 0 3-7.7L3 8"/>',
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
+  layers:
+    '<path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>',
+  pin: '<path d="M12 17v5"/><path d="M9 10.8V4h6v6.8a2 2 0 0 0 .4 1.2l1.6 2.1a1 1 0 0 1-.8 1.6H7.8a1 1 0 0 1-.8-1.6l1.6-2.1a2 2 0 0 0 .4-1.2Z"/>',
 };
 
 function icon(name, size = 18, className = "") {
@@ -142,7 +179,6 @@ function normalizeRoute(path) {
   if (clean === "/" || clean === "/dashboard") return "/dashboard/overview";
   if (clean === "/overview") return "/dashboard/overview";
   if (clean === "/history") return "/dashboard/job-history";
-  if (clean === "/settings") return "/dashboard/settings";
   return ROUTES[clean] ? clean : "/dashboard/overview";
 }
 
@@ -161,25 +197,25 @@ function formatNumber(value, maximumFractionDigits = 0) {
   return number.toLocaleString(undefined, { maximumFractionDigits });
 }
 
-function formatHashrate(value, decimals = 2) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "N/A";
-  if (number >= 1e18) return `${(number / 1e18).toFixed(decimals)} EH/s`;
-  if (number >= 1e15) return `${(number / 1e15).toFixed(decimals)} PH/s`;
-  if (number >= 1e12) return `${(number / 1e12).toFixed(decimals)} TH/s`;
-  if (number >= 1e9) return `${(number / 1e9).toFixed(decimals)} GH/s`;
-  if (number >= 1e6) return `${(number / 1e6).toFixed(decimals)} MH/s`;
-  return `${number.toFixed(decimals)} H/s`;
-}
-
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes)) return "N/A";
   const units = ["Bytes", "KB", "MB", "GB", "TB"];
   if (bytes === 0) return "0 Bytes";
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const index = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
+
+const DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
+  month: "long",
+  day: "numeric",
+  year: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+});
 
 function formatDate(value) {
   if (!value) return "N/A";
@@ -188,13 +224,7 @@ function formatDate(value) {
     ? new Date(raw < 10_000_000_000 ? raw * 1000 : raw)
     : new Date(value);
   if (Number.isNaN(date.getTime())) return "N/A";
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(date);
+  return DATE_FORMAT.format(date);
 }
 
 function shortHash(value, front = 8, back = 8) {
@@ -209,19 +239,10 @@ function currentPageElement() {
 }
 
 function applyAppearance() {
-  document.documentElement.dataset.theme = state.theme;
   document.documentElement.dataset.mode = state.mode;
-  document.querySelector('meta[name="theme-color"]')?.setAttribute(
-    "content",
-    state.mode === "dark" ? "#09090b" : "#ffffff",
-  );
-}
-
-function switchControl(key, checked, label) {
-  return `<label class="switch" aria-label="${escapeHtml(label)}">
-    <input type="checkbox" name="${escapeHtml(key)}" ${checked ? "checked" : ""} />
-    <span class="switch-track"></span>
-  </label>`;
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute("content", state.mode === "dark" ? "#0a0a0a" : "#e5e5e5");
 }
 
 function renderShell() {
@@ -230,13 +251,13 @@ function renderShell() {
     <aside id="sidebar" class="sidebar">
       <nav class="sidebar-nav" aria-label="Dashboard navigation">
         ${sidebarLink("/dashboard/overview", "dashboard", "Dashboard")}
-        ${sidebarLink("/dashboard/job-history", "history", "Job History")}
-        ${sidebarLink("/dashboard/settings", "settings", "Settings")}
+        ${sidebarLink("/dashboard/job-history", "history", "Declared templates")}
       </nav>
     </aside>
     <div class="main-shell">
       <header class="topbar">
         <div class="topbar-left">
+          <img class="topbar-logo" src="/dmnd-logo.svg" alt="DMND" width="64" height="27" draggable="false" />
           <button class="icon-btn btn ghost" type="button" data-action="toggle-sidebar" aria-label="Toggle sidebar">${icon("panel", 19)}</button>
           <nav class="breadcrumbs" aria-label="Breadcrumb">
             <a class="breadcrumb-parent" href="/dashboard/overview" data-nav="/dashboard/overview">Dashboard</a>
@@ -245,13 +266,8 @@ function renderShell() {
           </nav>
         </div>
         <div class="topbar-actions">
+          <span id="health-badge" class="status-badge"><span class="status-dot"></span>Connecting...</span>
           <button class="icon-btn secondary" type="button" data-action="toggle-mode" aria-label="Toggle dark mode">${icon("theme", 18)}</button>
-          <label class="theme-select-wrap">
-            <span class="theme-select-label">Select a theme:</span>
-            <select id="theme-select" class="theme-select" aria-label="Theme">
-              ${THEME_OPTIONS.map(([value, name]) => `<option value="${value}" ${value === state.theme ? "selected" : ""}>${name}</option>`).join("")}
-            </select>
-          </label>
         </div>
       </header>
       <div class="page-scroll"><main id="page-content"></main></div>
@@ -279,7 +295,8 @@ function updateNavigation() {
 function navigate(route, replace = false) {
   const normalized = normalizeRoute(route);
   if (replace) window.history.replaceState({}, "", normalized);
-  else if (normalized !== state.route) window.history.pushState({}, "", normalized);
+  else if (normalized !== state.route)
+    window.history.pushState({}, "", normalized);
   state.route = normalized;
   updateNavigation();
   renderRoute();
@@ -289,20 +306,24 @@ function navigate(route, replace = false) {
 function renderRoute() {
   closeModal();
   if (state.route === "/dashboard/job-history") renderJobHistory();
-  else if (state.route === "/dashboard/settings") renderSettings();
   else renderOverview();
 }
 
 async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (options.body && !headers.has("Content-Type"))
+    headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers });
   let payload = null;
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) payload = await response.json();
   if (!response.ok) {
-    const message = payload?.message || `Request failed (${response.status})`;
-    throw new Error(message);
+    // Callers branch on status, not message text.
+    const error = new Error(
+      payload?.message || `Request failed (${response.status})`,
+    );
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
@@ -313,19 +334,21 @@ async function envelopeRequest(path, options = {}) {
   return payload.data;
 }
 
-function addLog(event, level, message) {
+function addLog(event, level, message, atSeconds) {
   state.logs.unshift({
     event,
     level,
     message,
-    timestamp: new Date().toLocaleString(),
+    timestamp: (atSeconds
+      ? new Date(atSeconds * 1000)
+      : new Date()
+    ).toLocaleString(),
   });
-  state.logs = state.logs.slice(0, 100);
+  state.logs = state.logs.slice(0, LOG_LIMIT);
   if (state.route === "/dashboard/overview") renderLogs();
 }
 
 function toast(title, description = "", type = "info", duration = 5_000) {
-  if (!state.settings.show_notifications && type !== "error") return;
   const root = document.querySelector("#toast-root");
   const item = document.createElement("div");
   item.className = `toast ${type}`;
@@ -345,7 +368,9 @@ function openModal({ title, description = "", body = "", size = "large" }) {
       <div class="modal-body">${body}</div>
     </section>
   </div>`;
-  requestAnimationFrame(() => root.querySelector("button, input, select")?.focus());
+  requestAnimationFrame(() =>
+    root.querySelector("button, input, select")?.focus(),
+  );
 }
 
 function closeModal() {
@@ -387,148 +412,24 @@ async function pollStats() {
     envelopeRequest("/api/stats/system"),
   ]);
   state.stats.loading = false;
-  state.stats.health = requests[0].status === "fulfilled" ? requests[0].value : null;
-  state.stats.pool = requests[1].status === "fulfilled" ? requests[1].value : null;
-  state.stats.aggregate = requests[2].status === "fulfilled" ? requests[2].value : null;
-  state.stats.system = requests[3].status === "fulfilled" ? requests[3].value : null;
+  state.stats.health =
+    requests[0].status === "fulfilled" ? requests[0].value : null;
+  state.stats.pool =
+    requests[1].status === "fulfilled" ? requests[1].value : null;
+  state.stats.aggregate =
+    requests[2].status === "fulfilled" ? requests[2].value : null;
+  state.stats.system =
+    requests[3].status === "fulfilled" ? requests[3].value : null;
+  // Only failures the page shows: the health badge and the pool card.
   state.stats.errors = {
-    health: requests[0].status === "rejected" ? requests[0].reason?.message : null,
-    pool: requests[1].status === "rejected" ? requests[1].reason?.message : null,
-    aggregate: requests[2].status === "rejected" ? requests[2].reason?.message : null,
-    system: requests[3].status === "rejected" ? requests[3].reason?.message : null,
+    pool:
+      requests[1].status === "rejected" ? requests[1].reason?.message : null,
   };
-  state.stats.error = state.stats.errors.health;
-  if (state.route === "/dashboard/overview") updateStatsUI();
-}
-
-async function loadMiners() {
-  try {
-    state.stats.miners = await envelopeRequest("/api/stats/miners");
-  } catch (error) {
-    state.stats.miners = null;
-  }
-}
-
-function normalizeTransaction(transaction) {
-  const vsize = Number(transaction.vsize) || 0;
-  const baseRaw = Number(transaction.fees?.base) || 0;
-  const baseSat = Math.abs(baseRaw) < 21_000_000 ? baseRaw * 100_000_000 : baseRaw;
-  return {
-    ...transaction,
-    txid: String(transaction.txid || ""),
-    vsize,
-    weight: Number(transaction.weight) || vsize * 4,
-    feeRate: Number(transaction.feeRate) || Number(transaction.fee_rate) || (vsize ? baseSat / vsize : 0),
-    baseFee: baseSat,
-    ancestor_count: Number(transaction.ancestor_count) || 0,
-    ancestor_size: Number(transaction.ancestor_size) || 0,
-    descendant_count: Number(transaction.descendant_count) || 0,
-    descendant_size: Number(transaction.descendant_size) || 0,
-    depends: Array.isArray(transaction.depends) ? transaction.depends.map(String) : [],
-    spent_by: Array.isArray(transaction.spent_by) ? transaction.spent_by.map(String) : [],
-    bip125_replaceable: Boolean(transaction.bip125_replaceable),
-    unbroadcast: Boolean(transaction.unbroadcast),
-  };
-}
-
-async function loadMempool(force = false) {
-  if (state.paused && !force) return;
-  try {
-    const transactions = await apiRequest("/api/mempool");
-    state.mempool = Array.isArray(transactions) ? transactions.map(normalizeTransaction) : [];
-    state.mempoolLoaded = true;
-    state.mempoolError = null;
-  } catch (error) {
-    state.mempoolLoaded = true;
-    state.mempoolError = error.message;
-  }
+  state.stats.error =
+    requests[0].status === "rejected" ? requests[0].reason?.message : null;
   if (state.route === "/dashboard/overview") {
-    renderMempoolTable();
-    updateSelectionUI();
-  }
-}
-
-function socketUrl(path) {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}${path}`;
-}
-
-function connectSocket(key, path, handlers) {
-  if (state.sockets[key]?.readyState === WebSocket.OPEN || state.sockets[key]?.readyState === WebSocket.CONNECTING) return;
-  clearTimeout(state.reconnectTimers[key]);
-  let socket;
-  try {
-    socket = new WebSocket(socketUrl(path));
-  } catch (error) {
-    state.reconnectTimers[key] = setTimeout(() => connectSocket(key, path, handlers), 3_000);
-    return;
-  }
-  state.sockets[key] = socket;
-  socket.addEventListener("open", () => handlers.open?.());
-  socket.addEventListener("message", (event) => handlers.message?.(event));
-  socket.addEventListener("error", () => handlers.error?.());
-  socket.addEventListener("close", () => {
-    handlers.close?.();
-    state.reconnectTimers[key] = setTimeout(() => connectSocket(key, path, handlers), 3_000);
-  });
-}
-
-function connectWebSockets() {
-  connectSocket("jd", "/ws/jd/stream", {
-    open: () => addLog("WebSocketOpen", "INFO", "Connected to job declaration stream"),
-    message: (event) => {
-      try {
-        const notification = JSON.parse(event.data);
-        addLog(notification.event || "JobEvent", "INFO", notification.message || "Job declaration event received");
-        if (notification.event === "NewTemplate") {
-          const alreadySeen = state.templateId === notification.template_id;
-          state.templateId = notification.template_id;
-          if (!alreadySeen) {
-            toast("NewTemplate", notification.message || `Template ${notification.template_id} is ready`);
-            if (state.settings.auto_selection_enabled) runAutoSelection("template");
-          }
-        } else if (["RequestTransactionDataSuccess", "RequestTransactionDataTimeout"].includes(notification.event)) {
-          state.templateId = null;
-        }
-      } catch (error) {
-        addLog("WebSocketParseError", "ERROR", `Failed to parse WebSocket message: ${error.message}`);
-      }
-    },
-    error: () => addLog("WebSocketError", "ERROR", "WebSocket connection error"),
-    close: () => addLog("WebSocketClose", "WARNING", "Disconnected from job declaration stream; reconnecting…"),
-  });
-
-  connectSocket("mempool", "/ws/bitcoin/stream", {
-    message: (event) => {
-      if (state.paused) return;
-      try {
-        applyMempoolEvent(JSON.parse(event.data));
-      } catch (error) {
-        console.warn("Unable to process mempool event", error);
-      }
-    },
-  });
-}
-
-function applyMempoolEvent(event) {
-  if (event.event === "A" && event.transaction) {
-    const transaction = normalizeTransaction(event.transaction);
-    const index = state.mempool.findIndex((item) => item.txid === transaction.txid);
-    if (index >= 0) state.mempool[index] = transaction;
-    else state.mempool.unshift(transaction);
-  } else if (event.event === "R" && event.txid) {
-    state.mempool = state.mempool.filter((item) => item.txid !== String(event.txid));
-  } else if (event.event === "C" && event.block?.txids) {
-    const mined = new Set(event.block.txids.map(String));
-    state.mempool = state.mempool.filter((item) => !mined.has(item.txid));
-  } else if (event.event === "D" && Array.isArray(event.transactions)) {
-    const current = new Map(state.mempool.map((item) => [item.txid, item]));
-    event.transactions.map(normalizeTransaction).forEach((item) => current.set(item.txid, item));
-    state.mempool = [...current.values()];
-  }
-  if (state.route === "/dashboard/overview") {
-    renderMempoolTable();
-    updateSelectionUI();
+    updateStatsUI();
+    loadMiners();
   }
 }
 
@@ -536,67 +437,80 @@ function renderOverview() {
   const page = currentPageElement();
   page.className = "page compact-top";
   page.innerHTML = `<section class="page-header">
-    <div><h1 class="page-title">Hi, Welcome back 👋</h1></div>
+    <div><h1 class="page-title">Welcome back, DMND'er</h1></div>
     <div class="page-actions">
-      <button class="btn" type="button" data-action="open-stats">${icon("chart", 17)} Detailed Stats</button>
-      <span id="health-badge" class="status-badge"><span class="status-dot"></span>Connecting...</span>
+      <button class="btn primary" id="prio-open" type="button" data-action="open-prioritize" hidden>${icon("pin", 16)} Prioritise transaction</button>
     </div>
   </section>
   <section class="stats-grid" aria-label="Mining statistics">
-    ${statCard("pool-card", "globe", "Pool Address", "Loading…", "Latency:", "Loading…", "")}
-    ${statCard("devices-card", "monitor", "Connected Devices", "—", "Mining devices online", "Total active miners", "Active")}
-    ${statCard("hashrate-card", "server", "Total Hashrate", "—", "Combined mining power", "Aggregate hash performance", "Mining")}
-    ${statCard("cpu-card", "cpu", "CPU Usage", "—", "System performance", "Memory: —", "Normal")}
+    ${statCard("pool-card", "globe", "Pool Address", "Loading…", "Latency:", "Loading…", "Round trip of the last job declaration")}
+    ${statCard("devices-card", "monitor", "Connected Devices", "—", "", "s")}
+    ${statCard("bandwidth-card", "server", "Bandwidth", "—", "Pool connection", "", "Average pool traffic, both directions, since start.")}
+    ${statCard("cpu-card", "cpu", "CPU Usage", "—", "System performance", "Memory: —")}
   </section>
-  <section class="card validation-card" id="validation-card">
+  <div class="block-row">
+  <section class="card block-card">
+    <div id="block-facts"></div>
+  </section>
+  <section class="card templates-card">
     <div class="validation-head">
-      <div class="validation-title"><span class="success-text">${icon("checkCircle", 17)}</span> Bitcoin Mining Validation</div>
-      <span id="validation-badge" class="badge solid">Valid Selection</span>
-    </div>
-    <p id="validation-copy" class="validation-copy">No transactions selected</p>
-    <div class="validation-label-row"><span>Block Weight Usage:</span><span id="validation-percent" class="validation-percent">0.0%</span></div>
-    <div class="progress"><div id="validation-progress" class="progress-bar"></div></div>
-    <div class="validation-foot"><span id="validation-weight">0 / 4,000,000 weight units</span><span id="validation-remaining">4,000,000 remaining</span></div>
-  </section>
-  <section class="card transactions-card data-table-container">
-    <div class="toolbar-row">
-      <button id="run-auto-button" class="btn" type="button" data-action="run-auto">${icon("play", 16)} Run Auto-Selection</button>
-      <button class="btn" type="button" data-action="open-auto-settings">${icon("settings", 16)} Settings</button>
-    </div>
-    <div class="table-toolbar">
-      <div class="table-toolbar-left">
-        <input id="tx-search" class="input search-input" type="search" value="${escapeHtml(state.search)}" placeholder="Search by txid" autocomplete="off" />
-        ${filterChip("feeRate", "Fee Rate")}${filterChip("vsize", "vsize")}${filterChip("baseFee", "Base Fee")}${filterChip("depends", "Depends On")}
-      </div>
-      <div class="table-toolbar-right">
-        <select id="view-control" class="select-control" aria-label="Table view">
-          <option value="all" ${state.tableView === "all" ? "selected" : ""}>View · All</option>
-          <option value="compact" ${state.tableView === "compact" ? "selected" : ""}>View · Compact</option>
-        </select>
-        <button class="btn ${state.paused ? "primary" : "destructive"}" type="button" data-action="toggle-pause">${state.paused ? icon("play", 16) + " Resume" : icon("pause", 16) + " Pause"}</button>
-        <select id="sort-control" class="select-control" aria-label="Sort transactions">
-          ${sortOptions()}
-        </select>
+      <div class="validation-title">${icon("layers", 17)} Block templates</div>
+      <div class="button-row" style="gap:.4rem">
+        <button class="btn small" type="button" id="auto-declare-open" data-action="open-auto-declare"></button>
+        <button class="btn small" type="button" data-action="refresh-templates">${icon("refresh", 15)} Refresh</button>
       </div>
     </div>
-    <div id="mempool-table"></div>
-    <div id="selection-action-bar" class="selection-action-bar" hidden></div>
+    <!-- Updated in place so the open select survives polling. -->
+    <div class="tplx-controls">
+      <label class="policy-label nowrap">Sort by
+        <select id="template-sort" class="select-control small" aria-label="Sort the candidates">
+          ${TEMPLATE_SORTS.map((option) => `<option value="${option.key}">${escapeHtml(option.label)}</option>`).join("")}
+        </select>
+      </label>
+      <button class="btn small" type="button" id="sort-direction" data-action="toggle-sort-direction"></button>
+      <span class="tplx-controls-gap"></span>
+      <span id="template-filters" class="button-row" style="gap:.35rem"></span>
+    </div>
+    <div id="tplx-root" class="tplx"></div>
   </section>
-  <section class="card logs-card">
-    <div class="validation-head"><div class="validation-title">${icon("history", 17)} Logs</div><span class="badge">Latest 100</span></div>
-    <div id="logs-list" class="logs-list"></div>
-  </section>`;
+  </div>
+  <div class="bottom-row">
+    <section class="card miners-card">
+      <div class="validation-head">
+        <div class="validation-title">${icon("monitor", 17)} Connected miners <span id="miners-count" class="badge"></span></div>
+      </div>
+      <div id="miners-list" class="miners-scroll"></div>
+    </section>
+    <section class="card logs-card">
+      <div class="validation-head">
+        <div class="validation-title">${icon("history", 17)} Logs</div>
+        <div class="button-row" style="gap:.35rem">
+          ${LOG_FILTERS.map(([key, label]) => `<button class="filter-chip small ${state.logFilter === key ? "active" : ""}" type="button" data-action="filter-logs" data-log-filter="${key}">${label} <span class="filter-count" data-log-count="${key}"></span></button>`).join("")}
+          <span class="logs-cap">last ${formatNumber(LOG_LIMIT)}</span>
+        </div>
+      </div>
+      <div id="logs-list" class="logs-list"></div>
+    </section>
+  </div>`;
   updateStatsUI();
-  renderMempoolTable();
-  updateSelectionUI();
+  renderTemplatesSection();
+  updatePrioritizeButton();
+  renderMiners();
   renderLogs();
-  if (!state.mempoolLoaded) loadMempool();
+  if (!state.templatesLoaded) loadTemplates();
+  loadPrioritized();
+  loadMiners();
 }
 
-function statCard(id, iconName, label, value, footTitle, footMuted, badge) {
+// One stat card; `hint` becomes a hover question mark.
+function statCard(id, iconName, label, value, footTitle, footMuted, hint = "") {
   return `<article id="${id}" class="card stat-card">
-    <div><div class="stat-card-top"><div><div class="stat-label">${icon(iconName, 17)} ${label}</div><div class="stat-value" data-stat-value>${value}</div></div>${badge ? `<span class="badge">${badge === "Mining" ? icon("trend", 13) : icon("activity", 13)} ${badge}</span>` : ""}</div></div>
-    <div><div class="stat-foot-title"><span data-stat-foot-title>${footTitle}</span> ${footTitle.includes("Latency") ? "" : icon("trend", 14)}</div><div class="stat-foot-muted" data-stat-foot-muted>${footMuted}</div></div>
+    <div><div class="stat-card-top"><div><div class="stat-label">${icon(iconName, 17)} ${label}${
+      hint
+        ? `<span class="stat-hint" tabindex="0" role="note" aria-label="${escapeHtml(hint)}">?<span class="stat-tip">${escapeHtml(hint)}</span></span>`
+        : ""
+    }</div><div class="stat-value" data-stat-value>${value}</div></div></div></div>
+    <div><div class="stat-foot-title"><span data-stat-foot-title>${footTitle}</span></div><div class="stat-foot-muted" data-stat-foot-muted>${footMuted}</div></div>
   </article>`;
 }
 
@@ -617,29 +531,34 @@ function updateStatsUI() {
   const pool = state.stats.pool;
   updateStatCard(
     "pool-card",
-    pool?.address || (state.stats.errors.pool ? `Error: ${state.stats.errors.pool}` : "N/A"),
+    pool?.address ||
+      (state.stats.errors.pool ? `Error: ${state.stats.errors.pool}` : "N/A"),
     "Latency:",
-    `${pool?.latency ?? "N/A"} ms`,
+    known(pool?.declaration_latency_ms)
+      ? `${formatNumber(pool.declaration_latency_ms / 1000, 3)} secs`
+      : "N/A",
+  );
+  updateStatCard(
+    "bandwidth-card",
+    known(pool?.bandwidth_bytes_per_sec)
+      ? `${formatBytes(pool.bandwidth_bytes_per_sec)}/s`
+      : "N/A",
+    "",
+    "",
   );
   const aggregate = state.stats.aggregate;
   updateStatCard(
     "devices-card",
     aggregate?.total_connected_device ?? "N/A",
-    "Mining devices online",
-    "Total active miners",
-  );
-  updateStatCard(
-    "hashrate-card",
-    aggregate ? formatHashrate(aggregate.aggregate_hashrate) : "N/A",
-    "Combined mining power",
-    "Aggregate hash performance",
+    "",
+    "",
   );
   const system = state.stats.system;
   const cpu = Number(system?.["cpu_usage_%"] ?? system?.cpu_usage);
   updateStatCard(
     "cpu-card",
     Number.isFinite(cpu) ? `${cpu.toFixed(1)}%` : "N/A",
-    "System performance",
+    "",
     `Memory: ${system ? formatBytes(system.memory_usage_bytes ?? system.memory_usage) : "N/A"}`,
   );
 }
@@ -652,443 +571,81 @@ function updateStatCard(id, value, footTitle, footMuted) {
   card.querySelector("[data-stat-foot-muted]").textContent = footMuted;
 }
 
-function filterChip(key, label) {
-  const value = state.filters[key];
-  const display = value !== null && value !== "" ? `${label}: ${value}` : label;
-  return `<button class="filter-chip ${value !== null && value !== "" ? "active" : ""}" type="button" data-filter="${key}">${icon("plus", 15)} ${escapeHtml(display)}</button>`;
-}
-
-function sortOptions() {
-  const options = [
-    ["feeRate:desc", "Sort · Fee rate ↓"],
-    ["feeRate:asc", "Sort · Fee rate ↑"],
-    ["vsize:desc", "Sort · Size ↓"],
-    ["vsize:asc", "Sort · Size ↑"],
-    ["baseFee:desc", "Sort · Base fee ↓"],
-    ["time:desc", "Sort · Newest"],
-  ];
-  const current = `${state.sort.key}:${state.sort.direction}`;
-  return options.map(([value, label]) => `<option value="${value}" ${value === current ? "selected" : ""}>${label}</option>`).join("");
-}
-
-function filteredTransactions() {
-  const search = state.search.trim().toLowerCase();
-  const filtered = state.mempool.filter((transaction) => {
-    if (search && !transaction.txid.toLowerCase().includes(search)) return false;
-    if (state.filters.feeRate !== null && transaction.feeRate < Number(state.filters.feeRate)) return false;
-    if (state.filters.vsize !== null && transaction.vsize > Number(state.filters.vsize)) return false;
-    if (state.filters.baseFee !== null && transaction.baseFee < Number(state.filters.baseFee)) return false;
-    if (state.filters.depends && !transaction.depends.some((item) => item.includes(state.filters.depends))) return false;
-    return true;
-  });
-  const direction = state.sort.direction === "asc" ? 1 : -1;
-  return filtered.sort((a, b) => {
-    const left = a[state.sort.key] ?? 0;
-    const right = b[state.sort.key] ?? 0;
-    return (left > right ? 1 : left < right ? -1 : 0) * direction;
-  });
-}
-
-function renderMempoolTable() {
-  const root = document.querySelector("#mempool-table");
-  if (!root) return;
-  const rows = filteredTransactions();
-  const totalPages = Math.max(1, Math.ceil(rows.length / state.tablePageSize));
-  state.tablePage = Math.min(state.tablePage, totalPages);
-  const start = (state.tablePage - 1) * state.tablePageSize;
-  const visibleRows = rows.slice(start, start + state.tablePageSize);
-  const allVisibleSelected = visibleRows.length > 0 && visibleRows.every((row) => state.selected.has(row.txid));
-  const compact = state.tableView === "compact";
-  root.innerHTML = `<div class="table-shell">
-    <table class="data-table">
-      <thead><tr>
-        <th><input type="checkbox" data-action="select-page" aria-label="Select page" ${allVisibleSelected ? "checked" : ""} /></th>
-        <th>Txid</th><th><span class="sort-header">FeeRate (sat/vB) ${icon("sort", 13)}</span></th><th><span class="sort-header">Size (vB) ${icon("sort", 13)}</span></th><th><span class="sort-header">Base Fee (sat) ${icon("sort", 13)}</span></th>
-        ${compact ? "" : `<th>Depends On</th><th>Descendant Count</th><th>Descendant Size</th><th>Ancestor Count</th><th>Ancestor Size</th><th>Time</th>`}
-      </tr></thead>
-      <tbody>${renderTransactionRows(visibleRows, compact)}</tbody>
-    </table>
-  </div>
-  <div class="table-pagination">
-    <span>${state.selected.size ? `${state.selected.size} of ${rows.length} row(s) selected.` : `${rows.length} row(s) total.`}</span>
-    <div class="pagination-controls">
-      <label class="nowrap">Rows per page <select id="table-page-size" class="select-control small"><option>10</option><option>20</option><option>30</option><option>50</option></select></label>
-      <span class="nowrap">Page ${state.tablePage} of ${totalPages}</span>
-      <button class="icon-btn" type="button" data-table-page="first" ${state.tablePage <= 1 ? "disabled" : ""} aria-label="First page">${icon("chevronsLeft", 15)}</button>
-      <button class="icon-btn" type="button" data-table-page="previous" ${state.tablePage <= 1 ? "disabled" : ""} aria-label="Previous page">${icon("chevronLeft", 15)}</button>
-      <button class="icon-btn" type="button" data-table-page="next" ${state.tablePage >= totalPages ? "disabled" : ""} aria-label="Next page">${icon("chevronRight", 15)}</button>
-      <button class="icon-btn" type="button" data-table-page="last" ${state.tablePage >= totalPages ? "disabled" : ""} aria-label="Last page">${icon("chevronsRight", 15)}</button>
-    </div>
-  </div>`;
-  const pageSize = root.querySelector("#table-page-size");
-  if (pageSize) pageSize.value = String(state.tablePageSize);
-}
-
-function renderTransactionRows(rows, compact) {
-  if (!state.mempoolLoaded) return `<tr><td class="empty-cell" colspan="11">Loading transactions…</td></tr>`;
-  if (state.mempoolError && rows.length === 0) return `<tr><td class="empty-cell destructive-text" colspan="11">${escapeHtml(state.mempoolError)}</td></tr>`;
-  if (rows.length === 0) return `<tr><td class="empty-cell" colspan="11">No results.</td></tr>`;
-  return rows.map((transaction) => {
-    const selected = state.selected.has(transaction.txid);
-    return `<tr class="${selected ? "selected" : ""}">
-      <td><input type="checkbox" data-tx-select="${escapeHtml(transaction.txid)}" ${selected ? "checked" : ""} aria-label="Select transaction" /></td>
-      <td title="${escapeHtml(transaction.txid)}"><code>${escapeHtml(shortHash(transaction.txid, 10, 8))}</code></td>
-      <td>${formatNumber(transaction.feeRate, 2)}</td><td>${formatNumber(transaction.vsize)}</td><td>${formatNumber(transaction.baseFee)}</td>
-      ${compact ? "" : `<td title="${escapeHtml(transaction.depends.join(", "))}">${transaction.depends.length ? escapeHtml(shortHash(transaction.depends[0], 7, 5)) : "—"}</td><td>${formatNumber(transaction.descendant_count)}</td><td>${formatNumber(transaction.descendant_size)}</td><td>${formatNumber(transaction.ancestor_count)}</td><td>${formatNumber(transaction.ancestor_size)}</td><td>${escapeHtml(formatDate(transaction.time))}</td>`}
-    </tr>`;
-  }).join("");
-}
-
-function selectedTransactions() {
-  const selected = state.selected;
-  return state.mempool.filter((transaction) => selected.has(transaction.txid));
-}
-
-function validateSelection() {
-  const transactions = selectedTransactions();
-  const selectedIds = state.selected;
-  const mempoolIds = new Set(state.mempool.map((transaction) => transaction.txid));
-  const missing = [...selectedIds].filter((txid) => !mempoolIds.has(txid));
-  const dependencyIssues = [];
-  for (const transaction of transactions) {
-    for (const dependency of transaction.depends) {
-      if (mempoolIds.has(dependency) && !selectedIds.has(dependency)) dependencyIssues.push(`${shortHash(transaction.txid)} needs ${shortHash(dependency)}`);
-    }
-  }
-  const totalWeight = transactions.reduce((sum, transaction) => sum + transaction.weight, 0);
-  const errors = [];
-  if (totalWeight > MAX_BLOCK_WEIGHT) errors.push("Selection exceeds the Bitcoin block weight limit");
-  if (missing.length) errors.push(`${missing.length} selected transaction(s) are no longer in the mempool`);
-  if (dependencyIssues.length) errors.push(`${dependencyIssues.length} parent transaction dependency issue(s)`);
-  return {
-    transactions,
-    totalWeight,
-    totalFees: transactions.reduce((sum, transaction) => sum + transaction.baseFee, 0),
-    errors,
-    isValid: errors.length === 0,
-  };
-}
-
-function updateSelectionUI() {
-  const validation = validateSelection();
-  const percentage = Math.min(100, (validation.totalWeight / MAX_BLOCK_WEIGHT) * 100);
-  const copy = document.querySelector("#validation-copy");
-  if (!copy) return;
-  copy.textContent = state.selected.size
-    ? validation.isValid
-      ? `${state.selected.size} transaction${state.selected.size === 1 ? "" : "s"} selected`
-      : validation.errors.join(" · ")
-    : "No transactions selected";
-  copy.classList.toggle("destructive-text", !validation.isValid);
-  const badge = document.querySelector("#validation-badge");
-  badge.textContent = validation.isValid ? "Valid Selection" : "Invalid Selection";
-  badge.style.background = validation.isValid ? "var(--primary)" : "var(--destructive)";
-  badge.style.borderColor = validation.isValid ? "var(--primary)" : "var(--destructive)";
-  document.querySelector("#validation-percent").textContent = `${percentage.toFixed(1)}%`;
-  document.querySelector("#validation-percent").classList.toggle("destructive-text", !validation.isValid);
-  const progress = document.querySelector("#validation-progress");
-  progress.style.width = `${percentage}%`;
-  progress.classList.toggle("invalid", !validation.isValid);
-  document.querySelector("#validation-weight").textContent = `${formatNumber(validation.totalWeight)} / 4,000,000 weight units`;
-  document.querySelector("#validation-remaining").textContent = `${formatNumber(Math.max(0, MAX_BLOCK_WEIGHT - validation.totalWeight))} remaining`;
-  const actionBar = document.querySelector("#selection-action-bar");
-  actionBar.hidden = state.selected.size === 0;
-  if (!actionBar.hidden) {
-    actionBar.innerHTML = `<div><strong>${state.selected.size} selected</strong><div class="muted">${formatNumber(validation.totalWeight)} weight units · ${formatNumber(validation.totalFees)} sats</div></div>
-      <div class="button-row" style="gap:.5rem"><button class="btn small" type="button" data-action="open-selection-summary">${icon("eye", 15)} Review</button><button class="btn small" type="button" data-action="clear-selection">Clear</button><button class="btn primary small" type="button" data-action="declare-job" ${!validation.isValid || state.declaring ? "disabled" : ""}>${state.declaring ? "Declaring…" : "Declare Job"}</button></div>`;
-  }
-}
-
 function renderLogs() {
   const root = document.querySelector("#logs-list");
   if (!root) return;
-  root.innerHTML = state.logs.length
-    ? state.logs.map((log) => `<div class="log-row"><span>${escapeHtml(log.timestamp)}</span><strong class="log-level-${log.level.toLowerCase()}">${escapeHtml(log.level)}</strong><span><strong>${escapeHtml(log.event)}</strong> · ${escapeHtml(log.message)}</span></div>`).join("")
-    : '<div class="empty-cell" style="display:grid;place-items:center">No logs available. Waiting for WebSocket connection...</div>';
+
+  const counts = { all: state.logs.length, info: 0, warning: 0, error: 0 };
+  for (const log of state.logs) {
+    const level = log.level.toLowerCase();
+    if (level in counts) counts[level] += 1;
+  }
+  document.querySelectorAll("[data-log-count]").forEach((element) => {
+    element.textContent = formatNumber(counts[element.dataset.logCount] ?? 0);
+  });
+  document.querySelectorAll("[data-log-filter]").forEach((element) => {
+    element.classList.toggle(
+      "active",
+      element.dataset.logFilter === state.logFilter,
+    );
+  });
+
+  const shown = state.logs.filter(
+    (log) =>
+      state.logFilter === "all" || log.level.toLowerCase() === state.logFilter,
+  );
+
+  root.innerHTML = shown.length
+    ? shown
+        .map(
+          (log) =>
+            `<div class="log-row"><span>${escapeHtml(log.timestamp)}</span><strong class="log-level-${log.level.toLowerCase()}">${escapeHtml(log.level)}</strong><span><strong>${escapeHtml(log.event)}</strong> · ${escapeHtml(log.message)}</span></div>`,
+        )
+        .join("")
+    : `<div class="empty-cell" style="display:grid;place-items:center">${
+        state.logs.length ? "Nothing at this level." : "No logs yet."
+      }</div>`;
 }
 
-function openFilterModal(key) {
-  const definitions = {
-    feeRate: ["Minimum Fee Rate", "Show transactions at or above this fee rate (sat/vB).", "number"],
-    vsize: ["Maximum Virtual Size", "Show transactions at or below this virtual size.", "number"],
-    baseFee: ["Minimum Base Fee", "Show transactions at or above this base fee in satoshis.", "number"],
-    depends: ["Depends On", "Show transactions whose parent TXID contains this value.", "text"],
-  };
-  const [title, description, type] = definitions[key];
-  openModal({
-    title,
-    description,
-    size: "",
-    body: `<form id="filter-form"><div class="form-field"><label for="filter-value">Value</label><input id="filter-value" class="input" type="${type}" min="0" value="${escapeHtml(state.filters[key] ?? "")}" placeholder="Leave empty to clear" /></div><div class="modal-actions"><button class="btn" type="button" data-action="clear-filter" data-filter-key="${key}">Clear</button><button class="btn primary" type="submit" data-filter-key="${key}">Apply Filter</button></div></form>`,
-  });
+function renderMiners() {
+  const root = document.querySelector("#miners-list");
+  const count = document.querySelector("#miners-count");
+  if (!root) return;
+
+  const miners = state.miners ? Object.entries(state.miners) : [];
+  if (count)
+    count.textContent = miners.length ? formatNumber(miners.length) : "—";
+
+  if (!miners.length) {
+    root.innerHTML = `<div class="empty-cell" style="display:grid;place-items:center">${
+      state.miners ? "No miner is connected." : "Reading the connected miners…"
+    }</div>`;
+    return;
+  }
+
+  root.innerHTML = `<div class="table-shell miners-scroll"><table class="pz-table"><thead><tr>
+      <th>Miner</th><th class="right">Difficulty</th>
+    </tr></thead><tbody>${miners
+      .map(
+        ([id, miner]) => `<tr>
+        <td>${escapeHtml(miner.device_name || `Miner ${id}`)}</td>
+        <td class="right">${formatNumber(miner.current_difficulty, 2)}</td>
+      </tr>`,
+      )
+      .join("")}</tbody></table></div>`;
 }
 
-function openSelectionSummary() {
-  const validation = validateSelection();
-  const count = validation.transactions.length;
-  const totalVsize = validation.transactions.reduce((sum, item) => sum + item.vsize, 0);
-  const averageFeeRate = count ? validation.transactions.reduce((sum, item) => sum + item.feeRate, 0) / count : 0;
-  openModal({
-    title: "Selected Transactions",
-    description: "Review the selected transactions",
-    size: "large",
-    body: `<div class="selection-summary-grid">
-      ${summaryMetric("Total Transactions", formatNumber(count))}
-      ${summaryMetric("Total Fees", `${formatNumber(validation.totalFees)} sats`)}
-      ${summaryMetric("Total Virtual Size", `${formatNumber(totalVsize)} vbytes`)}
-      ${summaryMetric("Average Fee Rate", `${formatNumber(averageFeeRate, 2)} sat/vB`)}
-    </div>
-    <div class="form-section"><h4>Transaction Summary</h4><div class="txid-list">${validation.transactions.map((item, index) => `<div class="txid-row"><span class="badge">${index + 1}</span><span class="txid-value" title="${escapeHtml(item.txid)}">${escapeHtml(item.txid)}</span><button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(item.txid)}" aria-label="Copy TXID">${icon("copy", 14)}</button></div>`).join("")}</div></div>
-    <div class="modal-actions"><button class="btn" type="button" data-action="close-modal">Close</button><button class="btn primary" type="button" data-action="declare-job" ${!validation.isValid ? "disabled" : ""}>Declare Job</button></div>`,
-  });
+async function loadMiners() {
+  try {
+    state.miners = await envelopeRequest("/api/stats/miners");
+  } catch (error) {
+    state.miners = null;
+  }
+  if (state.route === "/dashboard/overview") renderMiners();
 }
 
 function summaryMetric(label, value) {
   return `<div class="summary-metric"><div class="summary-metric-label">${label}</div><div class="summary-metric-value">${value}</div></div>`;
-}
-
-async function declareJob() {
-  if (!state.templateId) {
-    toast("No template available", "Please wait for a new template notification before declaring a job.", "error");
-    return false;
-  }
-  const validation = validateSelection();
-  if (!state.selected.size) {
-    toast("No transactions selected", "Please select at least one transaction to declare a job.", "error");
-    return false;
-  }
-  if (!validation.isValid) {
-    toast("Invalid Selection", "Selected transactions violate Bitcoin mining criteria.", "error");
-    return false;
-  }
-  state.declaring = true;
-  updateSelectionUI();
-  try {
-    const data = await envelopeRequest("/api/job-declaration", {
-      method: "POST",
-      body: JSON.stringify({ template_id: state.templateId, txids: [...state.selected] }),
-    });
-    toast("Job Declaration Successful!", `Successfully declared job with ${state.selected.size} transactions for template ${state.templateId}.`, "success");
-    addLog("JobDeclarationSuccess", "INFO", `Job declared successfully with ${state.selected.size} transactions (template_id: ${state.templateId})`);
-    if (state.settings.clear_selection_on_job_declaration) state.selected.clear();
-    closeModal();
-    return data || true;
-  } catch (error) {
-    toast("Job Declaration Failed", error.message, "error");
-    addLog("JobDeclarationError", "ERROR", `Job declaration failed: ${error.message}`);
-    return false;
-  } finally {
-    state.declaring = false;
-    if (state.route === "/dashboard/overview") {
-      renderMempoolTable();
-      updateSelectionUI();
-    }
-  }
-}
-
-function localAutoSelection() {
-  const settings = state.settings;
-  let transactions = state.mempool.filter((transaction) => {
-    if (transaction.feeRate < settings.min_fee_rate) return false;
-    if (settings.max_size && transaction.vsize > settings.max_size) return false;
-    if (settings.min_base_fee && transaction.baseFee < settings.min_base_fee) return false;
-    if (settings.max_ancestor_count && transaction.ancestor_count > settings.max_ancestor_count) return false;
-    if (settings.max_descendant_count && transaction.descendant_count > settings.max_descendant_count) return false;
-    if (settings.exclude_bip125_replaceable && transaction.bip125_replaceable) return false;
-    if (settings.exclude_unbroadcast && transaction.unbroadcast) return false;
-    return true;
-  });
-  if (settings.selection_strategy === "maximizeCount") transactions.sort((a, b) => a.vsize - b.vsize);
-  else if (settings.selection_strategy === "balanced") transactions.sort((a, b) => b.feeRate / Math.max(1, b.vsize) - a.feeRate / Math.max(1, a.vsize));
-  else transactions.sort((a, b) => b.baseFee - a.baseFee);
-  const maximum = Math.max(1, Number(settings.max_transaction_count) || 100);
-  return transactions.slice(0, maximum);
-}
-
-async function runAutoSelection(source = "manual") {
-  if (state.autoSelecting) {
-    toast("Auto-selection in progress", "Please wait for the current auto-selection to complete", "warning");
-    return;
-  }
-  if (!state.settings.auto_selection_enabled) {
-    toast("Auto-selection disabled", "Please enable auto-selection in settings first", "warning");
-    return;
-  }
-  if (state.settings.require_template && !state.templateId) {
-    toast("No template available", "Please wait for a new template notification before running auto-selection.", "warning");
-    return;
-  }
-  state.autoSelecting = true;
-  const button = document.querySelector("#run-auto-button");
-  if (button) {
-    button.disabled = true;
-    button.textContent = "Selecting…";
-  }
-  let transactions;
-  let local = false;
-  try {
-    const params = new URLSearchParams({
-      selectionStrategy: state.settings.selection_strategy,
-      minFeeRate: String(state.settings.min_fee_rate),
-      maxSize: String(state.settings.max_size),
-      minBaseFee: String(state.settings.min_base_fee),
-      maxAncestorCount: String(state.settings.max_ancestor_count),
-      maxDescendantCount: String(state.settings.max_descendant_count),
-      excludeBip125Replaceable: String(state.settings.exclude_bip125_replaceable),
-      excludeUnbroadcast: String(state.settings.exclude_unbroadcast),
-      maxTransactionCount: String(state.settings.max_transaction_count),
-    });
-    const data = await envelopeRequest(`/api/auto-select?${params}`);
-    if (!Array.isArray(data)) throw new Error("Invalid API response format");
-    const selectedIds = new Set(data.map((item) => String(item.txid)));
-    transactions = state.mempool.filter((item) => selectedIds.has(item.txid));
-  } catch (error) {
-    local = true;
-    transactions = localAutoSelection();
-    toast("Using local filtering", "API unavailable, using local transaction filtering", "warning", 3_000);
-  }
-  if (!transactions.length) {
-    toast("No matching transactions", "No transactions match the current auto-selection criteria", "warning");
-  } else {
-    if (state.settings.clear_existing_selections || !state.settings.preserve_existing_selections) state.selected.clear();
-    transactions.forEach((transaction) => state.selected.add(transaction.txid));
-    if (state.settings.pause_on_selection) state.paused = true;
-    toast(`Auto-selection ${local ? "(local) " : ""}completed`, `Selected ${transactions.length} transactions${state.templateId ? ` for template ${state.templateId}` : ""}.`, "success");
-    if (state.settings.auto_scroll_to_table) document.querySelector(".data-table-container")?.scrollIntoView({ behavior: "smooth" });
-    if (state.settings.auto_job_declaration && state.templateId) await declareJob();
-  }
-  state.autoSelecting = false;
-  if (state.route === "/dashboard/overview") renderOverview();
-  if (source === "template") addLog("AutoSelection", "INFO", `Auto-selection completed for template ${state.templateId ?? "unknown"}`);
-}
-
-function openAutoSelectionSettings() {
-  const settings = state.settings;
-  openModal({
-    title: "Auto-Selection Settings",
-    description: "Configure auto-selection criteria for transaction selection when new templates arrive.",
-    size: "large",
-    body: `<form id="auto-settings-form">
-      <div class="setting-row"><div class="setting-copy"><strong>Enable Auto-Selection</strong><span>Automatically select transactions when new templates arrive</span></div>${switchControl("auto_selection_enabled", settings.auto_selection_enabled, "Enable auto-selection")}</div>
-      <div class="form-section"><div class="form-grid">
-        ${formSelect("selection_strategy", "Selection Strategy", settings.selection_strategy, [["maximizeFees", "Maximize Fees"], ["maximizeCount", "Maximize Count"], ["balanced", "Balanced"]])}
-        ${formInput("min_fee_rate", "Min Fee Rate (sat/vB)", settings.min_fee_rate, 0, "number")}
-        ${formInput("max_size", "Max Size (vBytes)", settings.max_size, 1, "number")}
-        ${formInput("min_base_fee", "Min Base Fee (sats)", settings.min_base_fee, 0, "number")}
-        ${formInput("max_transaction_count", "Max Transaction Count", settings.max_transaction_count, 1, "number")}
-        ${formInput("max_ancestor_count", "Max Ancestor Count", settings.max_ancestor_count, 1, "number")}
-        ${formInput("max_descendant_count", "Max Descendant Count", settings.max_descendant_count, 1, "number")}
-      </div></div>
-      <div class="form-section"><h4>Selection Preferences</h4>
-        ${modalSettingRow("require_template", "Require Template", "Only run auto-selection when a template is available", settings.require_template)}
-        ${modalSettingRow("clear_existing_selections", "Clear Existing Selections", "Remove current selections before auto-selecting new ones", settings.clear_existing_selections)}
-        ${modalSettingRow("periodic_enabled", "Enable Periodic Auto-Selection", "Run auto-selection at regular intervals", settings.periodic_enabled)}
-        <div id="periodic-interval-wrap" class="form-field" style="margin:.6rem 0;${settings.periodic_enabled ? "" : "display:none"}"><label>Interval (seconds)</label><input class="input" name="periodic_interval" type="number" min="5" max="300" value="${settings.periodic_interval}" /></div>
-        ${modalSettingRow("auto_job_declaration", "Auto Job Declaration", "Automatically declare job after successful auto-selection", settings.auto_job_declaration)}
-      </div>
-      <div class="form-section"><h4>Exclusion Preferences</h4>
-        ${modalSettingRow("exclude_bip125_replaceable", "Exclude BIP125 Replaceable", "Exclude replaceable transactions", settings.exclude_bip125_replaceable)}
-        ${modalSettingRow("exclude_unbroadcast", "Exclude Unbroadcast", "Exclude transactions not broadcast to peers", settings.exclude_unbroadcast)}
-      </div>
-      <div class="modal-actions"><button class="btn" type="button" data-action="close-modal">Cancel</button><button class="btn primary" type="submit">Save Settings</button></div>
-    </form>`,
-  });
-}
-
-function formInput(name, label, value, min = 0, type = "text") {
-  return `<div class="form-field"><label for="${name}">${label}</label><input id="${name}" class="input" name="${name}" type="${type}" min="${min}" value="${escapeHtml(value)}" /></div>`;
-}
-
-function formSelect(name, label, value, options) {
-  return `<div class="form-field"><label for="${name}">${label}</label><select id="${name}" class="select-control" name="${name}">${options.map(([optionValue, optionLabel]) => `<option value="${optionValue}" ${optionValue === value ? "selected" : ""}>${optionLabel}</option>`).join("")}</select></div>`;
-}
-
-function modalSettingRow(name, label, description, checked) {
-  return `<div class="setting-row"><div class="setting-copy"><strong>${label}</strong><span>${description}</span></div>${switchControl(name, checked, label)}</div>`;
-}
-
-function formSettings(form) {
-  const data = new FormData(form);
-  const next = { ...state.settings };
-  const booleans = [
-    "auto_selection_enabled", "require_template", "clear_existing_selections", "periodic_enabled",
-    "auto_job_declaration", "exclude_bip125_replaceable", "exclude_unbroadcast",
-  ];
-  booleans.forEach((key) => { next[key] = data.has(key); });
-  ["min_fee_rate", "max_size", "min_base_fee", "max_transaction_count", "max_ancestor_count", "max_descendant_count", "periodic_interval"].forEach((key) => {
-    if (data.has(key)) next[key] = Number(data.get(key));
-  });
-  if (data.has("selection_strategy")) next.selection_strategy = String(data.get("selection_strategy"));
-  return next;
-}
-
-async function saveSettings(settings, successMessage = "Settings saved") {
-  state.settings = { ...state.settings, ...settings };
-  try {
-    const saved = await envelopeRequest("/api/settings", { method: "POST", body: JSON.stringify(state.settings) });
-    if (saved) state.settings = { ...state.settings, ...saved };
-    toast(successMessage, "Your dashboard preferences have been updated.", "success");
-  } catch (error) {
-    localStorage.setItem("demand-settings", JSON.stringify(state.settings));
-    toast("Saved locally", `The settings API is unavailable: ${error.message}`, "warning");
-  }
-  schedulePeriodicAutoSelection();
-}
-
-function schedulePeriodicAutoSelection() {
-  clearInterval(state.periodicTimer);
-  state.periodicTimer = null;
-  if (state.settings.auto_selection_enabled && state.settings.periodic_enabled) {
-    state.periodicTimer = setInterval(() => runAutoSelection("periodic"), Math.max(5, state.settings.periodic_interval) * 1000);
-  }
-}
-
-async function loadSettings() {
-  const local = localStorage.getItem("demand-settings");
-  if (local) {
-    try { state.settings = { ...state.settings, ...JSON.parse(local) }; } catch (_) { /* ignore invalid local backup */ }
-  }
-  try {
-    const settings = await envelopeRequest("/api/settings");
-    if (settings) state.settings = { ...state.settings, ...settings };
-  } catch (_) {
-    // The dashboard remains usable with defaults when Bitcoin RPC/database is unavailable.
-  }
-  state.settingsLoaded = true;
-  schedulePeriodicAutoSelection();
-  if (state.route === "/dashboard/settings") renderSettings();
-}
-
-async function openDetailedStats() {
-  await loadMiners();
-  openModal({
-    title: "Mining Pool Statistics",
-    description: "Detailed view of mining pool performance and system metrics",
-    size: "large",
-    body: `<div class="tabs" role="tablist">
-      ${["overview", "miners", "system", "pool"].map((tab) => `<button class="tab ${tab === "overview" ? "active" : ""}" type="button" data-stats-tab="${tab}">${tab[0].toUpperCase() + tab.slice(1)}${tab === "pool" ? " Info" : ""}</button>`).join("")}
-    </div><div id="stats-tab-panel" class="tab-panel">${statsTabContent("overview")}</div>`,
-  });
-}
-
-function statsTabContent(tab) {
-  if (tab === "miners") {
-    const miners = state.stats.miners ? Object.entries(state.stats.miners) : [];
-    if (!miners.length) return '<div class="detail-card muted">No miner data available</div>';
-    return miners.map(([id, miner]) => `<div class="detail-card" style="margin-bottom:.75rem"><h4>${icon("monitor", 16)} ${escapeHtml(miner.device_name || `Miner ${id}`)}</h4><div class="stats-details-grid">${detail("Hashrate", formatHashrate(miner.hashrate))}${detail("Difficulty", formatNumber(miner.current_difficulty, 4))}${detail("Accepted Shares", formatNumber(miner.accepted_shares))}${detail("Rejected Shares", formatNumber(miner.rejected_shares))}</div></div>`).join("");
-  }
-  if (tab === "system") {
-    const system = state.stats.system;
-    if (!system) return '<div class="detail-card muted">No system data available</div>';
-    const cpu = Number(system["cpu_usage_%"] ?? system.cpu_usage);
-    return `<div class="detail-card"><h4>${icon("cpu", 16)} System Performance</h4><div class="stats-details-grid">${detail("CPU Usage", Number.isFinite(cpu) ? `${cpu.toFixed(1)}%` : "N/A")}${detail("Memory Usage", formatBytes(system.memory_usage_bytes ?? system.memory_usage))}</div></div>`;
-  }
-  if (tab === "pool") {
-    const pool = state.stats.pool;
-    return pool ? `<div class="detail-card"><h4>${icon("globe", 16)} Pool Information</h4><div class="stats-details-grid">${detail("Pool Address", pool.address || "N/A")}${detail("Latency", `${pool.latency ?? "N/A"} ms`)}</div></div>` : '<div class="detail-card muted">No pool data available</div>';
-  }
-  const aggregate = state.stats.aggregate;
-  return `<div class="detail-card"><h4>${icon("activity", 16)} Aggregate Statistics</h4><div class="stats-details-grid">${detail("Connected Devices", aggregate?.total_connected_device ?? "N/A")}${detail("Total Hashrate", aggregate ? formatHashrate(aggregate.aggregate_hashrate) : "N/A")}${detail("Accepted Shares", formatNumber(aggregate?.aggregate_accepted_shares))}${detail("Rejected Shares", formatNumber(aggregate?.aggregate_rejected_shares))}${detail("Current Difficulty", formatNumber(aggregate?.aggregate_diff, 4))}</div></div>`;
 }
 
 function detail(label, value) {
@@ -1098,9 +655,15 @@ function detail(label, value) {
 function renderJobHistory() {
   const page = currentPageElement();
   page.className = "page compact-top";
-  page.innerHTML = `<section class="page-header"><div><h1 class="page-title">Job Declaration History</h1><p class="page-description">View your submitted job declarations</p></div></section><div id="job-history-content"></div>`;
+  page.innerHTML = `<section class="page-header">
+    <div><h1 class="page-title">Declared templates</h1><p class="page-description">Every template this proxy has declared, newest first, under the block it was declared for.</p></div>
+    <div class="page-actions"><button class="tiny-setting" type="button" data-action="open-retention" id="retention-open"></button></div>
+  </section><div id="job-history-content"></div>`;
   renderJobHistoryContent();
-  if (!state.jobsLoading && !state.jobs.length && !state.jobsError) loadJobHistory();
+  if (!state.jobsLoading && !state.jobs.length && !state.jobsError)
+    loadJobHistory();
+  // Fetched once per page visit.
+  loadHistoryRetention();
 }
 
 async function loadJobHistory() {
@@ -1108,7 +671,9 @@ async function loadJobHistory() {
   state.jobsError = null;
   renderJobHistoryContent();
   try {
-    const data = await envelopeRequest(`/api/job-history?page=${state.jobPage}&per_page=${state.jobPerPage}`);
+    const data = await envelopeRequest(
+      `/api/job-history?page=${state.jobPage}&per_page=${state.jobPerPage}`,
+    );
     state.jobs = data?.jobs || [];
     state.jobTotal = Number(data?.total) || 0;
     state.jobTotalPages = Number(data?.total_pages) || 0;
@@ -1117,6 +682,92 @@ async function loadJobHistory() {
   } finally {
     state.jobsLoading = false;
     renderJobHistoryContent();
+  }
+}
+
+async function loadHistoryRetention() {
+  try {
+    const data = await envelopeRequest("/api/history/retention");
+    state.historyKeepBlocks = data?.keep_blocks ?? null;
+  } catch (_) {
+    // Keep the last known value.
+  }
+  renderRetentionButton();
+}
+
+async function saveHistoryRetention(value) {
+  const keep_blocks = value === "" ? null : Number(value);
+  const previous = state.historyKeepBlocks;
+  state.historyKeepBlocks = keep_blocks;
+  try {
+    await envelopeRequest("/api/history/retention", {
+      method: "POST",
+      body: JSON.stringify({ keep_blocks }),
+    });
+    toast(
+      "Retention set",
+      keep_blocks === null
+        ? "History is kept until you delete it."
+        : `Only the last ${keep_blocks} blocks are kept. Anything older has been removed.`,
+      "success",
+    );
+    // Applied immediately by the proxy, so the list on screen is already stale.
+    loadJobHistory();
+  } catch (error) {
+    state.historyKeepBlocks = previous;
+    toast("Could not change the retention", error.message, "error");
+  }
+  // Patch the open dialog; a rejected change puts the radio back.
+  refreshRetentionModal();
+}
+
+function refreshRetentionModal() {
+  const form = document.querySelector("#retention-form");
+  if (!form) return;
+  const chosenValue = String(state.historyKeepBlocks ?? "");
+  form.querySelectorAll(".auto-declare-option").forEach((option) => {
+    const input = option.querySelector("input");
+    const chosen = input.value === chosenValue;
+    option.classList.toggle("is-chosen", chosen);
+    input.checked = chosen;
+  });
+  renderRetentionButton();
+}
+
+// Irreversible: the stored txid lists exist nowhere else.
+function openClearHistoryModal() {
+  const total = state.jobTotal;
+  if (!total) return;
+  openModal({
+    title: "Delete history",
+    description: `${formatNumber(total)} declaration${total === 1 ? "" : "s"} will be removed.`,
+    size: "",
+    body: `<p class="auto-declare-note">The transaction list each one declared exists nowhere
+        else — a candidate is dropped from memory the moment the tip moves. This cannot be undone.</p>
+      <div class="modal-actions">
+        <button class="btn" type="button" data-action="close-modal">Cancel</button>
+        <button class="btn danger" type="button" data-action="confirm-clear-history">${icon("trash", 14)} Delete all</button>
+      </div>`,
+  });
+}
+
+async function clearJobHistory() {
+  const total = state.jobTotal;
+  if (!total) return;
+  try {
+    const data = await envelopeRequest("/api/job-history", {
+      method: "DELETE",
+    });
+    toast(
+      "History deleted",
+      `${formatNumber(data?.removed ?? total)} removed.`,
+      "success",
+    );
+    state.jobPage = 1;
+    closeModal();
+    loadJobHistory();
+  } catch (error) {
+    toast("Could not delete the history", error.message, "error");
   }
 }
 
@@ -1131,91 +782,220 @@ function renderJobHistoryContent() {
   const start = state.jobTotal ? (state.jobPage - 1) * state.jobPerPage + 1 : 0;
   const end = Math.min(state.jobPage * state.jobPerPage, state.jobTotal);
   root.innerHTML = `<section class="card history-card">
-    <div class="history-toolbar"><div class="button-row" style="gap:.5rem"><button class="btn small" type="button" data-action="refresh-history" ${state.jobsLoading ? "disabled" : ""}>${icon("refresh", 15)} Refresh</button></div><span class="muted">${state.jobsLoading ? "Loading…" : `${state.jobTotal} total job${state.jobTotal === 1 ? "" : "s"}`}</span></div>
-    <div class="table-shell"><table class="data-table history-table"><thead><tr><th>JD No</th><th>Template ID</th><th>Channel</th><th>TX Count</th><th>Mining Job Token Hex</th><th>Created</th><th>Actions</th></tr></thead><tbody>${renderJobRows()}</tbody></table></div>
+    <div class="history-toolbar">
+      <div class="button-row" style="gap:.5rem">
+        <button class="btn small" type="button" data-action="refresh-history" ${state.jobsLoading ? "disabled" : ""}>${icon("refresh", 15)} Refresh</button>
+        <button class="btn small danger" type="button" data-action="clear-history" ${state.jobTotal ? "" : "disabled"}>${icon("trash", 14)} Delete all</button>
+      </div>
+      <span class="muted">${state.jobsLoading ? "Loading…" : `${state.jobTotal} declaration${state.jobTotal === 1 ? "" : "s"}`}</span>
+    </div>
+    <div class="table-shell"><table class="data-table history-table"><thead><tr><th>JD No</th><th>Template</th><th class="right">Fees (BTC)</th><th class="right">TXs</th><th class="right">Block fill</th><th>Channel</th><th>Mining Job Token</th><th>Declared</th><th>Actions</th></tr></thead><tbody>${renderJobRows()}</tbody></table></div>
     <div class="history-pagination"><span>Showing ${start} to ${end} of ${state.jobTotal} entries</span><div class="pagination-controls"><label class="nowrap">Rows per page <select id="job-page-size" class="select-control"><option>10</option><option>20</option><option>30</option><option>50</option></select></label><span>Page ${state.jobPage} of ${totalPages}</span><button class="icon-btn" data-job-page="first" ${state.jobPage <= 1 ? "disabled" : ""}>${icon("chevronsLeft", 15)}</button><button class="icon-btn" data-job-page="previous" ${state.jobPage <= 1 ? "disabled" : ""}>${icon("chevronLeft", 15)}</button><button class="icon-btn" data-job-page="next" ${state.jobPage >= totalPages ? "disabled" : ""}>${icon("chevronRight", 15)}</button><button class="icon-btn" data-job-page="last" ${state.jobPage >= totalPages ? "disabled" : ""}>${icon("chevronsRight", 15)}</button></div></div>
   </section>`;
   const pageSize = root.querySelector("#job-page-size");
   if (pageSize) pageSize.value = String(state.jobPerPage);
+  renderRetentionButton();
 }
 
+function renderRetentionButton() {
+  const button = document.querySelector("#retention-open");
+  if (!button) return;
+  button.innerHTML = `${icon("sliders", 13)} Keeping ${escapeHtml(retentionLabel())}`;
+}
+
+function retentionLabel() {
+  const match = HISTORY_RETENTIONS.find(
+    ([value]) => value === String(state.historyKeepBlocks ?? ""),
+  );
+  return match ? match[1] : "last 5 blocks";
+}
+
+function openRetentionModal() {
+  openModal({
+    title: "History",
+    description: "",
+    size: "",
+    body: `<form id="retention-form" class="auto-declare">
+      ${HISTORY_RETENTIONS.map(
+        ([
+          value,
+          label,
+        ]) => `<label class="auto-declare-option ${String(state.historyKeepBlocks ?? "") === value ? "is-chosen" : ""}">
+          <input type="radio" name="keep_blocks" value="${escapeHtml(value)}" ${String(state.historyKeepBlocks ?? "") === value ? "checked" : ""} />
+          <span class="auto-declare-copy"><strong>${escapeHtml(label)}</strong></span>
+        </label>`,
+      ).join("")}
+      <p class="auto-declare-note">Older blocks are dropped as they fall outside this.</p>
+    </form>`,
+  });
+}
+
+const HISTORY_COLUMNS = 9;
+
+// History rows, grouped under the block each declaration was for.
 function renderJobRows() {
-  if (state.jobsLoading && !state.jobs.length) return '<tr><td colspan="7" class="empty-cell">Loading…</td></tr>';
-  if (!state.jobs.length) return '<tr><td colspan="7" class="empty-cell">No results.</td></tr>';
-  return state.jobs.map((job) => `<tr><td><strong>#${formatNumber(job.id)}</strong></td><td><code>${escapeHtml(job.template_id)}</code></td><td><span class="badge">CH-${escapeHtml(job.channel_id)}</span></td><td>${formatNumber(job.txid_count)}</td><td><span class="inline" style="gap:.35rem"><code>${escapeHtml(shortHash(job.mining_job_token))}</code><button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(job.mining_job_token)}" aria-label="Copy mining job token">${icon("copy", 13)}</button></span></td><td class="muted">${escapeHtml(formatDate(job.created_at))}</td><td><button class="btn ghost small" type="button" data-view-txids="${escapeHtml(job.template_id)}">${icon("eye", 14)} View TXIDs</button></td></tr>`).join("");
+  if (state.jobsLoading && !state.jobs.length)
+    return `<tr><td colspan="${HISTORY_COLUMNS}" class="empty-cell">Loading…</td></tr>`;
+  if (!state.jobs.length)
+    return `<tr><td colspan="${HISTORY_COLUMNS}" class="empty-cell">Nothing has been declared yet.</td></tr>`;
+
+  // Mark rows still live on the current tip.
+  const liveIds = new Set(
+    state.templates.map((template) => template.template_id),
+  );
+  const perBlock = new Map();
+  for (const job of state.jobs)
+    perBlock.set(job.height, (perBlock.get(job.height) || 0) + 1);
+
+  const rows = [];
+  let block;
+
+  state.jobs.forEach((job, index) => {
+    if (index === 0 || job.height !== block) {
+      block = job.height;
+      const inBlock = perBlock.get(block);
+      rows.push(`<tr class="hist-block"><td colspan="${HISTORY_COLUMNS}">
+        ${icon("layers", 13)}
+        <strong>${known(block) ? `Block ${formatNumber(block)}` : "Block not recorded"}</strong>
+        <span class="muted">${formatNumber(inBlock)} declaration${inBlock === 1 ? "" : "s"} on this page${known(block) ? "" : " · declared before the block was stored with it"}</span>
+      </td></tr>`);
+    }
+
+    const isInForce = Number(job.template_id) === state.activeDeclaration;
+    const isLive = liveIds.has(Number(job.template_id));
+    const fill = known(job.total_weight)
+      ? `${((job.total_weight / MAX_BLOCK_WEIGHT) * 100).toFixed(2)}%`
+      : '<span class="muted">—</span>';
+
+    rows.push(`<tr>
+      <td><strong>#${formatNumber(job.id)}</strong></td>
+      <td><span class="inline" style="gap:.35rem"><code>${escapeHtml(job.template_id)}</code>${
+        isInForce
+          ? `<span class="tplx-chip tplx-chip-declared" title="This is the declaration in use for the block being mined now">${icon("check", 10)} in use</span>`
+          : isLive
+            ? '<span class="tplx-chip" title="Still a candidate for the block being mined now">current block</span>'
+            : ""
+      }</span></td>
+      <td class="right">${known(job.total_fees_sat) ? formatBtc(job.total_fees_sat) : '<span class="muted">—</span>'}</td>
+      <td class="right">${formatNumber(job.txid_count)}</td>
+      <td class="right">${fill}</td>
+      <td><span class="badge">CH-${escapeHtml(job.channel_id)}</span></td>
+      <td><span class="inline" style="gap:.35rem"><code>${escapeHtml(shortHash(job.mining_job_token))}</code><button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(job.mining_job_token)}" aria-label="Copy mining job token">${icon("copy", 13)}</button></span></td>
+      <td class="muted">${escapeHtml(formatDate(job.created_at))}</td>
+      <td><button class="btn ghost small" type="button" data-view-txids="${escapeHtml(job.template_id)}">${icon("eye", 14)} View TXIDs</button></td>
+    </tr>`);
+  });
+
+  return rows.join("");
 }
 
 async function openJobTxids(templateId) {
-  openModal({ title: `Job TXIDs - Template ${templateId}`, description: "Transaction IDs included in this job declaration", size: "xlarge", body: '<div class="empty-cell" style="display:grid;place-items:center">Loading transaction IDs...</div>' });
+  openModal({
+    title: `Job TXIDs - Template ${templateId}`,
+    description: "Transaction IDs included in this job declaration",
+    size: "xlarge",
+    body: '<div class="empty-cell" style="display:grid;place-items:center">Loading transaction IDs...</div>',
+  });
   try {
-    const data = await envelopeRequest(`/api/job-txids/${encodeURIComponent(templateId)}`);
+    const data = await envelopeRequest(
+      `/api/job-txids/${encodeURIComponent(templateId)}`,
+    );
     const txids = data?.txids || [];
+    state.modalCopyText = txids.join("\n");
     openModal({
       title: `Job TXIDs - Template ${templateId}`,
       description: "Transaction IDs included in this job declaration",
       size: "xlarge",
       body: `<div class="detail-card"><h4>${icon("hash", 16)} Transaction Summary</h4><div class="details-grid">${detail("Template ID", data?.template_id ?? templateId)}${detail("Total TXIDs", data?.total ?? txids.length)}</div></div>
-      <div class="validation-head" style="margin:1rem 0"><span class="badge">${txids.length} Transaction${txids.length === 1 ? "" : "s"}</span><div class="button-row" style="gap:.5rem"><button class="btn small" type="button" data-copy="${escapeHtml(txids.join("\n"))}">${icon("copy", 14)} Copy All</button><button class="btn small" type="button" data-export-txids="${escapeHtml(templateId)}">${icon("download", 14)} Export CSV</button></div></div>
+      <div class="validation-head" style="margin:1rem 0"><span class="badge">${txids.length} Transaction${txids.length === 1 ? "" : "s"}</span><div class="button-row" style="gap:.5rem"><button class="btn small" type="button" data-action="copy-modal-text">${icon("copy", 14)} Copy All</button><button class="btn small" type="button" data-export-txids="${escapeHtml(templateId)}">${icon("download", 14)} Export CSV</button></div></div>
       <h4>Transaction IDs</h4><div class="txid-list">${txids.map((txid, index) => `<div class="txid-row"><span class="badge">${index + 1}</span><span class="txid-value" title="${escapeHtml(txid)}">${escapeHtml(txid)}</span><div class="button-row"><button class="icon-btn btn ghost" data-copy="${escapeHtml(txid)}" aria-label="Copy transaction ID">${icon("copy", 14)}</button><a class="icon-btn btn ghost" href="https://mempool.space/tx/${encodeURIComponent(txid)}" target="_blank" rel="noopener noreferrer" aria-label="View on mempool.space">${icon("external", 14)}</a></div></div>`).join("")}</div>`,
     });
-    document.querySelector("[data-export-txids]")?.addEventListener("click", () => downloadText(["txid", ...txids].join("\n"), `job-txids-${templateId}.csv`, "text/csv;charset=utf-8"), { once: true });
+    document
+      .querySelector("[data-export-txids]")
+      ?.addEventListener(
+        "click",
+        () =>
+          downloadText(
+            ["txid", ...txids].join("\n"),
+            `job-txids-${templateId}.csv`,
+            "text/csv;charset=utf-8",
+          ),
+        { once: true },
+      );
   } catch (error) {
-    openModal({ title: `Job TXIDs - Template ${templateId}`, description: "Transaction IDs included in this job declaration", body: `<div class="history-error">Error: ${escapeHtml(error.message)}</div>` });
+    openModal({
+      title: `Job TXIDs - Template ${templateId}`,
+      description: "Transaction IDs included in this job declaration",
+      body: `<div class="history-error">Error: ${escapeHtml(error.message)}</div>`,
+    });
   }
-}
-
-function renderSettings() {
-  const page = currentPageElement();
-  const settings = state.settings;
-  page.className = "page compact-top";
-  page.innerHTML = `<section class="page-header"><div><h1 class="page-title-row">${icon("settings", 32)} Dashboard Settings</h1><p class="page-description">Configure general dashboard preferences and settings</p></div><button class="btn" type="button" data-action="reset-settings">${icon("undo", 16)} Reset All Settings</button></section>
-  <section class="card settings-shell"><div class="settings-section-header"><h2 class="settings-section-title">${icon("user", 18)} General Preferences</h2><p class="settings-section-description">Customize dashboard behavior, notifications, and user interface preferences.</p></div>
-    <form id="general-settings-form">
-      <section class="card settings-group"><h3>UI Behavior</h3><p>Control how the dashboard behaves during transaction selection and job declarations</p>
-        ${settingsRow("auto_scroll_to_table", "Auto-scroll to table", "Automatically scroll to the transaction table when prompted", settings.auto_scroll_to_table)}
-        ${settingsRow("pause_on_selection", "Pause on selection", "Pause mempool updates when auto-selecting transactions", settings.pause_on_selection)}
-        ${settingsRow("clear_selection_on_job_declaration", "Clear selection on job declaration", "Automatically clear selected transactions after successful job declaration", settings.clear_selection_on_job_declaration)}
-      </section>
-      <section class="card settings-group"><h3>Notifications</h3><p>Configure when and how notifications are displayed</p>
-        ${settingsRow("show_notifications", "Show notifications", "Display toast notifications for events and status updates", settings.show_notifications)}
-      </section>
-      <section class="card settings-group"><h3>Settings Backup & Restore</h3><p>Export your settings for backup or import previously saved settings</p><div class="backup-actions"><button class="btn" type="button" data-action="export-settings">${icon("download", 16)} Export Settings</button><button class="btn" type="button" data-action="import-settings">${icon("upload", 16)} Import Settings</button><input id="settings-import" type="file" accept="application/json" hidden /></div></section>
-      <div class="settings-footer"><button class="btn primary" type="submit">Save Settings</button></div>
-    </form>
-  </section>`;
-}
-
-function settingsRow(name, title, description, checked) {
-  return `<div class="setting-row"><div class="setting-copy"><strong>${title}</strong><span>${description}</span></div>${switchControl(name, checked, title)}</div>`;
-}
-
-function collectGeneralSettings(form) {
-  const data = new FormData(form);
-  return {
-    auto_scroll_to_table: data.has("auto_scroll_to_table"),
-    pause_on_selection: data.has("pause_on_selection"),
-    clear_selection_on_job_declaration: data.has("clear_selection_on_job_declaration"),
-    show_notifications: data.has("show_notifications"),
-  };
-}
-
-function changeTablePage(action) {
-  const totalPages = Math.max(1, Math.ceil(filteredTransactions().length / state.tablePageSize));
-  if (action === "first") state.tablePage = 1;
-  else if (action === "previous") state.tablePage = Math.max(1, state.tablePage - 1);
-  else if (action === "next") state.tablePage = Math.min(totalPages, state.tablePage + 1);
-  else if (action === "last") state.tablePage = totalPages;
-  renderMempoolTable();
 }
 
 function changeJobPage(action) {
   const totalPages = Math.max(1, state.jobTotalPages || 1);
   if (action === "first") state.jobPage = 1;
-  else if (action === "previous") state.jobPage = Math.max(1, state.jobPage - 1);
-  else if (action === "next") state.jobPage = Math.min(totalPages, state.jobPage + 1);
+  else if (action === "previous")
+    state.jobPage = Math.max(1, state.jobPage - 1);
+  else if (action === "next")
+    state.jobPage = Math.min(totalPages, state.jobPage + 1);
   else if (action === "last") state.jobPage = totalPages;
   loadJobHistory();
 }
+
+async function copyWithToast(text) {
+  try {
+    await copyText(text);
+    toast("Copied to clipboard", "", "success", 2_000);
+  } catch (error) {
+    toast("Copy failed", error.message, "error");
+  }
+}
+
+// All click actions; `target` is the element carrying data-action.
+const CLICK_ACTIONS = {
+  "toggle-sidebar": () => {
+    const sidebar = document.querySelector("#sidebar");
+    if (window.innerWidth < 768) sidebar.classList.toggle("mobile-open");
+    else sidebar.classList.toggle("expanded");
+  },
+  "toggle-mode": () => {
+    state.mode = state.mode === "dark" ? "light" : "dark";
+    localStorage.setItem("demand-mode", state.mode);
+    applyAppearance();
+  },
+  // Backdrop clicks close; clicks inside the dialog do not, unless on a close button.
+  "close-modal": (event, target) => {
+    if (!event.target.closest("[data-modal-panel]") || target.closest("button"))
+      closeModal();
+  },
+  "close-panel": (event, target) => {
+    if (!event.target.closest("[data-panel]") || target.closest("button"))
+      closePanel();
+  },
+  "refresh-history": () => loadJobHistory(),
+  "open-retention": () => openRetentionModal(),
+  "clear-history": () => openClearHistoryModal(),
+  "confirm-clear-history": () => clearJobHistory(),
+  "refresh-templates": () => loadTemplates(),
+  "open-prioritize": () => openPrioritizePanel(),
+  "open-auto-declare": () => openAutoDeclareModal(),
+  "copy-modal-text": () => copyWithToast(state.modalCopyText),
+  "toggle-sort-direction": () => {
+    state.templateSort = {
+      ...state.templateSort,
+      direction: state.templateSort.direction === "desc" ? "asc" : "desc",
+    };
+    renderTemplatesSection();
+  },
+  "filter-logs": (event, target) => {
+    state.logFilter = target.dataset.logFilter;
+    renderLogs();
+  },
+  "filter-templates": (event, target) => {
+    state.templateFilter = target.dataset.filter;
+    renderTemplatesSection();
+  },
+};
 
 document.addEventListener("click", async (event) => {
   const nav = event.target.closest("[data-nav]");
@@ -1224,132 +1004,60 @@ document.addEventListener("click", async (event) => {
     navigate(nav.dataset.nav);
     return;
   }
+
+  // Actions win over opening: the declare button sits *inside* a template pad that
+  // is itself clickable.
   const actionTarget = event.target.closest("[data-action]");
   if (actionTarget) {
-    const action = actionTarget.dataset.action;
-    if (action === "toggle-sidebar") {
-      const sidebar = document.querySelector("#sidebar");
-      if (window.innerWidth < 768) sidebar.classList.toggle("mobile-open");
-      else sidebar.classList.toggle("expanded");
-    } else if (action === "toggle-mode") {
-      state.mode = state.mode === "dark" ? "light" : "dark";
-      localStorage.setItem("demand-mode", state.mode);
-      applyAppearance();
-    } else if (action === "close-modal" && (!event.target.closest("[data-modal-panel]") || actionTarget.closest("button"))) {
-      closeModal();
-    } else if (action === "open-stats") await openDetailedStats();
-    else if (action === "toggle-pause") { state.paused = !state.paused; renderOverview(); }
-    else if (action === "run-auto") await runAutoSelection();
-    else if (action === "open-auto-settings") openAutoSelectionSettings();
-    else if (action === "open-selection-summary") openSelectionSummary();
-    else if (action === "clear-selection") { state.selected.clear(); renderMempoolTable(); updateSelectionUI(); closeModal(); }
-    else if (action === "declare-job") await declareJob();
-    else if (action === "refresh-history") loadJobHistory();
-    else if (action === "reset-settings") {
-      state.settings = { ...DEFAULT_SETTINGS };
-      await saveSettings(state.settings, "Settings reset");
-      renderSettings();
-    } else if (action === "export-settings") {
-      downloadText(JSON.stringify(state.settings, null, 2), `demand-dashboard-settings-${new Date().toISOString().slice(0, 10)}.json`, "application/json");
-    } else if (action === "import-settings") document.querySelector("#settings-import")?.click();
-    else if (action === "clear-filter") {
-      state.filters[actionTarget.dataset.filterKey] = actionTarget.dataset.filterKey === "depends" ? "" : null;
-      closeModal();
-      renderOverview();
-    }
+    await CLICK_ACTIONS[actionTarget.dataset.action]?.(event, actionTarget);
+    return;
   }
-  const filter = event.target.closest("[data-filter]");
-  if (filter) openFilterModal(filter.dataset.filter);
-  const tablePage = event.target.closest("[data-table-page]");
-  if (tablePage) changeTablePage(tablePage.dataset.tablePage);
+
   const jobPage = event.target.closest("[data-job-page]");
-  if (jobPage) changeJobPage(jobPage.dataset.jobPage);
+  if (jobPage) return changeJobPage(jobPage.dataset.jobPage);
+
   const viewTxids = event.target.closest("[data-view-txids]");
-  if (viewTxids) openJobTxids(viewTxids.dataset.viewTxids);
+  if (viewTxids) return openJobTxids(viewTxids.dataset.viewTxids);
+
   const copy = event.target.closest("[data-copy]");
-  if (copy) {
-    try { await copyText(copy.dataset.copy); toast("Copied to clipboard", "", "success", 2_000); }
-    catch (error) { toast("Copy failed", error.message, "error"); }
-  }
-  const statsTab = event.target.closest("[data-stats-tab]");
-  if (statsTab) {
-    document.querySelectorAll("[data-stats-tab]").forEach((tab) => tab.classList.toggle("active", tab === statsTab));
-    document.querySelector("#stats-tab-panel").innerHTML = statsTabContent(statsTab.dataset.statsTab);
-  }
+  if (copy) return copyWithToast(copy.dataset.copy);
+
+  const opener = event.target.closest("[data-template-open]");
+  if (opener) openTemplateTransactions(Number(opener.dataset.templateOpen));
 });
 
 document.addEventListener("change", async (event) => {
   const target = event.target;
-  if (target.id === "theme-select") {
-    state.theme = target.value;
-    localStorage.setItem("demand-theme", state.theme);
-    applyAppearance();
-  } else if (target.id === "view-control") {
-    state.tableView = target.value;
-    renderMempoolTable();
-  } else if (target.id === "sort-control") {
-    [state.sort.key, state.sort.direction] = target.value.split(":");
-    renderMempoolTable();
-  } else if (target.id === "table-page-size") {
-    state.tablePageSize = Number(target.value);
-    state.tablePage = 1;
-    renderMempoolTable();
+  if (target.name === "policy" && target.closest("#auto-declare-form")) {
+    await saveDeclarationPolicy(target.value);
+  } else if (target.id === "template-sort") {
+    // Switching sort resets the direction to descending.
+    state.templateSort = { key: target.value, direction: "desc" };
+    renderTemplatesSection();
+  } else if (
+    target.name === "keep_blocks" &&
+    target.closest("#retention-form")
+  ) {
+    await saveHistoryRetention(target.value);
   } else if (target.id === "job-page-size") {
     state.jobPerPage = Number(target.value);
     state.jobPage = 1;
     loadJobHistory();
-  } else if (target.matches("[data-tx-select]")) {
-    if (target.checked) state.selected.add(target.dataset.txSelect);
-    else state.selected.delete(target.dataset.txSelect);
-    renderMempoolTable();
-    updateSelectionUI();
-  } else if (target.matches('[data-action="select-page"]')) {
-    const rows = filteredTransactions().slice((state.tablePage - 1) * state.tablePageSize, state.tablePage * state.tablePageSize);
-    rows.forEach((row) => target.checked ? state.selected.add(row.txid) : state.selected.delete(row.txid));
-    renderMempoolTable();
-    updateSelectionUI();
-  } else if (target.name === "periodic_enabled") {
-    const wrapper = document.querySelector("#periodic-interval-wrap");
-    if (wrapper) wrapper.style.display = target.checked ? "flex" : "none";
-  } else if (target.id === "settings-import" && target.files?.[0]) {
-    try {
-      const imported = JSON.parse(await target.files[0].text());
-      const allowed = Object.keys(DEFAULT_SETTINGS);
-      const sanitized = Object.fromEntries(Object.entries(imported).filter(([key]) => allowed.includes(key)));
-      await saveSettings({ ...state.settings, ...sanitized }, "Settings imported");
-      renderSettings();
-    } catch (error) {
-      toast("Import failed", "The selected file is not valid dashboard settings JSON.", "error");
-    }
-  }
-});
-
-document.addEventListener("input", (event) => {
-  if (event.target.id === "tx-search") {
-    state.search = event.target.value;
-    state.tablePage = 1;
-    renderMempoolTable();
   }
 });
 
 document.addEventListener("submit", async (event) => {
-  if (event.target.id === "filter-form") {
+  if (event.target.id === "prio-panel-form") {
     event.preventDefault();
-    const key = event.submitter?.dataset.filterKey;
-    const value = event.target.querySelector("#filter-value").value.trim();
-    state.filters[key] = key === "depends" ? value : value === "" ? null : Number(value);
-    state.tablePage = 1;
-    closeModal();
-    renderOverview();
-  } else if (event.target.id === "auto-settings-form") {
-    event.preventDefault();
-    await saveSettings(formSettings(event.target), "Auto-selection settings saved");
-    closeModal();
-    if (state.route === "/dashboard/overview") renderOverview();
-  } else if (event.target.id === "general-settings-form") {
-    event.preventDefault();
-    await saveSettings(collectGeneralSettings(event.target));
-    renderSettings();
+    const data = new FormData(event.target);
+    const token = String(data.get("token") || "").trim();
+    if (token) {
+      state.prioritizedToken = token;
+      localStorage.setItem("demand-tx-token", token);
+    }
+    const hex = String(data.get("tx") || "").trim();
+    if (hex) await prioritizeTransaction(hex);
+    return;
   }
 });
 
@@ -1360,23 +1068,894 @@ window.addEventListener("popstate", () => {
 });
 
 window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeModal();
+  if (event.key === "Escape") {
+    closeModal();
+    closePanel();
+    return;
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
     event.preventDefault();
     document.querySelector('[data-action="toggle-sidebar"]')?.click();
+    return;
   }
+  // Enter/Space opens a focused template pad; buttons already handle these keys.
+  if (event.key !== "Enter" && event.key !== " ") return;
+  if (event.target.tagName === "BUTTON") return;
+  const card = event.target.closest?.("[data-template-open]");
+  if (!card) return;
+  event.preventDefault();
+  openTemplateTransactions(Number(card.dataset.templateOpen));
 });
 
+function currentTemplate() {
+  return state.templates[0] || null;
+}
+
+// Single-flight: concurrent callers share the running request; one more runs after
+// if anything asked meanwhile. Also prevents stale overwrites.
+let templatesRequest = null;
+let templatesRequestedAgain = false;
+
+function loadTemplates() {
+  if (templatesRequest) {
+    templatesRequestedAgain = true;
+    return templatesRequest;
+  }
+  templatesRequest = fetchTemplates().finally(() => {
+    templatesRequest = null;
+    if (templatesRequestedAgain) {
+      templatesRequestedAgain = false;
+      loadTemplates();
+    }
+  });
+  return templatesRequest;
+}
+
+async function fetchTemplates() {
+  try {
+    const payload = await envelopeRequest("/api/templates/recent");
+    state.templates = payload?.templates || [];
+    state.templatesCandidateLimit = payload?.candidate_limit ?? null;
+    state.policy = payload?.policy ?? state.policy;
+    state.policyPick = payload?.policy_pick ?? null;
+    state.activeDeclaration = payload?.active_declaration ?? null;
+    state.templatesError = null;
+    noticeNewBlock();
+    noticeNewTemplate();
+  } catch (error) {
+    state.templates = [];
+    state.templatesError = error.message;
+  }
+  state.templatesLoaded = true;
+  renderTemplatesSection();
+  // The history page marks live candidates from this payload.
+  if (state.route === "/dashboard/job-history") renderJobHistoryContent();
+}
+
+function noticeNewTemplate() {
+  const newest = currentTemplate()?.template_id ?? null;
+  if (!known(newest) || newest === state.newestTemplateId) return;
+  const first = state.newestTemplateId === null;
+  state.newestTemplateId = newest;
+  if (first) return;
+  const message = `Template ${formatNumber(newest)} is ready to be declared`;
+  toast("New template", message);
+  addLog("NewTemplate", "INFO", message);
+}
+
+function noticeNewBlock() {
+  const height = currentTemplate()?.height ?? null;
+  if (!known(height) || height === state.blockHeight) return;
+
+  const previous = state.blockHeight;
+  state.blockHeight = height;
+  state.blockSeenAt = Math.floor(Date.now() / 1000);
+
+  // The first block seen after a page load is not news.
+  if (previous === null) return;
+
+  const gained = height - previous;
+  const message =
+    gained === 1
+      ? `Block ${formatNumber(previous)} was mined. Templates for ${formatNumber(height)} start now.`
+      : `The tip moved from block ${formatNumber(previous)} to ${formatNumber(height)}.`;
+  toast("New block", message, "success", 8_000);
+  addLog("NewBlock", "INFO", message);
+}
+
+function templateKind(template) {
+  return template.future_template
+    ? {
+        label: "New block",
+        hint: "New block: Template provider built for the next block because the previous one was mined.",
+      }
+    : {
+        label: "Higher fees",
+        hint: "Same tip: Template provider rebuilt because mempool fees rose past the set -sv2feedelta threshold.",
+      };
+}
+
+function formatBtc(sats) {
+  return (sats / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function relativeAge(seconds) {
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3_600)}h ago`;
+}
+
+// Update the controls in place, then redraw the ribbon.
+function renderTemplatesSection() {
+  if (state.route !== "/dashboard/overview") return;
+
+  const policy = document.querySelector("#auto-declare-open");
+  if (policy) {
+    policy.innerHTML = `${icon("sliders", 15)} Auto declare: ${escapeHtml(criterionLabel(state.policy))}`;
+    policy.title = policyCopy(state.policy);
+  }
+
+  // Patch the open dialog rather than redrawing it.
+  const pick = document.querySelector("#auto-declare-pick");
+  if (pick) pick.innerHTML = autoDeclarePickHtml();
+
+  const sort = document.querySelector("#template-sort");
+  if (sort && sort.value !== state.templateSort.key)
+    sort.value = state.templateSort.key;
+
+  const direction = document.querySelector("#sort-direction");
+  if (direction) {
+    const label = sortDirectionLabel(
+      activeSort(),
+      state.templateSort.direction,
+    );
+    direction.innerHTML = `${icon("sort", 13)} ${escapeHtml(label)}`;
+    direction.title = "Click for the other direction";
+  }
+
+  const filters = document.querySelector("#template-filters");
+  if (filters) filters.innerHTML = renderTemplateFilters();
+
+  renderTemplateCandidates();
+}
+
+function renderTemplateFilters() {
+  const kinds = [
+    [
+      "all",
+      "All",
+      state.templates.length,
+      "Every candidate held for this block.",
+    ],
+    [
+      "future",
+      "New block",
+      state.templates.filter((template) => template.future_template).length,
+      "The first template for this block",
+    ],
+    [
+      "rebuild",
+      "Higher fees",
+      state.templates.filter((template) => !template.future_template).length,
+      "Same tip: Template provider rebuilt because mempool fees rose past the set -sv2feedelta threshold.",
+    ],
+  ];
+
+  // Hide the chips when only one kind is present.
+  if (kinds.filter(([, , count]) => count > 0).length < 3) return "";
+
+  return (
+    `<span class="policy-label">Show</span>` +
+    kinds
+      .map(
+        ([
+          key,
+          label,
+          count,
+          hint,
+        ]) => `<button class="filter-chip small ${state.templateFilter === key ? "active" : ""}"
+        type="button" data-action="filter-templates" data-filter="${key}" ${count ? "" : "disabled"}
+        title="${escapeHtml(hint)}">${escapeHtml(label)} <span class="filter-count">${formatNumber(count)}</span></button>`,
+      )
+      .join("")
+  );
+}
+
+async function saveDeclarationPolicy(policy) {
+  const previous = state.policy;
+  state.policy = policy;
+  renderTemplatesSection();
+  refreshAutoDeclareModal();
+  try {
+    const result = await envelopeRequest("/api/declaration-policy", {
+      method: "POST",
+      body: JSON.stringify({ policy }),
+    });
+    toast(
+      "Declaration criterion set",
+      `${criterionLabel(policy)}.`,
+      "success",
+      3_500,
+    );
+    addLog(
+      "DeclarationPolicy",
+      "INFO",
+      `Declaration criterion set to "${policy}"`,
+    );
+    await loadTemplates();
+  } catch (error) {
+    state.policy = previous;
+    toast("Could not change the criterion", error.message, "error");
+    renderTemplatesSection();
+  }
+  refreshAutoDeclareModal();
+}
+
+function autoDeclarePickHtml() {
+  if (!state.policyPick) {
+    return '<span class="muted">no candidate to pick from yet</span>';
+  }
+  return `${escapeHtml(criterionLabel(state.policy))} is <strong>#${formatNumber(state.policyPick)}</strong> right now`;
+}
+
+function openAutoDeclareModal() {
+  openModal({
+    title: "Auto declare",
+    description:
+      "Which criterion to use when declaring automatically on each new template.",
+    size: "",
+    body: `<form id="auto-declare-form" class="auto-declare">
+      ${POLICIES.map(
+        (
+          option,
+        ) => `<label class="auto-declare-option ${state.policy === option.key ? "is-chosen" : ""}">
+          <input type="radio" name="policy" value="${escapeHtml(option.key)}" ${state.policy === option.key ? "checked" : ""} />
+          <span class="auto-declare-copy">
+            <strong>${escapeHtml(option.label)}</strong>
+            <span>${escapeHtml(option.copy)}</span>
+          </span>
+        </label>`,
+      ).join("")}
+      <p class="auto-declare-pick" id="auto-declare-pick">${autoDeclarePickHtml()}</p>
+    </form>`,
+  });
+}
+
+// Patch the open dialog; rebuilding would steal focus mid-choice.
+function refreshAutoDeclareModal() {
+  const form = document.querySelector("#auto-declare-form");
+  if (!form) return;
+  form.querySelectorAll(".auto-declare-option").forEach((option) => {
+    const input = option.querySelector("input");
+    const chosen = input.value === state.policy;
+    option.classList.toggle("is-chosen", chosen);
+    input.checked = chosen;
+  });
+  const pick = form.querySelector("#auto-declare-pick");
+  if (pick) pick.innerHTML = autoDeclarePickHtml();
+}
+
+// The candidate ribbon.
+function renderTemplateCandidates() {
+  const root = document.querySelector("#tplx-root");
+  if (!root) return;
+
+  const now = Math.floor(Date.now() / 1000);
+  const current = currentTemplate();
+  const declared =
+    state.templates.find(
+      (candidate) => candidate.template_id === state.activeDeclaration,
+    ) || null;
+
+  const facts = document.querySelector("#block-facts");
+  if (facts) facts.innerHTML = renderBlockContext(current, declared, now);
+
+  if (!state.templatesLoaded) {
+    root.innerHTML = `<div class="tplx-empty">Loading templates…</div>`;
+    return;
+  }
+  if (state.templatesError) {
+    root.innerHTML = `<div class="tplx-empty">Could not load templates: ${escapeHtml(state.templatesError)}</div>`;
+    return;
+  }
+  if (!state.templates.length) {
+    // Usually means a block was just found.
+    root.innerHTML = `<div class="tplx-empty">
+      <strong>No candidate for the current block yet.</strong><br />
+    </div>`;
+    return;
+  }
+
+  const sort = activeSort();
+  const shown = sortedTemplates(sort);
+
+  root.innerHTML = shown.length
+    ? `<div class="tplx-ribbon">${shown
+        .map((template) => renderPaper(template, { declared, sort, now }))
+        .join("")}</div>`
+    : `<div class="tplx-empty">No candidate matches this filter.</div>`;
+}
+
+// Block facts. Workers hash the newest template while its declaration settles, so
+// "declared" and "hashing" can differ by design.
+function renderBlockContext(current, declared, now) {
+  const inSync = !declared || declared.template_id === current?.template_id;
+  const oldest = state.templates[state.templates.length - 1];
+  const feeGain =
+    state.templates.length > 1 &&
+    known(current?.total_fees_sat) &&
+    known(oldest?.total_fees_sat)
+      ? current.total_fees_sat - oldest.total_fees_sat
+      : null;
+
+  // Mark a block found in the last half minute.
+  const fresh =
+    known(state.blockSeenAt) &&
+    now - state.blockSeenAt < 30 &&
+    known(state.blockHeight);
+
+  const rows = [
+    [
+      "Block",
+      known(current?.height ?? state.blockHeight)
+        ? `${formatNumber(current?.height ?? state.blockHeight)}${fresh ? ' <span class="tplx-chip tplx-chip-new">new</span>' : ""}`
+        : "unknown",
+      fresh ? "is-up" : "",
+      fresh
+        ? "The tip moved within the last half minute; these candidates are all for the new block."
+        : "Decoded from the coinbase prefix, as BIP34 requires.",
+    ],
+    [
+      "Declared",
+      declared ? `#${formatNumber(declared.template_id)}` : "nothing yet",
+      declared ? "is-up" : "",
+      declared
+        ? "The declaration the pool has accepted; shares are accounted against this set."
+        : "No transaction set of ours is being accounted against for this block yet.",
+    ],
+    [
+      "Workers hashing",
+      current ? `#${formatNumber(current.template_id)}` : "—",
+      inSync ? "" : "is-warn",
+      inSync
+        ? "The accepted declaration and the newest template agree."
+        : "The newest template is already with the miners; its declaration is still settling.",
+    ],
+    [
+      "Fees gained",
+      feeGain === null
+        ? "—"
+        : `${feeGain > 0 ? "+" : ""}${formatBtc(feeGain)} BTC`,
+      feeGain !== null && feeGain > 0 ? "is-up" : "",
+      "Across every rebuild template has sent for this block.",
+    ],
+    [
+      "Newest arrived",
+      current ? relativeAge(Math.max(0, now - current.received_at)) : "—",
+      "",
+      "Template provider send a new one if the fees rose past -sv2feedelta or the previous one was mined.",
+    ],
+    [
+      "Auto declare Criterion",
+      escapeHtml(criterionLabel(state.policy)),
+      "",
+      `${policyCopy(state.policy)}${
+        state.policyPick
+          ? ` As it stands that is template ${state.policyPick}, which changes with every rebuild sv2-tp sends.`
+          : ""
+      }`,
+    ],
+  ];
+
+  return `<div class="tplx-facts">
+    ${rows
+      .map(
+        ([
+          label,
+          value,
+          valueClass,
+          hint,
+        ]) => `<span class="tplx-fact" title="${escapeHtml(hint)}">
+          <span class="tplx-fact-label">${escapeHtml(label)}</span>
+          <span class="tplx-fact-value ${valueClass}">${value}</span>
+        </span>`,
+      )
+      .join("")}
+  </div>`;
+}
+
+// Scroll artwork: a 512-square icon silhouette; the page and dowel are drawn again
+// underneath in their own colours.
+const SCROLL_PAGE_PATH =
+  "M86 11H444C442 16 441 21 441 26V278L420 307L441 336V423H71V366L91 337L71 308V162L91 133L71 104V26C71 18 78 11 86 11Z";
+const SCROLL_DOWEL_PATH =
+  "M45 437H371A30 30 0 0 1 401 467A30 30 0 0 1 371 497H45A30 30 0 0 1 15 467A30 30 0 0 1 45 437Z";
+const SCROLL_TOP_ROLL_HOLE = "M497 45A30 30 0 1 1 437 45A30 30 0 1 1 497 45Z";
+const SCROLL_BOTTOM_ROLL_HOLE =
+  "M437 467A30 30 0 1 1 377 467A30 30 0 1 1 437 467Z";
+const SCROLL_BODY_PATH = `M105 0H467C492 0 512 20 512 45C512 70 492 90 467 90C462 90 457 89 452 87V292L436 307L452 322V467C452 492 432 512 407 512H45C20 512 0 492 0 467C0 442 20 422 45 422H60V353L76 337L60 321V149L76 133L60 117V45C60 20 80 0 105 0Z ${SCROLL_PAGE_PATH} ${SCROLL_DOWEL_PATH} ${SCROLL_TOP_ROLL_HOLE} ${SCROLL_BOTTOM_ROLL_HOLE}`;
+const SCROLL_ROLL_PATH = `M452 467A45 45 0 1 1 362 467A45 45 0 1 1 452 467Z ${SCROLL_BOTTOM_ROLL_HOLE}`;
+
+function scrollFrame() {
+  return `<svg class="scroll-svg" viewBox="0 0 512 512" preserveAspectRatio="none" aria-hidden="true">
+    <path class="scroll-page" d="${SCROLL_PAGE_PATH}" />
+    <path class="scroll-dowel" d="${SCROLL_DOWEL_PATH}" />
+    <path class="scroll-ink" fill-rule="evenodd" d="${SCROLL_BODY_PATH}" />
+    <path class="scroll-ink" fill-rule="evenodd" d="${SCROLL_ROLL_PATH}" />
+  </svg>`;
+}
+
+// One template, drawn as a scroll.
+function renderPaper(template, { declared, sort, now }) {
+  const isDeclared = declared?.template_id === template.template_id;
+  const kind = templateKind(template);
+  const fill = Math.min(100, (template.total_weight / MAX_BLOCK_WEIGHT) * 100);
+  const rate = templateFeeRate(template);
+  const age = Math.max(0, now - template.received_at);
+  const delta =
+    sort.key !== "received" && declared && !isDeclared
+      ? deltaPercent(sort.value(template), sort.value(declared))
+      : null;
+
+  // Sortable metrics first; the active sort is marked.
+  const metrics = [
+    [
+      "highest_fees",
+      known(template.total_fees_sat) ? formatBtc(template.total_fees_sat) : "—",
+      "BTC in fees",
+    ],
+    ["block_weight", `${fill.toFixed(2)}%`, "of block weight"],
+    ["fee_rate", known(rate) ? rate.toFixed(2) : "—", "sat/vB"],
+    ["tx_count", formatNumber(template.tx_count), "transactions"],
+  ];
+
+  return `<article class="scroll ${isDeclared ? "is-declared" : ""}"
+      data-template-open="${escapeHtml(template.template_id)}"
+      tabindex="0" role="button" aria-label="Show the transactions in template ${escapeHtml(template.template_id)}"
+      title="${escapeHtml(kind.hint)} ${formatNumber(template.tx_count)} transactions, ${formatNumber(template.total_weight)} WU.">
+    ${scrollFrame()}
+    <div class="scroll-content">
+      <div class="p3-head">
+        <span class="p3-id">#${formatNumber(template.template_id)}${templateMark(template, declared)}</span>
+        <span class="p3-kind ${template.future_template ? "is-block" : ""}">${escapeHtml(kind.label)}</span>
+      </div>
+      <div class="p3-metrics">
+        ${metrics
+          .map(
+            ([
+              key,
+              value,
+              unit,
+            ]) => `<span class="p3-metric ${key === sort.key ? "is-sort" : ""}">
+              <span>${escapeHtml(value)}</span><span class="p3-metric-unit">${escapeHtml(unit)}</span>
+            </span>`,
+          )
+          .join("")}
+      </div>
+      ${
+        (template.prioritized_included || []).length
+          ? `<span class="p3-prio" title="${formatNumber(template.prioritized_included.length)} transaction${template.prioritized_included.length === 1 ? "" : "s"} you asked bitcoind to prioritise ${template.prioritized_included.length === 1 ? "is" : "are"} in this template">${icon("pin", 10)} ${formatNumber(template.prioritized_included.length)} prioritised</span>`
+          : ""
+      }
+      ${
+        known(delta)
+          ? `<span class="p3-delta ${delta > 0.005 ? "is-up" : ""}" title="${delta > 0 ? "beats" : delta < 0 ? "falls short of" : "matches"} the declared template on ${escapeHtml(sort.label.toLowerCase())} by ${Math.abs(delta).toFixed(2)}%">${delta > 0 ? "+" : delta < 0 ? "−" : ""}${Math.abs(delta).toFixed(2)}% more than declared</span>`
+          : `<span class="p3-delta"></span>`
+      }
+      <div class="p3-foot">
+        <span>${escapeHtml(relativeAge(age))}</span>
+        ${isDeclared ? `<span class="tplx-in-force">${icon("check", 11)} declared</span>` : ""}
+      </div>
+      ${isDeclared ? '<span class="scroll-stamp">declared</span>' : ""}
+    </div>
+  </article>`;
+}
+
+function templateMark(template, declared) {
+  if (declared?.template_id === template.template_id) {
+    return `<span class="tplx-row-mark" title="The declaration the pool has accepted">${icon("check", 11)}</span>`;
+  }
+  if (template.template_id === currentTemplate()?.template_id) {
+    return `<span class="tplx-row-mark is-hashing" title="The newest template — the workers are already hashing this one">${icon("activity", 11)}</span>`;
+  }
+  return "";
+}
+
+function activeSort() {
+  return (
+    TEMPLATE_SORTS.find((option) => option.key === state.templateSort.key) ||
+    TEMPLATE_SORTS[0]
+  );
+}
+
+function sortDirectionLabel(sort, direction) {
+  if (sort.key === "received")
+    return direction === "desc" ? "newest first" : "oldest first";
+  return direction === "desc" ? "highest first" : "lowest first";
+}
+
+// Unscorable candidates go last; ties keep arrival order.
+function sortedTemplates(sort) {
+  const direction = state.templateSort.direction === "asc" ? 1 : -1;
+  return state.templates
+    .filter(matchesTemplateFilter)
+    .map((template, index) => ({ template, index }))
+    .sort((left, right) => {
+      const leftValue = sort.value(left.template);
+      const rightValue = sort.value(right.template);
+      if (!known(leftValue) || !known(rightValue)) {
+        if (known(leftValue)) return -1;
+        if (known(rightValue)) return 1;
+        return left.index - right.index;
+      }
+      if (leftValue !== rightValue) return (leftValue - rightValue) * direction;
+      return left.index - right.index;
+    })
+    .map((entry) => entry.template);
+}
+
+function matchesTemplateFilter(template) {
+  if (state.templateFilter === "future") return template.future_template;
+  if (state.templateFilter === "rebuild") return !template.future_template;
+  return true;
+}
+
+// A candidate's metric against the declared template's, in percent.
+function deltaPercent(value, baseline) {
+  if (!known(value) || !known(baseline) || baseline === 0) return null;
+  return ((value - baseline) / baseline) * 100;
+}
+
+// Average fee rate in sat/vB (vsize = weight / 4).
+function templateFeeRate(template) {
+  if (!known(template.total_fees_sat) || !template.total_weight) return null;
+  return template.total_fees_sat / (template.total_weight / 4);
+}
+
+function criterionLabel(key) {
+  return POLICIES.find((policy) => policy.key === key)?.label || key;
+}
+
+// Right-side panel, for tasks rather than reading.
+function openPanel({ title, description = "", body = "", footer = "" }) {
+  const root = document.querySelector("#panel-root");
+  root.innerHTML = `<div class="panel-overlay" data-action="close-panel">
+    <section class="panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}" data-panel>
+      <header class="panel-head">
+        <div>
+          <h2 class="panel-title">${escapeHtml(title)}</h2>
+          ${description ? `<p class="panel-description">${escapeHtml(description)}</p>` : ""}
+        </div>
+        <button class="panel-close" type="button" data-action="close-panel" aria-label="Close">${icon("x", 20)}</button>
+      </header>
+      <div class="panel-body">${body}</div>
+      ${footer ? `<footer class="panel-foot">${footer}</footer>` : ""}
+    </section>
+  </div>`;
+  requestAnimationFrame(() =>
+    root.querySelector("input, textarea, button")?.focus(),
+  );
+}
+
+function closePanel() {
+  const root = document.querySelector("#panel-root");
+  if (root) root.innerHTML = "";
+}
+
+// Prioritise a transaction; asks for the API_TX_TOKEN first when unset.
+function openPrioritizePanel() {
+  const needsToken = !state.prioritizedToken;
+  openPanel({
+    title: "Prioritise a transaction",
+    body: `${renderPrioritizedList()}
+      <form id="prio-panel-form" class="panel-form">
+        ${
+          needsToken
+            ? `<label class="panel-field">
+                <span class="panel-label">API token <span class="muted">required</span></span>
+                <input class="panel-input" type="password" name="token" placeholder="API_TX_TOKEN" autocomplete="off" required />
+                <span class="panel-hint">The proxy's own <code>API_TX_TOKEN</code>. Kept in this browser and sent only to this proxy.</span>
+              </label>`
+            : ""
+        }
+        <label class="panel-field">
+          <span class="panel-label">Raw transaction <span class="muted">hex</span></span>
+          <textarea class="panel-input panel-textarea" name="tx" rows="7" spellcheck="false" autocomplete="off" placeholder="0200000001..." required></textarea>
+        </label>
+        ${state.prioritizedError ? `<p class="tplx-note is-error">${escapeHtml(state.prioritizedError)}</p>` : ""}
+      </form>`,
+    footer: `<button class="btn pill" type="button" data-action="close-panel">Cancel</button>
+      <button class="btn pill primary panel-submit" type="submit" form="prio-panel-form" ${state.prioritizing ? "disabled" : ""}>${state.prioritizing ? "Sending…" : "Prioritise transaction"}</button>`,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Prioritised transactions. The fee delta affects the template bitcoind builds
+// *next*. Endpoints authenticate with API_TX_TOKEN, kept in this browser only.
+// ---------------------------------------------------------------------------
+
+// "Not in a candidate yet" is the normal first state.
+function renderPrioritizedList() {
+  if (!state.prioritizedToken) return "";
+
+  const carriers = new Map();
+  for (const template of state.templates) {
+    for (const txid of template.prioritized_included || []) {
+      if (!carriers.has(txid)) carriers.set(txid, []);
+      carriers.get(txid).push(template.template_id);
+    }
+  }
+
+  if (!state.prioritized.length) {
+    return `<section class="panel-section"><h3 class="panel-section-title">Currently prioritised</h3>
+      <p class="panel-hint">No prioritised transactions yet</p></section>`;
+  }
+
+  return `<section class="panel-section">
+    <h3 class="panel-section-title">Currently prioritised <span class="muted">${formatNumber(state.prioritized.length)}</span></h3>
+    <ul class="prio-list">${state.prioritized
+      .map((tx) => {
+        const inTemplates = carriers.get(tx.txid) || [];
+        return `<li class="prio-row">
+          <span class="inline" style="gap:.3rem">
+            <code title="${escapeHtml(tx.txid)}">${escapeHtml(shortHash(tx.txid, 8, 6))}</code>
+            <button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(tx.txid)}" aria-label="Copy transaction ID">${icon("copy", 12)}</button>
+          </span>
+          <span class="prio-fee" title="The fee bitcoind sees for it: its own, then the one the delta gives it">${escapeHtml(formatBtcFee(tx.tx_fee?.real))} → <strong>${escapeHtml(formatBtcFee(tx.tx_fee?.modified))}</strong></span>
+          <span class="prio-in">${
+            inTemplates.length
+              ? `<span class="tplx-chip tplx-chip-prio" title="Candidates that carry it">${icon("check", 10)} ${inTemplates.map((id) => `#${formatNumber(id)}`).join(" ")}</span>`
+              : '<span class="muted">not in a candidate yet</span>'
+          }</span>
+        </li>`;
+      })
+      .join("")}</ul>
+  </section>`;
+}
+
+// The RPC reports fees in BTC; show sats.
+function formatBtcFee(btc) {
+  if (!known(btc)) return "—";
+  return `${Number(btc).toFixed(8).replace(/0+$/, "").replace(/\.$/, "")} BTC`;
+}
+
+function updatePrioritizeButton() {
+  const button = document.querySelector("#prio-open");
+  if (button) button.hidden = state.prioritizationEnabled !== true;
+}
+
+async function loadPrioritized() {
+  if (state.prioritizationEnabled === null) {
+    try {
+      const capabilities = await envelopeRequest("/api/capabilities");
+      state.prioritizationEnabled = Boolean(
+        capabilities?.transaction_prioritization,
+      );
+    } catch (error) {
+      state.prioritizationEnabled = false;
+    }
+  }
+  updatePrioritizeButton();
+  if (!state.prioritizationEnabled || !state.prioritizedToken) return;
+  try {
+    const data = await envelopeRequest("/api/tx/prioritized", {
+      headers: { Authorization: `Bearer ${state.prioritizedToken}` },
+    });
+    state.prioritized = data?.txs || [];
+    state.prioritizedError = null;
+  } catch (error) {
+    state.prioritized = [];
+    state.prioritizedError = /unauthorized/i.test(error.message)
+      ? "That token was rejected. It is the proxy's API_TX_TOKEN."
+      : error.message;
+  }
+  // Redraw only if the panel is open.
+  if (document.querySelector("#prio-panel-form")) openPrioritizePanel();
+}
+
+// Submit a raw transaction and have bitcoind prioritise it.
+async function prioritizeTransaction(hex) {
+  state.prioritizing = true;
+  if (document.querySelector("#prio-panel-form")) openPrioritizePanel();
+  try {
+    // The endpoint takes the tx in the path.
+    const txid = await envelopeRequest(
+      `/api/tx/submit/${encodeURIComponent(hex)}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${state.prioritizedToken}` },
+      },
+    );
+    toast(
+      "Prioritised",
+      `bitcoind accepted ${shortHash(String(txid), 8, 6)}. It can appear in the next template.`,
+      "success",
+    );
+    addLog(
+      "PrioritizeTransaction",
+      "INFO",
+      `Submitted ${txid} for prioritisation`,
+    );
+    state.prioritizedError = null;
+    closePanel();
+  } catch (error) {
+    state.prioritizedError = error.message;
+    addLog(
+      "PrioritizeTransactionError",
+      "ERROR",
+      `Prioritisation failed: ${error.message}`,
+    );
+    openPrioritizePanel();
+  } finally {
+    state.prioritizing = false;
+    await loadPrioritized();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// One template's transactions
+// ---------------------------------------------------------------------------
+
+async function openTemplateTransactions(templateId) {
+  state.openTemplateId = templateId;
+  openModal({
+    title: `Template ${templateId}`,
+    description: "Transactions in this template, as sv2-tp sent them",
+    size: "xlarge",
+    body: '<div class="empty-cell" style="display:grid;place-items:center">Loading transactions…</div>',
+  });
+  await refreshTemplateModal();
+}
+
+async function refreshTemplateModal() {
+  const templateId = state.openTemplateId;
+  if (templateId === null) return;
+  let template;
+  try {
+    template = await envelopeRequest(
+      `/api/templates/${encodeURIComponent(templateId)}`,
+    );
+  } catch (error) {
+    openModal({
+      title: `Template ${templateId}`,
+      description: "Transactions in this template",
+      size: "xlarge",
+      body: `<div class="history-error">Error: ${escapeHtml(error.message)}</div>`,
+    });
+    return;
+  }
+  // Closed or switched while in flight.
+  if (state.openTemplateId !== templateId) return;
+
+  const kind = templateKind(template);
+  const age = Math.max(0, Math.floor(Date.now() / 1000) - template.received_at);
+  // Still a candidate for the current tip, and so still declarable.
+  const isLive = state.templates.some(
+    (candidate) => candidate.template_id === template.template_id,
+  );
+  // Accepted by the pool, not merely declared earlier.
+  const isInForce = state.activeDeclaration === template.template_id;
+
+  state.modalCopyText = (template.transactions || [])
+    .map((transaction) => transaction.txid)
+    .join("\n");
+  openModal({
+    title: `Template ${template.template_id}`,
+    description: `${kind.label} · ${template.height ? `block ${formatNumber(template.height)} · ` : ""}received ${relativeAge(age)} · ${kind.hint}`,
+    size: "xlarge",
+    body: `<div class="selection-summary-grid">
+        ${summaryMetric("Transactions", formatNumber(template.tx_count))}
+        ${summaryMetric("Total fees", template.total_fees_sat === null || template.total_fees_sat === undefined ? "unknown" : `${formatBtc(template.total_fees_sat)} BTC`)}
+        ${summaryMetric("Block fill", `${((template.total_weight / MAX_BLOCK_WEIGHT) * 100).toFixed(1)}%`)}
+        ${summaryMetric("Weight", `${formatNumber(template.total_weight)} WU`)}
+        ${summaryMetric("Coinbase value", `${formatBtc(template.coinbase_value_sat)} BTC`)}
+        ${summaryMetric("Subsidy", template.subsidy_sat === null || template.subsidy_sat === undefined ? "unknown" : `${formatBtc(template.subsidy_sat)} BTC`)}
+      </div>
+      
+      
+    
+      <div class="validation-head" style="margin:1.25rem 0 .5rem">
+        <div class="validation-title">${icon("hash", 16)} Transactions</div>
+        <div class="button-row" style="gap:.5rem">
+          <span class="badge">${formatNumber(template.tx_count)}</span>
+          ${(template.prioritized_included || []).length ? `<span class="badge success">${icon("pin", 12)} ${formatNumber(template.prioritized_included.length)} prioritised</span>` : ""}
+          <button class="btn small" type="button" data-action="copy-modal-text">${icon("copy", 14)} Copy txids</button>
+          <button class="btn small" type="button" data-export-template="${escapeHtml(String(template.template_id))}">${icon("download", 14)} Export CSV</button>
+        </div>
+      </div>
+      ${templateTransactionsTable(template)}
+      ${
+        isInForce || isLive
+          ? ``
+          : `<p class="validation-copy">${icon("info", 14)} The tip has moved since this template arrived, so it can no longer be mined and is no longer a candidate.</p>`
+      }`,
+  });
+
+  const exportButton = document.querySelector("[data-export-template]");
+  if (exportButton) {
+    exportButton.addEventListener(
+      "click",
+      () => {
+        const header = "txid,vsize,weight,fee_sat,fee_rate_sat_per_vb";
+        const lines = (template.transactions || []).map((t) =>
+          [
+            t.txid,
+            t.vsize,
+            t.weight,
+            t.fee_sat ?? "",
+            t.fee_rate_sat_per_vb ?? "",
+          ].join(","),
+        );
+        downloadText(
+          [header, ...lines].join("\n"),
+          `template-${template.template_id}.csv`,
+          "text/csv;charset=utf-8",
+        );
+      },
+      { once: true },
+    );
+  }
+}
+
+function templateTransactionsTable(template) {
+  const transactions = template.transactions || [];
+  if (!transactions.length) {
+    return `<div class="pz-empty">This template has no transactions beyond the coinbase.</div>`;
+  }
+
+  const prioritized = new Set(template.prioritized_included || []);
+
+  // Prioritised first, then by fee; the rest keep the node's order.
+  const rows = [...transactions]
+    .sort((left, right) => {
+      const leftPrio = prioritized.has(left.txid);
+      const rightPrio = prioritized.has(right.txid);
+      if (leftPrio !== rightPrio) return leftPrio ? -1 : 1;
+      return (right.fee_sat ?? -1) - (left.fee_sat ?? -1);
+    })
+    .map((transaction) => {
+      const isPrioritized = prioritized.has(transaction.txid);
+      return `<tr class="${isPrioritized ? "pz-row-prio" : ""}">
+      <td><span class="inline" style="gap:.35rem">${isPrioritized ? `<span class="tplx-row-mark" title="You asked bitcoind to prioritise this one">${icon("pin", 11)}</span>` : ""}<span class="txid-value" title="${escapeHtml(transaction.txid)}">${escapeHtml(shortHash(transaction.txid, 12, 6))}</span><button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(transaction.txid)}" aria-label="Copy transaction ID">${icon("copy", 13)}</button></span></td>
+      <td class="right">${transaction.fee_sat === null || transaction.fee_sat === undefined ? '<span class="muted">—</span>' : formatBtc(transaction.fee_sat)}</td>
+      <td class="right">${transaction.fee_rate_sat_per_vb === null || transaction.fee_rate_sat_per_vb === undefined ? '<span class="muted">—</span>' : formatNumber(transaction.fee_rate_sat_per_vb, 2)}</td>
+      <td class="right">${formatNumber(transaction.vsize)}</td>
+      <td class="right">${formatNumber(transaction.weight)}</td>
+    </tr>`;
+    })
+    .join("");
+
+  return `<div class="table-shell template-tx-scroll"><table class="pz-table"><thead><tr>
+      <th>TXID</th><th class="right">Fee (sats)</th><th class="right">sat/vB</th>
+      <th class="right">vSize</th><th class="right">Weight</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Declaring
+// ---------------------------------------------------------------------------
+
+// Declare one candidate; any candidate on the current tip is valid.
 function initialize() {
   applyAppearance();
-  if (window.location.pathname !== state.route) window.history.replaceState({}, "", state.route);
+  if (window.location.pathname !== state.route)
+    window.history.replaceState({}, "", state.route);
   renderShell();
-  loadSettings();
   pollStats();
-  loadMempool();
-  connectWebSockets();
-  setInterval(pollStats, API_POLL_INTERVAL);
-  setInterval(() => loadMempool(), MEMPOOL_REFRESH_INTERVAL);
+  loadTemplates();
+  // Polls pause while the tab is hidden.
+  setInterval(() => {
+    if (!document.hidden) pollStats();
+  }, API_POLL_INTERVAL);
+  setInterval(() => {
+    if (!document.hidden) loadTemplates();
+  }, TEMPLATE_REFRESH_INTERVAL);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      pollStats();
+      loadTemplates();
+    }
+  });
 }
 
 initialize();

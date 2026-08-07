@@ -3,15 +3,7 @@ use super::{
     utils::get_cpu_and_memory_usage,
     AppState, PRIORITIZED_TRANSACTIONS_POLL_LOCK,
 };
-use crate::{
-    api::mempool::auto_select_transactions,
-    config::Configuration,
-    db::{
-        handlers::{JobDeclarationHandler, SettingsHandler},
-        model::SettingsRequest,
-    },
-    proxy_state::ProxyState,
-};
+use crate::{config::Configuration, db::history, proxy_state::ProxyState};
 use axum::{
     extract::{Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
@@ -24,8 +16,77 @@ use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
 
-#[cfg(test)]
 use serde_json::json;
+
+/// Render one received template for the dashboard.
+fn template_payload(
+    snapshot: &crate::block_templates::TemplateSnapshot,
+    with_transactions: bool,
+) -> serde_json::Value {
+    let mut prioritized =
+        crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.snapshot_txids();
+    prioritized.extend(crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.snapshot_txids());
+    let prioritized_included: Vec<String> = snapshot
+        .transactions
+        .iter()
+        .filter(|tx| prioritized.contains(&tx.txid))
+        .map(|tx| tx.txid.to_string())
+        .collect();
+
+    let mut priced_tx_count: usize = 0;
+    let mut transactions = Vec::with_capacity(if with_transactions {
+        snapshot.transactions.len()
+    } else {
+        0
+    });
+
+    for tx in &snapshot.transactions {
+        if tx.fee_sat.is_some() {
+            priced_tx_count += 1;
+        }
+        if with_transactions {
+            transactions.push(json!({
+                "txid": tx.txid.to_string(),
+                "weight": tx.weight,
+                "vsize": tx.vsize,
+                "fee_sat": tx.fee_sat,
+                "fee_rate_sat_per_vb": tx.fee_sat.map(|fee| fee as f64 / tx.vsize.max(1) as f64),
+            }));
+        }
+    }
+
+    let mut payload = json!({
+        "available": true,
+        "template_id": snapshot.template_id,
+        "future_template": snapshot.future_template,
+        "version": snapshot.version,
+        "height": snapshot.height,
+        "coinbase_value_sat": snapshot.coinbase_tx_value_remaining,
+        "subsidy_sat": snapshot.subsidy_sat,
+        "total_fees_sat": snapshot.total_fees_sat,
+        "tx_count": snapshot.transactions.len(),
+        "priced_tx_count": priced_tx_count,
+        "total_weight": snapshot.total_weight,
+        "received_at": snapshot.received_at,
+        "prioritized_included": prioritized_included,
+    });
+    if with_transactions {
+        payload["transactions"] = json!(transactions);
+    }
+    payload
+}
+
+/// `None` keeps everything.
+#[derive(Debug, Deserialize)]
+pub struct HistoryRetentionRequest {
+    pub keep_blocks: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeclarationPolicyRequest {
+    /// One of `highest_fees`, `block_weight`.
+    pub policy: String,
+}
 
 pub struct Api {}
 
@@ -93,26 +154,26 @@ impl Api {
         )
     }
 
-    // Retrieves the current pool information
     pub async fn get_pool_info(State(state): State<AppState>) -> impl IntoResponse {
-        let current_pool_address = state.router.current_pool;
-        let latency = *state.router.latency_rx.borrow();
+        let address = crate::ACTIVE_POOL_ADDRESS
+            .safe_lock(|address| *address)
+            .unwrap_or(None);
+        let setup_latency = *state.router.latency_rx.borrow();
 
-        match (current_pool_address, latency) {
-            (Some(address), Some(latency)) => {
-                let response_data = serde_json::json!({
+        match address {
+            Some(address) => (
+                StatusCode::OK,
+                Json(APIResponse::success(Some(serde_json::json!({
                     "address": address.to_string(),
-                    "latency": latency.as_millis().to_string()
-                });
-                (
-                    StatusCode::OK,
-                    Json(APIResponse::success(Some(response_data))),
-                )
-            }
-            (_, _) => (
+                    "latency": setup_latency.map(|latency| latency.as_millis().to_string()),
+                    "declaration_latency_ms": super::stats::declaration_latency_ms(),
+                    "bandwidth_bytes_per_sec": super::stats::bandwidth_bytes_per_sec(),
+                })))),
+            ),
+            None => (
                 StatusCode::NOT_FOUND,
                 Json(APIResponse::error(Some(
-                    "Pool information unavailable".to_string(),
+                    "not connected to a pool yet".to_string(),
                 ))),
             ),
         }
@@ -167,6 +228,77 @@ impl Api {
                 Json(APIResponse::error(Some("Unknown proxy state".to_string()))),
             ),
         }
+    }
+
+    pub async fn get_capabilities(State(state): State<AppState>) -> impl IntoResponse {
+        Json(APIResponse::success(Some(json!({
+            "templates": true,
+            // Needs RPC credentials and an API token.
+            "transaction_prioritization": state.prioritizing_txs.is_some()
+        }))))
+    }
+
+    /// Candidates for the current tip, newest first.
+    pub async fn get_recent_templates() -> impl IntoResponse {
+        let policy = crate::block_templates::declaration_policy();
+        let templates: Vec<serde_json::Value> = crate::block_templates::with_candidates(|held| {
+            held.iter()
+                .map(|snapshot| template_payload(snapshot, false))
+                .collect()
+        });
+
+        Json(APIResponse::success(Some(json!({
+            "templates": templates,
+            "candidate_limit": crate::block_templates::CANDIDATE_LIMIT,
+            // The declaration the pool has accepted
+            "active_declaration": crate::block_templates::active_declaration(),
+            "policy": policy.as_str(),
+            // What the policy resolves to
+            "policy_pick": crate::block_templates::policy_pick(policy),
+        }))))
+    }
+
+    /// Set which candidate gets auto-declared.
+    pub async fn set_declaration_policy(
+        Json(request): Json<DeclarationPolicyRequest>,
+    ) -> impl IntoResponse {
+        let Some(policy) = crate::block_templates::DeclarationPolicy::parse(&request.policy) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(APIResponse::error(Some(format!(
+                    "unknown declaration policy {:?}",
+                    request.policy
+                )))),
+            );
+        };
+        crate::block_templates::set_declaration_policy(policy);
+        info!(policy = policy.as_str(), "declaration policy changed");
+        (
+            StatusCode::OK,
+            Json(APIResponse::success(Some(json!({
+            "policy": policy.as_str(),
+            })))),
+        )
+    }
+
+    /// One received template with its full transaction list.
+    pub async fn get_template_by_id(Path(template_id): Path<u64>) -> impl IntoResponse {
+        let Some(snapshot) = crate::block_templates::by_id(template_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(APIResponse::error(Some(format!(
+                    "template {template_id} is no longer held; only the last {} received are kept",
+                    crate::block_templates::CANDIDATE_LIMIT
+                )))),
+            );
+        };
+
+        (
+            StatusCode::OK,
+            Json(APIResponse::success(Some(template_payload(
+                &snapshot, true,
+            )))),
+        )
     }
 
     pub async fn prioritize_transaction(
@@ -356,23 +488,13 @@ impl Api {
         (StatusCode::OK, Json(APIResponse::success(Some(response))))
     }
 
-    // API endpoint: Get job declaration history with pagination
+    /// One page of declarations, newest first.
     pub async fn get_job_history(
-        State(state): State<AppState>,
         Query(params): Query<std::collections::HashMap<String, String>>,
     ) -> impl IntoResponse {
-        let db = match &state.db {
-            Some(db) => db,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(APIResponse::error(Some(
-                        "Database not available".to_string(),
-                    ))),
-                );
-            }
+        let Some(db) = crate::db::pool() else {
+            return no_database();
         };
-
         let page = params
             .get("page")
             .and_then(|p| p.parse::<i64>().ok())
@@ -382,162 +504,88 @@ impl Api {
             .and_then(|p| p.parse::<i64>().ok())
             .unwrap_or(10);
 
-        let handler = JobDeclarationHandler::new(db.clone());
-
-        match handler.get_job_history(page, per_page).await {
+        match history::page(db, page, per_page).await {
             Ok(response) => (StatusCode::OK, Json(APIResponse::success(Some(response)))),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(APIResponse::error(Some(format!(
-                    "Failed to get job history: {}",
-                    e
-                )))),
-            ),
+            Err(e) => internal(format!("Failed to get job history: {e}")),
         }
     }
 
-    // API endpoint: Get txids for a specific template
-    pub async fn get_job_txids(
-        State(state): State<AppState>,
-        Path(template_id): Path<i64>,
-    ) -> impl IntoResponse {
-        let db = match &state.db {
-            Some(db) => db,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(APIResponse::error(Some(
-                        "Database not available".to_string(),
-                    ))),
-                );
-            }
+    /// The transactions one declaration declared.
+    pub async fn get_job_txids(Path(template_id): Path<i64>) -> impl IntoResponse {
+        let Some(db) = crate::db::pool() else {
+            return no_database();
         };
-
-        let handler = JobDeclarationHandler::new(db.clone());
-
-        match handler.get_job_txids(template_id).await {
-            Ok(response) => (StatusCode::OK, Json(APIResponse::success(Some(response)))),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(APIResponse::error(Some(format!(
-                    "Failed to get job txids: {}",
-                    e
-                )))),
-            ),
-        }
-    }
-
-    // API endpoint: Get auto-selected transactions with configurable parameters
-    pub async fn get_auto_selected_transactions(
-        State(state): State<AppState>,
-        Query(params): Query<AutoSelectParams>,
-    ) -> impl IntoResponse {
-        match auto_select_transactions(state.rpc.clone(), params).await {
-            Ok(selected_transactions) => (
+        match history::txids(db, template_id).await {
+            Ok(txids) => (
                 StatusCode::OK,
-                Json(APIResponse::success(Some(selected_transactions))),
+                Json(APIResponse::success(Some(json!({
+                    "template_id": template_id,
+                    "total": txids.len(),
+                    "txids": txids,
+                })))),
             ),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(APIResponse::error(Some(format!(
-                    "Auto-selection failed: {}",
-                    e
-                )))),
-            ),
+            Err(e) => internal(format!("Failed to get job txids: {e}")),
         }
     }
 
-    // API endpoint: Get settings for a user
-    pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-        let db = match &state.db {
-            Some(db) => db,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(APIResponse::error(Some(
-                        "Database not available".to_string(),
-                    ))),
-                );
-            }
+    /// How many blocks of history the proxy is keeping.
+    pub async fn get_history_retention() -> impl IntoResponse {
+        let Some(db) = crate::db::pool() else {
+            return no_database();
         };
-
-        let handler = SettingsHandler::new(db.clone());
-
-        match handler.get_or_create_settings().await {
-            Ok(settings) => (StatusCode::OK, Json(APIResponse::success(Some(settings)))),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(APIResponse::error(Some(format!(
-                    "Failed to get settings: {}",
-                    e
-                )))),
-            ),
-        }
+        (
+            StatusCode::OK,
+            Json(APIResponse::success(Some(json!({
+                "keep_blocks": history::keep_blocks(db).await,
+                "default_keep_blocks": history::default_keep_blocks(),
+            })))),
+        )
     }
 
-    // API endpoint: Update settings for a user
-    pub async fn update_settings(
-        State(state): State<AppState>,
-        Json(settings_request): Json<SettingsRequest>,
+    /// Set retention; null keeps everything.
+    pub async fn set_history_retention(
+        Json(request): Json<HistoryRetentionRequest>,
     ) -> impl IntoResponse {
-        let db = match &state.db {
-            Some(db) => db,
-            None => {
+        let Some(db) = crate::db::pool() else {
+            return no_database();
+        };
+        if let Some(keep) = request.keep_blocks {
+            if keep < 1 {
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::BAD_REQUEST,
                     Json(APIResponse::error(Some(
-                        "Database not available".to_string(),
+                        "keep_blocks must be at least 1, or null to keep everything".to_string(),
                     ))),
                 );
             }
-        };
-
-        let handler = SettingsHandler::new(db.clone());
-
-        match handler.update_settings(&settings_request).await {
-            Ok(settings) => (StatusCode::OK, Json(APIResponse::success(Some(settings)))),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(APIResponse::error(Some(format!(
-                    "Failed to update settings: {}",
-                    e
-                )))),
-            ),
+        }
+        match history::set_keep_blocks(db, request.keep_blocks).await {
+            Ok(()) => {
+                info!(keep_blocks = ?request.keep_blocks, "history retention set");
+                (
+                    StatusCode::OK,
+                    Json(APIResponse::success(Some(
+                        json!({ "keep_blocks": request.keep_blocks }),
+                    ))),
+                )
+            }
+            Err(e) => internal(format!("Failed to set the history retention: {e}")),
         }
     }
-}
 
-#[derive(Debug, Deserialize)]
-pub struct AutoSelectParams {
-    #[serde(rename = "minFeeRate")]
-    pub min_fee_rate: Option<f64>,
-    #[serde(rename = "maxSize")]
-    pub max_size: Option<u64>,
-    #[serde(rename = "minBaseFee")]
-    pub min_base_fee: Option<u64>,
-    #[serde(rename = "maxAncestorCount")]
-    pub max_ancestor_count: Option<u64>,
-    #[serde(rename = "maxDescendantCount")]
-    pub max_descendant_count: Option<u64>,
-    #[serde(rename = "excludeBip125Replaceable")]
-    pub exclude_bip125_replaceable: Option<bool>,
-    #[serde(rename = "excludeUnbroadcast")]
-    pub exclude_unbroadcast: Option<bool>,
-    #[serde(rename = "maxTransactionCount")]
-    pub max_transaction_count: Option<usize>,
-    #[serde(rename = "selectionStrategy")]
-    pub selection_strategy: Option<SelectionStrategy>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum SelectionStrategy {
-    /// Maximize total fees collected
-    MaximizeFees,
-    /// Maximize number of transactions included
-    MaximizeCount,
-    /// Balanced approach considering both fees and count
-    Balanced,
+    /// Delete the whole history.
+    pub async fn clear_job_history() -> impl IntoResponse {
+        let Some(db) = crate::db::pool() else {
+            return no_database();
+        };
+        match history::clear(db).await {
+            Ok(removed) => (
+                StatusCode::OK,
+                Json(APIResponse::success(Some(json!({ "removed": removed })))),
+            ),
+            Err(e) => internal(format!("Failed to clear the job history: {e}")),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -596,6 +644,24 @@ pub struct APIResponse<T> {
     data: Option<T>,
 }
 
+/// Shared 503 for database-backed endpoints.
+fn no_database<T: Serialize>() -> (StatusCode, Json<APIResponse<T>>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(APIResponse::error(Some(
+            "Database not available".to_string(),
+        ))),
+    )
+}
+
+fn internal<T: Serialize>(message: String) -> (StatusCode, Json<APIResponse<T>>) {
+    error!(%message);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(APIResponse::error(Some(message))),
+    )
+}
+
 impl<T: Serialize> APIResponse<T> {
     pub fn success(data: Option<T>) -> Self {
         APIResponse {
@@ -621,9 +687,6 @@ async fn health_check_reports_full_translator_handoff() {
     use std::{net::IpAddr, time::Instant};
     use tokio::sync::mpsc;
 
-    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
-    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
-
     let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let (send_to_upstream, recv_from_downstream) = mpsc::channel(1);
 
@@ -636,8 +699,9 @@ async fn health_check_reports_full_translator_handoff() {
         })
         .expect("test handoff queue should accept first item");
 
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let state = AppState {
-        router,
+        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -648,11 +712,6 @@ async fn health_check_reports_full_translator_handoff() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
-        rpc: None,
-        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
-        tx_list_sender: tokio::sync::mpsc::channel(1).0,
-        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
-        db: None,
     };
 
     let response = Api::health_check(State(state)).await.into_response();
@@ -666,20 +725,13 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
     use axum::response::IntoResponse;
     use tokio::sync::mpsc;
 
-    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
-    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
-
     let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let state = AppState {
-        router,
+        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: None,
-        rpc: None,
-        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
-        tx_list_sender: tokio::sync::mpsc::channel(1).0,
-        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
-        db: None,
     };
 
     let response = Api::prioritize_transaction(
@@ -699,12 +751,10 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
     use axum::response::IntoResponse;
     use tokio::sync::mpsc;
 
-    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
-    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
-
     let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let state = AppState {
-        router,
+        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -715,11 +765,6 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
-        rpc: None,
-        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
-        tx_list_sender: tokio::sync::mpsc::channel(1).0,
-        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
-        db: None,
     };
 
     let response = Api::prioritize_transaction(
@@ -1052,12 +1097,10 @@ async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
             .expect("test server should run");
     });
 
-    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
-    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
-
     let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let state = AppState {
-        router,
+        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -1068,11 +1111,6 @@ async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
             )),
             api_tx_token: "api-token".to_string(),
         }),
-        rpc: None,
-        mempool_event_broadcaster: tokio::sync::broadcast::channel(1).0,
-        tx_list_sender: tokio::sync::mpsc::channel(1).0,
-        jd_event_broadcaster: tokio::sync::watch::channel(None).0,
-        db: None,
     };
 
     let mut headers = HeaderMap::new();

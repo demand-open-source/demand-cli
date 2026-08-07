@@ -8,3 +8,4 @@ config.toml
 *.db-wal
 *.db-shm
 .sqlx
+/template-provider

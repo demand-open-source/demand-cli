@@ -1,7 +1,55 @@
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering::Relaxed},
+        OnceLock,
+    },
+    time::Instant,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
+
+static COUNTING_SINCE: OnceLock<Instant> = OnceLock::new();
+
+static SENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static RECEIVED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Last declaration round trip in ms; 0 means none yet.
+static DECLARATION_MS: AtomicU64 = AtomicU64::new(0);
+
+fn counting_since() -> &'static Instant {
+    COUNTING_SINCE.get_or_init(Instant::now)
+}
+
+pub fn record_sent(bytes: usize) {
+    counting_since();
+    SENT_BYTES.fetch_add(bytes as u64, Relaxed);
+}
+
+pub fn record_received(bytes: usize) {
+    counting_since();
+    RECEIVED_BYTES.fetch_add(bytes as u64, Relaxed);
+}
+
+pub fn record_declaration_latency(millis: u64) {
+    DECLARATION_MS.store(millis.max(1), Relaxed);
+}
+
+/// Returns the average bandwidth in bytes per second since the first record_sent or record_received call.
+pub fn bandwidth_bytes_per_sec() -> Option<u64> {
+    let elapsed = COUNTING_SINCE.get()?.elapsed().as_secs();
+    if elapsed == 0 {
+        return None;
+    }
+    Some((SENT_BYTES.load(Relaxed) + RECEIVED_BYTES.load(Relaxed)) / elapsed)
+}
+
+pub fn declaration_latency_ms() -> Option<u64> {
+    match DECLARATION_MS.load(Relaxed) {
+        0 => None,
+        millis => Some(millis),
+    }
+}
 
 #[derive(Debug)]
 enum StatsCommand {

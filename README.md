@@ -57,6 +57,10 @@ The Template Provider listens on port **8336** by default — you'll need that i
 
 **✅ Verify:** the sv2-tp log should show a successful IPC connection to Bitcoin Core and new templates being generated as blocks arrive.
 
+### Dashboard
+
+The client serves a local dashboard at `http://127.0.0.1:3001` (set the port with `--api-server-port`). It shows pool and miner status, the block templates sv2-tp is offering, and the history of declared templates; from it you can choose how much history to keep and ask bitcoind to prioritise a transaction. It opens in a browser on start; set `HEADFUL=false` to stop that.
+
 ## 4. Run the DMND Client
 
 ### 4.1 Download the DMND Stratum V2 Client

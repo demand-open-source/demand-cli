@@ -128,17 +128,12 @@ async fn library_init_sv2_setup_connection() {
         api_server_port,
         false,
         false,
+        false,
         None,
         "http://127.0.0.1:8332".to_string(),
         "user".to_string(),
         "password".to_string(),
         "api-token".to_string(),
-        30,
-        "tcp://127.0.0.1:28334".to_string(),
-        "127.0.0.1".to_string(),
-        8332,
-        "user".to_string(),
-        "password".to_string(),
     );
 
     let proxy = tokio::spawn(dmnd_client::start(config));

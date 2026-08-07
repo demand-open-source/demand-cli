@@ -71,6 +71,9 @@ struct Args {
     api_server_port: Option<String>,
     #[clap(long, short = 'm')]
     monitor: bool,
+    /// Open the dashboard in a browser on start. Off by default
+    #[clap(long)]
+    headful: bool,
     #[clap(long, short = 'u')]
     auto_update: bool,
     #[clap(long)]
@@ -83,18 +86,6 @@ struct Args {
     rpc_pwd: Option<String>,
     #[clap(long)]
     api_tx_token: Option<String>,
-    #[clap(long = "custom-job-timeout")]
-    custom_job_timeout: Option<u64>,
-    #[clap(long = "zmq-pub-sequence")]
-    zmq_pub_sequence: Option<String>,
-    #[clap(long = "rpc-allow-ip")]
-    rpc_allow_ip: Option<String>,
-    #[clap(long = "rpc-port")]
-    rpc_port: Option<u16>,
-    #[clap(long = "rpc-username")]
-    rpcusername: Option<String>,
-    #[clap(long = "rpc-password")]
-    rpcpassword: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,18 +113,13 @@ struct ConfigFile {
     accept_window_ms: Option<u64>,
     api_server_port: Option<String>,
     monitor: Option<bool>,
+    headful: Option<bool>,
     auto_update: Option<bool>,
     miner_name: Option<String>,
     rpc_url: Option<String>,
     rpc_user: Option<String>,
     rpc_pwd: Option<String>,
     api_tx_token: Option<String>,
-    custom_job_timeout: Option<u64>,
-    zmq_pub_sequence: Option<String>,
-    rpc_allow_ip: Option<String>,
-    rpc_port: Option<u16>,
-    rpcusername: Option<String>,
-    rpcpassword: Option<String>,
 }
 
 impl ConfigFile {
@@ -162,18 +148,13 @@ impl ConfigFile {
             accept_window_ms: None,
             api_server_port: None,
             monitor: None,
+            headful: None,
             auto_update: None,
             miner_name: None,
             rpc_url: None,
             rpc_user: None,
             rpc_pwd: None,
             api_tx_token: None,
-            custom_job_timeout: None,
-            zmq_pub_sequence: None,
-            rpc_allow_ip: None,
-            rpc_port: None,
-            rpcusername: None,
-            rpcpassword: None,
         }
     }
 }
@@ -203,16 +184,11 @@ pub struct Configuration {
     accept_window_ms: u64,
     api_server_port: String,
     monitor: bool,
+    headful: bool,
     auto_update: bool,
     miner_name: Option<String>,
     prioritizing_txs_config: Option<BitcoindRpcConfig>,
     missing_prioritizing_txs_variables: Vec<&'static str>,
-    custom_job_timeout: u64,
-    zmq_pub_sequence: String,
-    rpc_allow_ip: String,
-    rpc_port: u16,
-    rpcusername: String,
-    rpcpassword: String,
 }
 
 #[derive(Clone, Debug)]
@@ -269,18 +245,13 @@ and make that test pass."
         accept_window_ms: u64,
         api_server_port: String,
         monitor: bool,
+        headful: bool,
         auto_update: bool,
         miner_name: Option<String>,
         rpc_url: String,
         rpc_user: String,
         rpc_pwd: String,
         api_tx_token: String,
-        custom_job_timeout: u64,
-        zmq_pub_sequence: String,
-        rpc_allow_ip: String,
-        rpc_port: u16,
-        rpcusername: String,
-        rpcpassword: String,
     ) -> Self {
         if let Err(error) = Self::validate_supported_delay(delay) {
             panic!("{error}");
@@ -314,16 +285,11 @@ and make that test pass."
             accept_window_ms,
             api_server_port,
             monitor,
+            headful,
             auto_update,
             miner_name,
             prioritizing_txs_config,
             missing_prioritizing_txs_variables,
-            custom_job_timeout,
-            zmq_pub_sequence,
-            rpc_allow_ip,
-            rpc_port,
-            rpcusername,
-            rpcpassword,
         }
     }
 
@@ -396,17 +362,12 @@ and make that test pass."
             "3001".to_string(),
             false,
             false,
+            false,
             None,
             "http://127.0.0.1:8332".to_string(),
             "user".to_string(),
             "password".to_string(),
             "api-token".to_string(),
-            30,
-            "tcp://127.0.0.1:28334".to_string(),
-            "127.0.0.1".to_string(),
-            8332,
-            "user".to_string(),
-            "password".to_string(),
         )
     }
 
@@ -580,36 +541,17 @@ and make that test pass."
         Self::cfg().monitor
     }
 
+    /// Whether to open a browser at the dashboard on start.
+    pub fn headful() -> bool {
+        Self::cfg().headful
+    }
+
     pub fn auto_update() -> bool {
         Self::cfg().auto_update
     }
 
     pub fn miner_name() -> Option<String> {
         Self::cfg().miner_name.clone()
-    }
-
-    pub fn custom_job_timeout() -> u64 {
-        Self::cfg().custom_job_timeout
-    }
-
-    pub fn zmq_pub_sequence() -> &'static str {
-        &Self::cfg().zmq_pub_sequence
-    }
-
-    pub fn rpc_allow_ip() -> &'static str {
-        &Self::cfg().rpc_allow_ip
-    }
-
-    pub fn rpc_port() -> u16 {
-        Self::cfg().rpc_port
-    }
-
-    pub fn rpcusername() -> &'static String {
-        &Self::cfg().rpcusername
-    }
-
-    pub fn rpcpassword() -> &'static String {
-        &Self::cfg().rpcpassword
     }
 
     pub(crate) fn prioritizing_txs_enabled() -> bool {
@@ -708,44 +650,6 @@ and make that test pass."
             .api_tx_token
             .or(config.api_tx_token)
             .or_else(|| std::env::var("API_TX_TOKEN").ok())
-            .unwrap_or_default();
-        let custom_job_timeout = args
-            .custom_job_timeout
-            .or(config.custom_job_timeout)
-            .or_else(|| {
-                std::env::var("CUSTOM_JOB_TIMEOUT")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-            })
-            .unwrap_or(30);
-        let zmq_pub_sequence = args
-            .zmq_pub_sequence
-            .or(config.zmq_pub_sequence)
-            .or_else(|| std::env::var("ZMQ_PUB_SEQUENCE").ok())
-            .unwrap_or_else(|| "tcp://127.0.0.1:28334".to_string());
-        let rpc_allow_ip = args
-            .rpc_allow_ip
-            .or(config.rpc_allow_ip)
-            .or_else(|| std::env::var("RPC_ALLOW_IP").ok())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let rpc_port = args
-            .rpc_port
-            .or(config.rpc_port)
-            .or_else(|| {
-                std::env::var("RPC_PORT")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-            })
-            .unwrap_or(8332);
-        let rpcusername = args
-            .rpcusername
-            .or(config.rpcusername)
-            .or_else(|| std::env::var("RPC_USERNAME").ok())
-            .unwrap_or_default();
-        let rpcpassword = args
-            .rpcpassword
-            .or(config.rpcpassword)
-            .or_else(|| std::env::var("RPC_PASSWORD").ok())
             .unwrap_or_default();
         if let Some(ref miner_name) = miner_name {
             validate_miner_name(miner_name).unwrap_or_else(|e| panic!("{e}"));
@@ -910,6 +814,11 @@ and make that test pass."
                 .monitor
                 .or_else(|| env_bool("MONITOR"))
                 .unwrap_or(false);
+        let headful = args.headful
+            || config
+                .headful
+                .or_else(|| env_bool("HEADFUL"))
+                .unwrap_or(true);
 
         let auto_update = if args.auto_update {
             true
@@ -945,18 +854,13 @@ and make that test pass."
             accept_window_ms,
             api_server_port,
             monitor,
+            headful,
             auto_update,
             miner_name,
             rpc_url,
             rpc_user,
             rpc_pwd,
             api_tx_token,
-            custom_job_timeout,
-            zmq_pub_sequence,
-            rpc_allow_ip,
-            rpc_port,
-            rpcusername,
-            rpcpassword,
         )
     }
 }

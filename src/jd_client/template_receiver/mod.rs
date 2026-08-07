@@ -1,6 +1,4 @@
 mod task_manager;
-use crate::api::TxListWithResponse;
-use crate::dashboard::jd_event_ws::TemplateNotificationBroadcaster;
 use crate::proxy_state::{DownstreamType, JdState, TpState};
 use crate::shared::utils::AbortOnDrop;
 use crate::{
@@ -46,7 +44,6 @@ pub struct TemplateRx {
     miner_coinbase_output: Vec<u8>,
     merge_mining_enabled: bool,
     test_only_do_not_send_solution_to_tp: bool,
-    jd_event_broadcaster: TemplateNotificationBroadcaster,
 }
 
 fn coinbase_capacity_with_merge_mining(base: u32, enabled: bool) -> (u32, Option<usize>) {
@@ -79,9 +76,7 @@ impl TemplateRx {
         down: Arc<Mutex<Downstream>>,
         miner_coinbase_outputs: Vec<TxOut>,
         authority_public_key: Option<Secp256k1PublicKey>,
-        tx_list_receiver: TReceiver<TxListWithResponse>,
         test_only_do_not_send_solution_to_tp: bool,
-        jd_event_broadcaster: TemplateNotificationBroadcaster,
     ) -> Result<AbortOnDrop, Error> {
         let mut encoded_outputs = vec![];
         miner_coinbase_outputs
@@ -131,7 +126,6 @@ impl TemplateRx {
             miner_coinbase_output: encoded_outputs,
             merge_mining_enabled: crate::merge_mining::enabled(),
             test_only_do_not_send_solution_to_tp,
-            jd_event_broadcaster,
         }));
 
         let task_manager = TaskManager::initialize();
@@ -145,13 +139,7 @@ impl TemplateRx {
         TaskManager::add_on_new_solution(task_manager.clone(), on_new_solution_task.into())
             .await
             .map_err(|_| Error::TemplateRxTaskManagerFailed)?;
-        let main_task = match Self::start_templates(
-            self_mutex,
-            receiver,
-            Arc::new(Mutex::new(tx_list_receiver)),
-        )
-        .await
-        {
+        let main_task = match Self::start_templates(self_mutex, receiver).await {
             Ok(main_task) => main_task,
             Err(e) => return Err(e),
         };
@@ -234,13 +222,9 @@ impl TemplateRx {
     pub async fn start_templates(
         self_mutex: Arc<Mutex<Self>>,
         mut receiver: TReceiver<EitherFrame>,
-        tx_list_receiver: Arc<Mutex<TReceiver<TxListWithResponse>>>,
     ) -> Result<AbortOnDrop, Error> {
         let jd = self_mutex
             .safe_lock(|s| s.jd.clone())
-            .map_err(|_| Error::TemplateRxMutexCorrupted)?;
-        let jd_event_broadcaster = self_mutex
-            .safe_lock(|s| s.jd_event_broadcaster.clone())
             .map_err(|_| Error::TemplateRxMutexCorrupted)?;
 
         let down = self_mutex
@@ -739,9 +723,8 @@ impl TemplateRx {
                                     pending_template_generation = None;
                                     pending_tx_data_template_id = None;
                                     let jd = jd.clone();
-                                    let tx_list_receiver = tx_list_receiver.clone();
-                                    let jd_event_broadcaster = jd_event_broadcaster.clone();
                                     tokio::task::spawn(async move {
+                                        let transactions_data = transactions.into();
                                         let mining_token = token.mining_job_token.to_vec();
                                         let pool_coinbase_out = token.coinbase_output.to_vec();
                                         if let (Some(jd), Some(downstream_job)) =
@@ -751,12 +734,10 @@ impl TemplateRx {
                                                 jd,
                                                 new_template_message,
                                                 mining_token,
-                                                tx_list_receiver,
-                                                jd_event_broadcaster,
+                                                transactions_data,
                                                 excess_data,
                                                 pool_coinbase_out,
                                                 downstream_job,
-                                                Some(transactions.into()),
                                             )
                                             .await {
                                                 error!("{e:?}");
@@ -1093,7 +1074,6 @@ mod tests {
         Vec::<TxOut>::new()
             .consensus_encode(&mut encoded_outputs)
             .expect("encode coinbase outputs");
-        let (jd_event_broadcaster, _) = tokio::sync::watch::channel(None);
         let self_mutex = Arc::new(Mutex::new(TemplateRx {
             sender: client_to_tp_tx,
             jd: None,
@@ -1102,11 +1082,8 @@ mod tests {
             miner_coinbase_output: encoded_outputs,
             merge_mining_enabled: false,
             test_only_do_not_send_solution_to_tp: true,
-            jd_event_broadcaster,
         }));
-        let (_tx_list_sender, tx_list_receiver) = mpsc::channel(1);
-        let tx_list_receiver = Arc::new(Mutex::new(tx_list_receiver));
-        let _abortable = TemplateRx::start_templates(self_mutex, tp_to_client_rx, tx_list_receiver)
+        let _abortable = TemplateRx::start_templates(self_mutex, tp_to_client_rx)
             .await
             .expect("template receiver start");
 

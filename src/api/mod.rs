@@ -1,8 +1,6 @@
-pub mod bitcoin_rpc;
-pub mod mempool;
+pub(crate) mod bitcoin_rpc;
 mod routes;
 pub mod stats;
-pub mod transaction_selector;
 mod utils;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -14,37 +12,22 @@ use std::{
 };
 
 use crate::{
-    api::{
-        bitcoin_rpc::{create_rpc_client, BitcoindRpc, BitcoindRpcError},
-        mempool::{
-            spawn_zmq_events, submit_tx_list, ws_mempool_events_handler, MempoolEventBroadcaster,
-        },
-    },
+    api::bitcoin_rpc::{BitcoindRpc, BitcoindRpcError},
     config,
-    dashboard::{
-        dashboard::static_handler,
-        jd_event_ws::{ws_event_handler, JobDeclarationData, TemplateNotificationBroadcaster},
-    },
-    db::connect_db,
+    dashboard::{assets::static_handler, open_dashboard},
     router::Router,
     Configuration,
 };
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router as AxumRouter,
 };
-use binary_sv2::{Seq064K, B016M};
 use bitcoin::{
     consensus::encode::{deserialize_hex, FromHexError},
     Transaction, Txid,
 };
-use bitcoincore_rpc::Client;
 use routes::Api;
 use stats::StatsSender;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc::Sender as TSender;
-use tokio::sync::oneshot;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{error, info, warn};
 
 const MEMPOOL_SPACE_API_BASE_URL: &str = "https://mempool.space/api";
@@ -61,12 +44,6 @@ struct MempoolSpaceAcceleration {
     fee_delta: i64,
 }
 
-// Type for sending job declaration responses back to API endpoints
-pub type JobResponseSender = oneshot::Sender<JobDeclarationData>;
-
-// Type for transaction list with optional job response sender
-pub type TxListWithResponse = (Seq064K<'static, B016M<'static>>, Option<JobResponseSender>);
-
 // Holds shared state (like the router) that so that it can be accessed in all routes.
 #[derive(Clone)]
 pub struct AppState {
@@ -74,11 +51,6 @@ pub struct AppState {
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
     prioritizing_txs: Option<PrioritizingTxs>,
-    rpc: Option<Arc<Client>>,
-    mempool_event_broadcaster: MempoolEventBroadcaster,
-    tx_list_sender: TSender<TxListWithResponse>,
-    pub jd_event_broadcaster: TemplateNotificationBroadcaster,
-    db: Option<sqlx::SqlitePool>,
 }
 
 #[derive(Clone)]
@@ -147,14 +119,7 @@ pub(crate) async fn start(
     router: Router,
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
-    tx_list_sender: TSender<TxListWithResponse>,
-    jd_event_broadcaster: TemplateNotificationBroadcaster,
 ) {
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::any())
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     let prioritizing_txs = Configuration::bitcoind_rpc_config().map(|config| {
         let rpc = Arc::new(BitcoindRpc::new(config.url, config.user, config.pwd));
         PrioritizingTxs {
@@ -189,59 +154,20 @@ pub(crate) async fn start(
         }
     }
 
-    let rpc = match create_rpc_client() {
-        Ok(client) => {
-            info!("Successfully connected to Bitcoin RPC");
-            Some(client)
-        }
-        Err(e) => {
-            warn!("{e}");
-            None
-        }
-    };
-
-    // Connect to the database if rpc is available
-    let db = if rpc.is_some() {
-        info!("Connecting to the database");
-        match connect_db().await {
-            Ok(pool) => {
-                info!("Database connection established");
-                Some(pool)
-            }
-            Err(e) => {
-                warn!("Failed to connect to the database: {e}");
-                None
-            }
-        }
-    } else {
-        warn!("Skipping database connection due to missing Bitcoin RPC connection");
-        None
-    };
-
-    let (mempool_event_broadcaster, _) = broadcast::channel(300);
+    if let Err(e) = crate::db::init().await {
+        warn!("Failed to open the database; job history will not be recorded: {e}");
+    }
 
     let state = AppState {
         router,
         stats_sender,
         downstream_handoff,
         prioritizing_txs,
-        rpc: rpc.clone(),
-        mempool_event_broadcaster: mempool_event_broadcaster.clone(),
-        tx_list_sender,
-        jd_event_broadcaster: jd_event_broadcaster.clone(),
-        db,
     };
-
-    let zmq_pub_sequence = config::Configuration::zmq_pub_sequence();
-
-    if let Some(rpc_client) = rpc {
-        spawn_zmq_events(rpc_client, mempool_event_broadcaster, zmq_pub_sequence);
-    } else {
-        eprintln!("Skipping ZMQ events setup due to missing Bitcoin RPC connection");
-    }
 
     let app = AxumRouter::new()
         .route("/api/health", get(Api::health_check))
+        .route("/api/capabilities", get(Api::get_capabilities))
         .route(
             "/api/coinbase/op-return",
             post(crate::merge_mining::set_pair_api),
@@ -267,20 +193,20 @@ pub(crate) async fn start(
         .route("/api/stats/aggregate", get(Api::get_aggregate_stats))
         .route("/api/stats/session-timing", get(Api::get_session_timing))
         .route("/api/stats/system", get(Api::system_stats))
-        .route("/api/mempool", get(mempool::fetch_mempool))
-        .route("/ws/bitcoin/stream", get(ws_mempool_events_handler))
-        .route("/ws/jd/stream", get(ws_event_handler))
-        .route("/api/job-declaration", post(submit_tx_list))
+        .route("/api/templates/recent", get(Api::get_recent_templates))
+        .route("/api/declaration-policy", post(Api::set_declaration_policy))
+        .route("/api/templates/{template_id}", get(Api::get_template_by_id))
         .route("/api/job-history", get(Api::get_job_history))
+        .route("/api/job-history", delete(Api::clear_job_history))
+        .route(
+            "/api/history/retention",
+            get(Api::get_history_retention).post(Api::set_history_retention),
+        )
         .route("/api/job-txids/{template_id}", get(Api::get_job_txids))
-        .route("/api/auto-select", get(Api::get_auto_selected_transactions))
-        .route("/api/settings", get(Api::get_settings))
-        .route("/api/settings", post(Api::update_settings))
         // Dashboard routes
         .route("/", get(static_handler))
         .route("/{*path}", get(static_handler))
-        .with_state(state)
-        .layer(cors);
+        .with_state(state);
 
     let api_server_port = crate::config::Configuration::api_server_port();
     let api_bind_address =
@@ -296,6 +222,7 @@ pub(crate) async fn start(
             }
         };
         info!(%api_server_addr, "API server listening");
+        open_dashboard(&api_server_port);
         if let Err(error) = axum::serve(listener, app.clone()).await {
             error!(%error, "API server stopped; mining remains active");
         }
