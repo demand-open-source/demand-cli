@@ -82,8 +82,6 @@ struct Args {
     #[clap(long)]
     rpc_pwd: Option<String>,
     #[clap(long)]
-    rpc_fee_delta: Option<i64>,
-    #[clap(long)]
     api_tx_token: Option<String>,
 }
 
@@ -117,7 +115,6 @@ struct ConfigFile {
     rpc_url: Option<String>,
     rpc_user: Option<String>,
     rpc_pwd: Option<String>,
-    rpc_fee_delta: Option<i64>,
     api_tx_token: Option<String>,
 }
 
@@ -152,7 +149,6 @@ impl ConfigFile {
             rpc_url: None,
             rpc_user: None,
             rpc_pwd: None,
-            rpc_fee_delta: None,
             api_tx_token: None,
         }
     }
@@ -195,7 +191,6 @@ pub(crate) struct BitcoindRpcConfig {
     pub url: String,
     pub user: String,
     pub pwd: String,
-    pub fee_delta: i64,
     pub api_tx_token: String,
 }
 
@@ -250,7 +245,6 @@ and make that test pass."
         rpc_url: String,
         rpc_user: String,
         rpc_pwd: String,
-        rpc_fee_delta: String,
         api_tx_token: String,
     ) -> Self {
         if let Err(error) = Self::validate_supported_delay(delay) {
@@ -258,13 +252,7 @@ and make that test pass."
         }
 
         let (prioritizing_txs_config, missing_prioritizing_txs_variables) =
-            Self::build_prioritizing_txs_config(
-                rpc_url,
-                rpc_user,
-                rpc_pwd,
-                rpc_fee_delta,
-                api_tx_token,
-            );
+            Self::build_prioritizing_txs_config(rpc_url, rpc_user, rpc_pwd, api_tx_token);
 
         Configuration {
             token,
@@ -302,7 +290,6 @@ and make that test pass."
         url: String,
         user: String,
         pwd: String,
-        fee_delta: String,
         api_tx_token: String,
     ) -> (Option<BitcoindRpcConfig>, Vec<&'static str>) {
         let mut missing = Vec::new();
@@ -315,9 +302,6 @@ and make that test pass."
         if pwd.trim().is_empty() {
             missing.push("RPC_PWD");
         }
-        if fee_delta.trim().is_empty() {
-            missing.push("RPC_FEE_DELTA");
-        }
         if api_tx_token.trim().is_empty() {
             missing.push("API_TX_TOKEN");
         }
@@ -326,17 +310,11 @@ and make that test pass."
             return (None, missing);
         }
 
-        let fee_delta = match fee_delta.trim().parse() {
-            Ok(fee_delta) => fee_delta,
-            Err(_) => return (None, vec!["RPC_FEE_DELTA"]),
-        };
-
         (
             Some(BitcoindRpcConfig {
                 url,
                 user,
                 pwd,
-                fee_delta,
                 api_tx_token,
             }),
             missing,
@@ -381,7 +359,6 @@ and make that test pass."
             "http://127.0.0.1:8332".to_string(),
             "user".to_string(),
             "password".to_string(),
-            "100000000".to_string(),
             "api-token".to_string(),
         )
     }
@@ -582,7 +559,7 @@ and make that test pass."
             return;
         }
 
-        if missing.len() == 5 {
+        if missing.len() == 4 {
             warn!("PRIORITIZING TXS NOT ENABLED");
         } else {
             error!(
@@ -655,12 +632,6 @@ and make that test pass."
             .rpc_pwd
             .or(config.rpc_pwd)
             .or_else(|| std::env::var("RPC_PWD").ok())
-            .unwrap_or_default();
-        let rpc_fee_delta = args
-            .rpc_fee_delta
-            .map(|value| value.to_string())
-            .or_else(|| config.rpc_fee_delta.map(|value| value.to_string()))
-            .or_else(|| std::env::var("RPC_FEE_DELTA").ok())
             .unwrap_or_default();
         let api_tx_token = args
             .api_tx_token
@@ -870,7 +841,6 @@ and make that test pass."
             rpc_url,
             rpc_user,
             rpc_pwd,
-            rpc_fee_delta,
             api_tx_token,
         )
     }
@@ -1138,23 +1108,21 @@ mod tests {
     }
 
     #[test]
-    fn prioritizing_txs_requires_all_rpc_values() {
+    fn prioritizing_txs_builds_from_required_rpc_values() {
         let (config, missing) = Configuration::build_prioritizing_txs_config(
             "http://127.0.0.1:8332".to_string(),
             "user".to_string(),
             "password".to_string(),
-            "42".to_string(),
             "api-token".to_string(),
         );
 
         assert!(missing.is_empty());
-        assert_eq!(config.expect("config should be enabled").fee_delta, 42);
+        assert!(config.is_some());
 
         let (config, missing) = Configuration::build_prioritizing_txs_config(
             "http://127.0.0.1:8332".to_string(),
             "".to_string(),
             "password".to_string(),
-            "42".to_string(),
             "api-token".to_string(),
         );
 
@@ -1165,7 +1133,6 @@ mod tests {
             "http://127.0.0.1:8332".to_string(),
             "user".to_string(),
             "password".to_string(),
-            "42".to_string(),
             "".to_string(),
         );
 
@@ -1180,19 +1147,12 @@ mod tests {
             "".to_string(),
             "".to_string(),
             "".to_string(),
-            "".to_string(),
         );
 
         assert!(config.is_none());
         assert_eq!(
             missing,
-            vec![
-                "RPC_URL",
-                "RPC_USER",
-                "RPC_PWD",
-                "RPC_FEE_DELTA",
-                "API_TX_TOKEN"
-            ]
+            vec!["RPC_URL", "RPC_USER", "RPC_PWD", "API_TX_TOKEN"]
         );
     }
 }

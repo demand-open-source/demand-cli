@@ -35,7 +35,7 @@ pub mod jd_client;
 mod merge_mining;
 mod minin_pool_connection;
 mod monitor;
-mod prioritized_transactions;
+pub mod prioritized_transactions;
 mod proxy_protocol;
 mod proxy_state;
 mod router;
@@ -148,6 +148,10 @@ async fn start_internal() {
     }
     Configuration::log_prioritizing_txs_status();
 
+    if Configuration::environment() != "production" || !Configuration::prioritizing_txs_enabled() {
+        api::START_TX_PRIO.store(false, Ordering::Relaxed);
+    }
+
     Configuration::token().expect("TOKEN is not set");
 
     //`self_update` performs synchronous I/O so spawn_blocking is needed
@@ -180,6 +184,15 @@ async fn start_internal() {
             "production" => panic!("Pool address is missing"),
             _ => unreachable!(),
         });
+    if !api::reset_node_fee_deltas_at_startup().await {
+        error!("node prioritization has not been reset");
+    }
+
+    if api::START_TX_PRIO.load(Ordering::Relaxed) {
+        info!("Transaction prioritization activated");
+    } else {
+        warn!("Transaction prioritization is disabled");
+    }
 
     let mut router = router::Router::new(pool_addresses, auth_pub_k, None, None);
     let epsilon = Duration::from_millis(30_000);

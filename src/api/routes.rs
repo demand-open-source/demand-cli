@@ -1,4 +1,8 @@
-use super::{utils::get_cpu_and_memory_usage, AppState};
+use super::{
+    bitcoin_rpc::{BitcoindRpc, BitcoindRpcError, PrioTx},
+    utils::get_cpu_and_memory_usage,
+    AppState, PRIORITIZED_TRANSACTIONS_POLL_LOCK,
+};
 use crate::config::Configuration;
 use crate::proxy_state::ProxyState;
 use axum::{
@@ -7,10 +11,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::Txid;
 use serde::Serialize;
-use serde_json::json;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
+
+#[cfg(test)]
+use serde_json::json;
 
 pub struct Api {}
 
@@ -154,11 +161,14 @@ impl Api {
         }
     }
 
-    pub async fn send_tx_to_bitcoind(
+    pub async fn prioritize_transaction(
         State(state): State<AppState>,
         headers: HeaderMap,
-        Path(tx): Path<String>,
+        Path((txid, fee_delta)): Path<(Txid, i64)>,
     ) -> impl IntoResponse {
+        if fee_delta == 0 {
+            return (StatusCode::OK, Json(APIResponse::success(None)));
+        }
         let Some(prioritizing_txs) = state.prioritizing_txs.as_ref() else {
             warn!("PRIORITIZING TXS NOT ENABLED");
             return (
@@ -179,19 +189,117 @@ impl Api {
             );
         }
 
-        match prioritizing_txs.rpc.submit_transaction(&tx).await {
-            Ok(txid) => {
-                info!("transaction sent to bitcoind: {txid}");
-                (StatusCode::OK, Json(APIResponse::success(Some(txid))))
+        let _prioritized_transactions_guard = PRIORITIZED_TRANSACTIONS_POLL_LOCK.lock().await;
+        if crate::prioritized_transactions::BAD_TRANSACTIONS
+            .get(&txid)
+            .is_some()
+        {
+            warn!(%txid, "transaction acceleration rejected because transaction is cached as bad");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(APIResponse::<String>::error(Some(format!(
+                    "Transaction acceleration was unsuccessful: {txid} was previously rejected by bitcoind"
+                )))),
+            );
+        }
+
+        match prioritizing_txs
+            .rpc
+            .prioritise_transaction(&txid, fee_delta)
+            .await
+        {
+            Ok(()) => {
+                let current_fee_delta = crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS
+                    .get(&txid)
+                    .unwrap_or(0);
+                let fee_delta = current_fee_delta + fee_delta;
+                crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.record(txid, fee_delta);
+                info!("transaction prioritized in bitcoind: {txid}");
+                (
+                    StatusCode::OK,
+                    Json(APIResponse::success(Some(txid.to_string()))),
+                )
             }
             Err(e) => {
-                error!("Failed to send transaction to bitcoind: {e}");
+                error!("Failed to prioritize transaction in bitcoind: {e}");
                 (
                     e.status_code(),
                     Json(APIResponse::error(Some(e.to_string()))),
                 )
             }
         }
+    }
+
+    pub async fn restore_tx_priority(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path(txid): Path<Txid>,
+    ) -> impl IntoResponse {
+        let Some(prioritizing_txs) = state.prioritizing_txs.as_ref() else {
+            warn!("PRIORITIZING TXS NOT ENABLED");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(APIResponse::<String>::error(Some(
+                    "PRIORITIZING TXS NOT ENABLED".to_string(),
+                ))),
+            );
+        };
+
+        if !is_authorized_for_tx_prioritization(&headers, &prioritizing_txs.api_tx_token) {
+            warn!("unauthorized tx priority restoration request");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(APIResponse::<String>::error(Some(
+                    "Unauthorized".to_string(),
+                ))),
+            );
+        }
+
+        let _prioritized_transactions_guard = PRIORITIZED_TRANSACTIONS_POLL_LOCK.lock().await;
+        match Self::restore_tx_priority_from_stores(&prioritizing_txs.rpc, &txid).await {
+            Ok(()) => {
+                info!(%txid, "transaction priority restored in bitcoind");
+                (
+                    StatusCode::OK,
+                    Json(APIResponse::success(Some(txid.to_string()))),
+                )
+            }
+            Err(e) => {
+                error!(%txid, error = %e, "failed to restore transaction priority in bitcoind");
+                (
+                    e.status_code(),
+                    Json(APIResponse::error(Some(e.to_string()))),
+                )
+            }
+        }
+    }
+
+    pub(super) async fn restore_tx_priority_from_stores(
+        rpc: &BitcoindRpc,
+        txid: &Txid,
+    ) -> Result<(), BitcoindRpcError> {
+        let stores = [
+            &crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS,
+            &crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED,
+        ];
+
+        for store in stores {
+            let Some(fee_delta) = store.get(txid) else {
+                continue;
+            };
+            let fee_delta_adjustment = fee_delta.checked_neg().ok_or_else(|| {
+                BitcoindRpcError::Prioritize("fee delta adjustment overflow".to_string())
+            })?;
+
+            rpc.prioritise_transaction(txid, fee_delta_adjustment)
+                .await?;
+        }
+
+        for store in stores {
+            store.remove(txid);
+        }
+
+        Ok(())
     }
 
     pub async fn get_prioritized_transactions(
@@ -202,9 +310,9 @@ impl Api {
             warn!("PRIORITIZING TXS NOT ENABLED");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(APIResponse::<serde_json::Value>::error(Some(
-                    "PRIORITIZING TXS NOT ENABLED".to_string(),
-                ))),
+                Json(APIResponse::<CategorizedPrioritizedTransactions>::error(
+                    Some("PRIORITIZING TXS NOT ENABLED".to_string()),
+                )),
             );
         };
 
@@ -212,61 +320,65 @@ impl Api {
             warn!("unauthorized prioritized txs request");
             return (
                 StatusCode::UNAUTHORIZED,
-                Json(APIResponse::<serde_json::Value>::error(Some(
-                    "Unauthorized".to_string(),
-                ))),
+                Json(APIResponse::<CategorizedPrioritizedTransactions>::error(
+                    Some("Unauthorized".to_string()),
+                )),
             );
         }
 
-        let mut txs = Vec::new();
-        for (txid, transaction) in crate::prioritized_transactions::snapshot() {
-            let Some((real_fee, modified_fee)) = (match prioritizing_txs
-                .rpc
-                .mempool_entry_fees(&txid)
-                .await
-            {
-                Ok(fees) => fees,
-                Err(e) => {
-                    error!(txid = %txid, error = %e, "failed to fetch prioritized transaction mempool fees");
-                    return (
-                        e.status_code(),
-                        Json(APIResponse::<serde_json::Value>::error(Some(e.to_string()))),
-                    );
-                }
-            }) else {
-                info!(
-                    txid = %txid,
-                    "tracked prioritized transaction is no longer in mempool; removing it"
+        let _prioritized_transactions_guard = PRIORITIZED_TRANSACTIONS_POLL_LOCK.lock().await;
+        let transactions = match prioritizing_txs.rpc.get_prioritised_transactions().await {
+            Ok(transactions) => transactions,
+            Err(e) => {
+                error!(error = %e, "failed to fetch prioritized transactions from bitcoind");
+                return (
+                    e.status_code(),
+                    Json(APIResponse::<CategorizedPrioritizedTransactions>::error(
+                        Some(e.to_string()),
+                    )),
                 );
-                crate::prioritized_transactions::remove(&txid);
-                continue;
-            };
+            }
+        };
+        let response = categorize_prioritized_transactions(
+            transactions,
+            &crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.snapshot_txids(),
+            &crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.snapshot_txids(),
+        );
 
-            let txid = txid.to_string();
-            txs.push((
-                txid.clone(),
-                json!({
-                    "txid": txid,
-                    "tx_hex": serialize_hex(&transaction),
-                    "tx_fee": {
-                        "real": real_fee,
-                        "modified": modified_fee
-                    }
-                }),
-            ));
-        }
-        txs.sort_by(|a, b| a.0.cmp(&b.0));
-        let txs: Vec<serde_json::Value> = txs.into_iter().map(|(_, tx)| tx).collect();
-        let response = json!({
-            "count": txs.len(),
-            "txs": txs
-        });
-
-        (
-            StatusCode::OK,
-            Json(APIResponse::<serde_json::Value>::success(Some(response))),
-        )
+        (StatusCode::OK, Json(APIResponse::success(Some(response))))
     }
+}
+
+#[derive(Serialize)]
+struct CategorizedPrioritizedTransactions {
+    mempool_space: BTreeMap<String, PrioTx>,
+    manually_prioritized: BTreeMap<String, PrioTx>,
+    unknown: BTreeMap<String, PrioTx>,
+}
+
+fn categorize_prioritized_transactions(
+    transactions: HashMap<Txid, PrioTx>,
+    mempool_space_txids: &HashSet<Txid>,
+    manually_prioritized_txids: &HashSet<Txid>,
+) -> CategorizedPrioritizedTransactions {
+    let mut categorized = CategorizedPrioritizedTransactions {
+        mempool_space: BTreeMap::new(),
+        manually_prioritized: BTreeMap::new(),
+        unknown: BTreeMap::new(),
+    };
+
+    for (txid, transaction) in transactions {
+        let category = if mempool_space_txids.contains(&txid) {
+            &mut categorized.mempool_space
+        } else if manually_prioritized_txids.contains(&txid) {
+            &mut categorized.manually_prioritized
+        } else {
+            &mut categorized.unknown
+        };
+        category.insert(txid.to_string(), transaction);
+    }
+
+    categorized
 }
 
 fn is_authorized_for_tx_prioritization(headers: &HeaderMap, expected_token: &str) -> bool {
@@ -342,7 +454,6 @@ async fn health_check_reports_full_translator_handoff() {
                 "http://127.0.0.1:8332".to_string(),
                 "user".to_string(),
                 "password".to_string(),
-                100_000_000,
             )),
             api_tx_token: "api-token".to_string(),
         }),
@@ -370,10 +481,10 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
         prioritizing_txs: None,
     };
 
-    let response = Api::send_tx_to_bitcoind(
+    let response = Api::prioritize_transaction(
         State(state),
         axum::http::HeaderMap::new(),
-        Path("00".to_string()),
+        Path(("00".repeat(32).parse().expect("valid txid"), 42)),
     )
     .await
     .into_response();
@@ -400,16 +511,15 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
                 "http://127.0.0.1:8332".to_string(),
                 "user".to_string(),
                 "password".to_string(),
-                100_000_000,
             )),
             api_tx_token: "api-token".to_string(),
         }),
     };
 
-    let response = Api::send_tx_to_bitcoind(
+    let response = Api::prioritize_transaction(
         State(state),
         axum::http::HeaderMap::new(),
-        Path("00".to_string()),
+        Path(("00".repeat(32).parse().expect("valid txid"), 42)),
     )
     .await
     .into_response();
@@ -418,121 +528,318 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
 }
 
 #[tokio::test]
-async fn get_prioritized_transactions_returns_snapshot() {
+async fn prioritize_transaction_rejects_a_cached_bad_transaction() {
     use axum::body::to_bytes;
-    use axum::extract::State;
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use tokio::sync::mpsc;
+
+    let txid = "00000000000000000000000000000000000000000000000000000000000000b1"
+        .parse()
+        .expect("valid test txid");
+    crate::prioritized_transactions::BAD_TRANSACTIONS.remove(&txid);
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&txid);
+    crate::prioritized_transactions::BAD_TRANSACTIONS.record(txid, 75_000);
+
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let state = AppState {
+        router,
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        prioritizing_txs: Some(super::PrioritizingTxs {
+            rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
+                "http://127.0.0.1:1".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+            )),
+            api_tx_token: "api-token".to_string(),
+        }),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, "Bearer api-token".parse().unwrap());
+
+    let response = Api::prioritize_transaction(State(state), headers, Path((txid, 42)))
+        .await
+        .into_response();
+
+    crate::prioritized_transactions::BAD_TRANSACTIONS.remove(&txid);
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.get(&txid),
+        None
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(
+        body["message"],
+        format!(
+            "Transaction acceleration was unsuccessful: {txid} was previously rejected by bitcoind"
+        )
+    );
+    assert_eq!(body["data"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn successful_prioritization_records_the_applied_fee_delta() {
+    use axum::extract::{Path, State};
     use axum::response::IntoResponse;
     use axum::{routing::post, Json, Router};
-    use bitcoin::{
-        blockdata::transaction::Transaction,
-        consensus::encode::{deserialize_hex, serialize_hex},
-    };
     use serde_json::{json, Value};
-    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::mpsc;
+
+    async fn mock_bitcoind(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        assert_eq!(body["method"], "prioritisetransaction");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "result": true,
+                "error": null,
+                "id": "dmnd-client"
+            })),
+        )
+    }
+
+    let txid = "0000000000000000000000000000000000000000000000000000000000000003"
+        .parse()
+        .expect("valid test txid");
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&txid);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("test server local addr");
+    let app = Router::new().route("/bitcoin", post(mock_bitcoind));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should run");
+    });
+
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let state = AppState {
+        router,
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        prioritizing_txs: Some(super::PrioritizingTxs {
+            rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
+                format!("http://{addr}/bitcoin"),
+                "user".to_string(),
+                "password".to_string(),
+            )),
+            api_tx_token: "api-token".to_string(),
+        }),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, "Bearer api-token".parse().unwrap());
+
+    let response = Api::prioritize_transaction(State(state), headers, Path((txid, 42)))
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS
+            .snapshot()
+            .get(&txid),
+        Some(&42)
+    );
+
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&txid);
+    server.abort();
+}
+
+#[tokio::test]
+async fn successful_restore_reverses_and_removes_all_cached_fee_deltas() {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
     use tokio::sync::mpsc;
 
     #[derive(Clone)]
     struct MockBitcoindState {
-        fees: Arc<HashMap<String, (f64, f64)>>,
+        requests: mpsc::UnboundedSender<Value>,
     }
 
     async fn mock_bitcoind(
         State(state): State<MockBitcoindState>,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
-        let method = body
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-
-        match method.as_deref() {
-            Some("getmempoolentry") => {
-                let txid = body
-                    .get("params")
-                    .and_then(Value::as_array)
-                    .and_then(|params| params.first())
-                    .and_then(Value::as_str)
-                    .expect("getmempoolentry txid param");
-                let (real_fee, modified_fee) = state
-                    .fees
-                    .get(txid)
-                    .copied()
-                    .unwrap_or((0.000_010_00, 1.000_010_00));
-
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "result": {
-                            "fees": {
-                                "base": real_fee,
-                                "modified": modified_fee
-                            }
-                        },
-                        "error": null,
-                        "id": "dmnd-client"
-                    })),
-                )
-            }
-            _ => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "result": null,
-                    "error": {
-                        "code": -32601,
-                        "message": "unknown method"
-                    },
-                    "id": "dmnd-client"
-                })),
-            ),
-        }
+        state
+            .requests
+            .send(body)
+            .expect("test should receive bitcoind request");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "result": true,
+                "error": null,
+                "id": "dmnd-client"
+            })),
+        )
     }
 
-    const RAW_TX_A: &str = concat!(
-        "01000000",
-        "01",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "ffffffff",
-        "00",
-        "ffffffff",
-        "01",
-        "0000000000000000",
-        "00",
-        "00000000",
-    );
-    const RAW_TX_B: &str = concat!(
-        "02000000",
-        "01",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-        "ffffffff",
-        "00",
-        "ffffffff",
-        "01",
-        "0000000000000000",
-        "00",
-        "00000000",
-    );
-
-    let tx_a: Transaction = deserialize_hex(RAW_TX_A).expect("valid test transaction");
-    let tx_b: Transaction = deserialize_hex(RAW_TX_B).expect("valid test transaction");
-    let txid_a = tx_a.compute_txid().to_string();
-    let txid_b = tx_b.compute_txid().to_string();
-    let tx_hex_a = serialize_hex(&tx_a);
-    let tx_hex_b = serialize_hex(&tx_b);
-    let fees = Arc::new(HashMap::from([
-        (txid_a.clone(), (0.000_010_00, 1.000_010_00)),
-        (txid_b.clone(), (0.000_020_00, 1.000_020_00)),
-    ]));
-
-    crate::prioritized_transactions::record(tx_a);
-    crate::prioritized_transactions::record(tx_b);
+    let txid = "0000000000000000000000000000000000000000000000000000000000000004"
+        .parse()
+        .expect("valid test txid");
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&txid);
+    crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.remove(&txid);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test server should bind");
     let addr = listener.local_addr().expect("test server local addr");
+    let (requests, mut received_requests) = mpsc::unbounded_channel();
+    let app = Router::new()
+        .route("/bitcoin", post(mock_bitcoind))
+        .with_state(MockBitcoindState { requests });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test server should run");
+    });
+
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+    let state = AppState {
+        router,
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        prioritizing_txs: Some(super::PrioritizingTxs {
+            rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
+                format!("http://{addr}/bitcoin"),
+                "user".to_string(),
+                "password".to_string(),
+            )),
+            api_tx_token: "api-token".to_string(),
+        }),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, "Bearer api-token".parse().unwrap());
+
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.record(txid, 100_000_000);
+    crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.record(txid, 25_000_000);
+
+    let response = Api::restore_tx_priority(State(state), headers, Path(txid))
+        .await
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let manual_restore_request = received_requests
+        .recv()
+        .await
+        .expect("manual prioritisetransaction restore request");
+    assert_eq!(manual_restore_request["method"], "prioritisetransaction");
+    assert_eq!(
+        manual_restore_request["params"],
+        json!([txid, 0, -100_000_000])
+    );
+
+    let accelerator_restore_request = received_requests
+        .recv()
+        .await
+        .expect("accelerator prioritisetransaction restore request");
+    assert_eq!(
+        accelerator_restore_request["method"],
+        "prioritisetransaction"
+    );
+    assert_eq!(
+        accelerator_restore_request["params"],
+        json!([txid, 0, -25_000_000])
+    );
+    assert_eq!(
+        crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.get(&txid),
+        None
+    );
+    assert_eq!(
+        crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.get(&txid),
+        None
+    );
+    assert!(received_requests.try_recv().is_err());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
+    use axum::body::to_bytes;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use axum::{routing::post, Json, Router};
+    use bitcoin::Txid;
+    use serde_json::{json, Value};
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct MockBitcoindState {
+        requests: mpsc::UnboundedSender<Value>,
+    }
+
+    async fn mock_bitcoind(
+        State(state): State<MockBitcoindState>,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        state
+            .requests
+            .send(body)
+            .expect("test should receive bitcoind request");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "result": {
+                    "00000000000000000000000000000000000000000000000000000000000000a1": {
+                        "fee_delta": 100_000,
+                        "in_mempool": true,
+                        "modified_fee": 110_000
+                    },
+                    "00000000000000000000000000000000000000000000000000000000000000a2": {
+                        "fee_delta": 200_000,
+                        "in_mempool": false
+                    },
+                    "00000000000000000000000000000000000000000000000000000000000000a3": {
+                        "fee_delta": -300_000,
+                        "in_mempool": true,
+                        "modified_fee": 30_000
+                    }
+                },
+                "error": null,
+                "id": "dmnd-client"
+            })),
+        )
+    }
+
+    let manual_txid: Txid = "00000000000000000000000000000000000000000000000000000000000000a1"
+        .parse()
+        .expect("valid test txid");
+    let mempool_space_txid: Txid =
+        "00000000000000000000000000000000000000000000000000000000000000a2"
+            .parse()
+            .expect("valid test txid");
+    let unknown_txid: Txid = "00000000000000000000000000000000000000000000000000000000000000a3"
+        .parse()
+        .expect("valid test txid");
+
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&manual_txid);
+    crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.remove(&mempool_space_txid);
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.record(manual_txid, 100_000);
+    crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED
+        .record(mempool_space_txid, 200_000);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test server should bind");
+    let addr = listener.local_addr().expect("test server local addr");
+    let (requests, mut received_requests) = mpsc::unbounded_channel();
     let app = Router::new()
         .route("/", post(mock_bitcoind))
-        .with_state(MockBitcoindState { fees });
+        .with_state(MockBitcoindState { requests });
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -552,7 +859,6 @@ async fn get_prioritized_transactions_returns_snapshot() {
                 format!("http://{addr}"),
                 "user".to_string(),
                 "password".to_string(),
-                100_000_000,
             )),
             api_tx_token: "api-token".to_string(),
         }),
@@ -569,25 +875,42 @@ async fn get_prioritized_transactions_returns_snapshot() {
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let txs = body["data"]["txs"].as_array().unwrap();
-    let tx_a = txs
-        .iter()
-        .find(|tx| tx["txid"].as_str() == Some(txid_a.as_str()))
-        .expect("first prioritized transaction should be present");
-    let tx_b = txs
-        .iter()
-        .find(|tx| tx["txid"].as_str() == Some(txid_b.as_str()))
-        .expect("second prioritized transaction should be present");
-
     assert_eq!(body["success"], true);
-    assert_eq!(body["data"]["count"].as_u64(), Some(txs.len() as u64));
-    assert_eq!(tx_a["tx_fee"]["real"], 0.000_010_00);
-    assert_eq!(tx_a["tx_fee"]["modified"], 1.000_010_00);
-    assert_eq!(tx_a["tx_hex"], tx_hex_a);
-    assert_eq!(tx_b["tx_fee"]["real"], 0.000_020_00);
-    assert_eq!(tx_b["tx_fee"]["modified"], 1.000_020_00);
-    assert_eq!(tx_b["tx_hex"], tx_hex_b);
+    assert_eq!(
+        body["data"],
+        json!({
+            "mempool_space": {
+                mempool_space_txid.to_string(): {
+                    "fee_delta": 200_000,
+                    "in_mempool": false
+                }
+            },
+            "manually_prioritized": {
+                manual_txid.to_string(): {
+                    "fee_delta": 100_000,
+                    "in_mempool": true,
+                    "modified_fee": 110_000
+                }
+            },
+            "unknown": {
+                unknown_txid.to_string(): {
+                    "fee_delta": -300_000,
+                    "in_mempool": true,
+                    "modified_fee": 30_000
+                }
+            }
+        })
+    );
+    let request = received_requests
+        .recv()
+        .await
+        .expect("getprioritisedtransactions request");
+    assert_eq!(request["method"], "getprioritisedtransactions");
+    assert_eq!(request["params"], json!([]));
+    assert!(received_requests.try_recv().is_err());
 
+    crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.remove(&manual_txid);
+    crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.remove(&mempool_space_txid);
     server.abort();
 }
 
