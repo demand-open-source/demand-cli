@@ -35,7 +35,7 @@ pub(crate) static START_TX_PRIO: AtomicBool = AtomicBool::new(true);
 static PRIORITIZED_TRANSACTIONS_POLL_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
-#[derive(serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MempoolSpaceAcceleration {
     txid: bitcoin::Txid,

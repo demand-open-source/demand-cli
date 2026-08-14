@@ -231,6 +231,9 @@ The feature is enabled **only when all** of the following are configured:
 | RPC password | `--rpc-pwd` | `rpc_pwd` | `RPC_PWD` | Bitcoin Core RPC password |
 | API token | `--api-tx-token` | `api_tx_token` | `API_TX_TOKEN` | Bearer token required by this API |
 
+Background transaction prioritization runs in production and local mode. It remains disabled in
+staging and testnet3 mode.
+
 > **Startup reset:** Whenever all four settings are configured, the client resets every non-zero fee delta currently reported by Bitcoin Core to zero at startup. This reset runs in every environment, including staging, testnet3, and local.
 
 > **Security:**

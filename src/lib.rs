@@ -98,6 +98,10 @@ pub(crate) fn share_log_enabled() -> bool {
     SHARE_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
+fn supports_transaction_prioritization(environment: &str) -> bool {
+    matches!(environment, "production" | "local")
+}
+
 pub async fn start(config: Configuration) {
     Configuration::init(config);
     start_internal().await;
@@ -148,7 +152,9 @@ async fn start_internal() {
     }
     Configuration::log_prioritizing_txs_status();
 
-    if Configuration::environment() != "production" || !Configuration::prioritizing_txs_enabled() {
+    if !supports_transaction_prioritization(&Configuration::environment())
+        || !Configuration::prioritizing_txs_enabled()
+    {
         api::START_TX_PRIO.store(false, Ordering::Relaxed);
     }
 
@@ -412,4 +418,17 @@ async fn monitor(
 pub enum Reconnect {
     NewUpstream(std::net::SocketAddr), // Reconnecting with a new upstream
     NoUpstream,                        // Reconnecting without upstream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_transaction_prioritization;
+
+    #[test]
+    fn transaction_prioritization_is_supported_in_production_and_local() {
+        assert!(supports_transaction_prioritization("production"));
+        assert!(supports_transaction_prioritization("local"));
+        assert!(!supports_transaction_prioritization("staging"));
+        assert!(!supports_transaction_prioritization("testnet3"));
+    }
 }
