@@ -34,6 +34,8 @@ pub type Message = PoolMessages<'static>;
 pub type StdFrame = StandardSv2Frame<Message>;
 pub type EitherFrame = StandardEitherFrame<Message>;
 
+const DIFFICULTY_COMMITMENT_OUTPUT_SIZE: u32 = 21;
+
 pub struct TemplateRx {
     sender: TSender<EitherFrame>,
     /// Allows the tp recv to communicate back to the main thread any status updates
@@ -171,7 +173,8 @@ impl TemplateRx {
     pub async fn send_max_coinbase_size(self_mutex: &Arc<Mutex<Self>>, size: u32) {
         let coinbase_output_data_size = PoolMessages::TemplateDistribution(
             TemplateDistribution::CoinbaseOutputDataSize(CoinbaseOutputDataSize {
-                coinbase_output_max_additional_size: size,
+                coinbase_output_max_additional_size: size
+                    .saturating_add(DIFFICULTY_COMMITMENT_OUTPUT_SIZE),
             }),
         );
         let frame: StdFrame = coinbase_output_data_size.try_into().expect("Internal error: this operation can not fail because PoolMessages::TemplateDistribution can always be converted into StdFrame");
@@ -408,6 +411,15 @@ impl TemplateRx {
                                     if will_publish_template {
                                         pending_downstream_job = None;
                                         pending_template_generation = None;
+                                        if let Err(error) =
+                                            Downstream::apply_difficulty_commitment(&down, &mut m)
+                                        {
+                                            error!(%error, "Failed to add difficulty commitment");
+                                            ProxyState::update_downstream_state(
+                                                DownstreamType::JdClientMiningDownstream,
+                                            );
+                                            break;
+                                        }
                                         if let Some(reserved_bytes) = merge_mining_reserved_bytes {
                                             let pristine_template = m.clone();
                                             let pool_output_count = last_token
@@ -978,7 +990,7 @@ mod tests {
         let frame = recv_std_frame(&mut from_client).await;
         with_decoded_message(frame, |message| match message {
             PoolMessages::TemplateDistribution(TemplateDistribution::CoinbaseOutputDataSize(m)) => {
-                assert_eq!(m.coinbase_output_max_additional_size, 1);
+                assert_eq!(m.coinbase_output_max_additional_size, 22);
             }
             other => panic!("unexpected coinbase size message: {other:?}"),
         });

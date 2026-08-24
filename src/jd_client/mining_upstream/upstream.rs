@@ -5,6 +5,7 @@ use crate::{jd_client::error::Error, jd_client::error::ProxyResult, shared::util
 use crate::jd_client::mining_downstream::{DownstreamJob, DownstreamMiningNode as Downstream};
 
 use binary_sv2::{Seq0255, U256};
+use bitcoin::{consensus::Decodable, Amount, ScriptBuf, TxOut};
 use roles_logic_sv2::{
     channel_logic::channel_factory::PoolChannelFactory,
     common_messages_sv2::Protocol,
@@ -15,6 +16,7 @@ use roles_logic_sv2::{
     parsers::Mining,
     routing_logic::{MiningRoutingLogic, NoRouting},
     selectors::NullDownstreamMiningSelector,
+    template_distribution_sv2::NewTemplate,
     utils::{Id, Mutex},
     Error as RolesLogicError,
 };
@@ -29,6 +31,14 @@ use tracing::{error, info, warn};
 use std::collections::VecDeque;
 
 use super::task_manager::TaskManager;
+
+const DIFFICULTY_COMMITMENT_TAG: &[u8] = b"DIFF32";
+const OP_RETURN: u8 = 0x6a;
+
+fn is_difficulty_commitment_script(script: &[u8]) -> bool {
+    script.first() == Some(&OP_RETURN)
+        && script.get(2..2 + DIFFICULTY_COMMITMENT_TAG.len()) == Some(DIFFICULTY_COMMITMENT_TAG)
+}
 
 #[derive(Debug)]
 struct CircularBuffer {
@@ -105,6 +115,7 @@ pub struct Upstream {
     /// Newly assigned identifier of the channel, stable for the whole lifetime of the connection,
     /// e.g. it is used for broadcasting new jobs by the `NewExtendedMiningJob` message.
     channel_id: Option<u32>,
+    target: Option<[u8; 32]>,
     /// This allows the upstream threads to be able to communicate back to the main thread its
     /// current status.
     /// Minimum `extranonce2` size. Initially requested in the `jdc-config.toml`, and ultimately
@@ -146,6 +157,7 @@ impl Upstream {
     ) -> ProxyResult<Arc<Mutex<Self>>> {
         Ok(Arc::new(Mutex::new(Self {
             channel_id: None,
+            target: None,
             min_extranonce_size,
             upstream_extranonce1_size: 16, // 16 is the default since that is the only value the pool supports currently
             sender,
@@ -155,6 +167,44 @@ impl Upstream {
             custom_job_send_lock: Arc::new(TokioMutex::new(())),
             req_ids: Id::new(),
         })))
+    }
+
+    pub(crate) fn apply_difficulty_commitment(
+        self_: &Arc<Mutex<Self>>,
+        template: &mut NewTemplate<'static>,
+    ) -> ProxyResult<()> {
+        let target = self_
+            .safe_lock(|upstream| upstream.target)
+            .map_err(|_| Error::JdClientUpstreamMutexCorrupted)?
+            .ok_or(Error::Unrecoverable)?;
+        let difficulty = bitcoin::Target::from_le_bytes(target).difficulty_float() as f32;
+        let mut script = b"\x6a\x0aDIFF32".to_vec();
+        script.extend_from_slice(&difficulty.to_le_bytes());
+        let commitment = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        };
+
+        let mut encoded_outputs = template.coinbase_tx_outputs.as_ref();
+        let mut outputs = Vec::new();
+        while !encoded_outputs.is_empty() {
+            let output =
+                TxOut::consensus_decode(&mut encoded_outputs).map_err(|_| Error::Unrecoverable)?;
+            if !is_difficulty_commitment_script(output.script_pubkey.as_bytes()) {
+                outputs.push(output);
+            }
+        }
+        outputs.push(commitment);
+
+        let output_count = u32::try_from(outputs.len()).map_err(|_| Error::Unrecoverable)?;
+        let encoded_outputs = outputs
+            .iter()
+            .flat_map(bitcoin::consensus::serialize)
+            .collect::<Vec<_>>()
+            .try_into()?;
+        template.coinbase_tx_outputs = encoded_outputs;
+        template.coinbase_tx_outputs_count = output_count;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -428,6 +478,13 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         let range_1 = prefix_len..prefix_len + self_len;
         let range_2 = prefix_len + self_len..total_len;
 
+        self.target = Some(
+            m.target
+                .to_vec()
+                .try_into()
+                .expect("U256 target must contain 32 bytes"),
+        );
+
         let extranonces = ExtendedExtranonce::new(range_0, range_1, range_2);
         let creator = roles_logic_sv2::job_creator::JobsCreators::new(total_len as u8);
         let channel_kind =
@@ -644,6 +701,12 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         &mut self,
         m: roles_logic_sv2::mining_sv2::SetTarget,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
+        self.target = Some(
+            m.maximum_target
+                .to_vec()
+                .try_into()
+                .expect("U256 target must contain 32 bytes"),
+        );
         if let Some(factory) = self.channel_factory.as_mut() {
             factory.update_target_for_channel(m.channel_id, m.maximum_target.clone().into());
             factory.set_target(&mut m.maximum_target.clone().into());
@@ -687,6 +750,46 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn template_with_outputs(outputs: &[TxOut]) -> NewTemplate<'static> {
+        let encoded_outputs = outputs
+            .iter()
+            .flat_map(bitcoin::consensus::serialize)
+            .collect::<Vec<_>>();
+        NewTemplate {
+            template_id: 1,
+            future_template: false,
+            version: 0,
+            coinbase_tx_version: 2,
+            coinbase_prefix: Vec::new().try_into().expect("empty prefix"),
+            coinbase_tx_input_sequence: 0,
+            coinbase_tx_value_remaining: 0,
+            coinbase_tx_outputs_count: outputs.len() as u32,
+            coinbase_tx_outputs: encoded_outputs.try_into().expect("serialized outputs"),
+            coinbase_tx_locktime: 0,
+            merkle_path: Vec::new().into(),
+        }
+    }
+
+    fn decode_template_outputs(template: &NewTemplate<'static>) -> Vec<TxOut> {
+        let mut encoded_outputs = template.coinbase_tx_outputs.as_ref();
+        let mut outputs = Vec::new();
+        while !encoded_outputs.is_empty() {
+            outputs.push(
+                TxOut::consensus_decode(&mut encoded_outputs).expect("valid serialized output"),
+            );
+        }
+        outputs
+    }
+
+    fn difficulty_commitment(difficulty: f32) -> TxOut {
+        let mut script = b"\x6a\x0aDIFF32".to_vec();
+        script.extend_from_slice(&difficulty.to_le_bytes());
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        }
+    }
 
     fn downstream_job(local_job_id: u32) -> DownstreamJob {
         DownstreamJob {
@@ -739,6 +842,63 @@ mod tests {
                 .downstream_job
                 .local_job_id,
             11
+        );
+    }
+
+    #[tokio::test]
+    async fn difficulty_commitment_replaces_all_existing_tagged_outputs() {
+        let unrelated_output = TxOut {
+            value: Amount::from_sat(42),
+            script_pubkey: ScriptBuf::from_bytes(
+                [b"\x6a\x0bX".as_slice(), b"DIFF32-data"].concat(),
+            ),
+        };
+        let malformed_commitment = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(
+                [b"\x6a\x0a".as_slice(), DIFFICULTY_COMMITMENT_TAG].concat(),
+            ),
+        };
+        let mut template = template_with_outputs(&[
+            difficulty_commitment(1.0),
+            unrelated_output.clone(),
+            malformed_commitment,
+            difficulty_commitment(2.0),
+        ]);
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let upstream = Upstream::new(0, sender).await.expect("upstream");
+
+        let first_target =
+            bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(0x1d00ffff));
+        upstream
+            .safe_lock(|state| state.target = Some(first_target.to_le_bytes()))
+            .expect("upstream lock");
+        Upstream::apply_difficulty_commitment(&upstream, &mut template).expect("first commitment");
+
+        assert_eq!(template.coinbase_tx_outputs_count, 2);
+        assert_eq!(
+            decode_template_outputs(&template),
+            vec![
+                unrelated_output.clone(),
+                difficulty_commitment(first_target.difficulty_float() as f32),
+            ]
+        );
+
+        let second_target =
+            bitcoin::Target::from_compact(bitcoin::CompactTarget::from_consensus(0x1c00ffff));
+        upstream
+            .safe_lock(|state| state.target = Some(second_target.to_le_bytes()))
+            .expect("upstream lock");
+        Upstream::apply_difficulty_commitment(&upstream, &mut template)
+            .expect("replacement commitment");
+
+        assert_eq!(template.coinbase_tx_outputs_count, 2);
+        assert_eq!(
+            decode_template_outputs(&template),
+            vec![
+                unrelated_output,
+                difficulty_commitment(second_target.difficulty_float() as f32),
+            ]
         );
     }
 }

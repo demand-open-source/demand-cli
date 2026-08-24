@@ -421,6 +421,22 @@ impl DownstreamMiningNode {
             .map_err(|_| JdClientError::Unrecoverable)
     }
 
+    pub(crate) fn apply_difficulty_commitment(
+        self_mutex: &Arc<Mutex<Self>>,
+        template: &mut NewTemplate<'static>,
+    ) -> Result<(), JdClientError> {
+        let upstream = self_mutex
+            .safe_lock(|state| match &state.status {
+                DownstreamMiningNodeStatus::ChannelOpened((_, upstream)) => Some(upstream.clone()),
+                _ => None,
+            })
+            .map_err(|_| JdClientError::JdClientDownstreamMutexCorrupted)?;
+        if let Some(upstream) = upstream {
+            UpstreamMiningNode::apply_difficulty_commitment(&upstream, template)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn on_new_template(
         self_mutex: &Arc<Mutex<Self>>,
         mut new_template: NewTemplate<'static>,
