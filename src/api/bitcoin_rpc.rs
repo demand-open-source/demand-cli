@@ -1,35 +1,47 @@
 use axum::http::StatusCode;
-use bitcoin::{blockdata::transaction::Transaction, consensus::encode::deserialize_hex, Txid};
-use serde::Deserialize;
+use bitcoin::{
+    blockdata::transaction::Transaction,
+    consensus::encode::{deserialize_hex, serialize_hex},
+    Txid,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{error::Error as StdError, fmt, time::Duration};
+use std::{collections::HashMap, error::Error as StdError, fmt, time::Duration};
 use tracing::{debug, info};
 
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PrioTx {
+    #[serde(skip)]
+    pub(crate) txid: Txid,
+    pub(crate) fee_delta: i64,
+    pub(crate) in_mempool: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) modified_fee: Option<i64>,
+}
+
 pub(crate) struct BitcoindRpc {
     url: String,
     user: String,
     pwd: String,
-    fee_delta: i64,
 }
 
 impl BitcoindRpc {
-    pub(crate) fn new(url: String, user: String, pwd: String, fee_delta: i64) -> Self {
-        Self {
-            url,
-            user,
-            pwd,
-            fee_delta,
-        }
+    pub(crate) fn new(url: String, user: String, pwd: String) -> Self {
+        Self { url, user, pwd }
     }
 
-    pub(crate) async fn submit_transaction(&self, tx: &str) -> Result<String, BitcoindRpcError> {
-        let tx = validate_transaction_hex(tx)?;
-        let transaction = transaction_from_hex(tx)?;
-        let (status, text) = self.send_request("sendrawtransaction", json!([tx])).await?;
-        let txid = txid_from_sendrawtransaction_response(&transaction, status, &text)?;
+    pub(crate) async fn submit_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<String, BitcoindRpcError> {
+        let transaction_hex = serialize_hex(transaction);
+        let (status, text) = self
+            .send_request("sendrawtransaction", json!([transaction_hex]))
+            .await?;
+        let txid = txid_from_sendrawtransaction_response(transaction, status, &text)?;
         let computed_txid = transaction.compute_txid();
         if txid != computed_txid {
             return Err(BitcoindRpcError::InvalidResponse(format!(
@@ -37,21 +49,87 @@ impl BitcoindRpc {
             )));
         }
 
-        self.prioritise_transaction(&txid).await?;
-        crate::prioritized_transactions::record(transaction);
         Ok(txid.to_string())
     }
 
-    async fn prioritise_transaction(&self, txid: &Txid) -> Result<(), BitcoindRpcError> {
+    pub(crate) async fn get_prioritised_transactions(
+        &self,
+    ) -> Result<HashMap<Txid, PrioTx>, BitcoindRpcError> {
+        let (status, text) = self
+            .send_request("getprioritisedtransactions", json!([]))
+            .await?;
+
+        let transactions = match RpcResponse::from_response(status, &text)? {
+            Some(Value::Object(transactions)) => transactions,
+            _ => {
+                return Err(BitcoindRpcError::InvalidResponse(format!(
+                    "invalid getprioritisedtransactions response from bitcoind: {text}"
+                )))
+            }
+        };
+
+        transactions
+            .into_iter()
+            .map(|(txid, priority)| {
+                let parsed_txid = txid.parse::<Txid>().map_err(|error| {
+                    BitcoindRpcError::InvalidResponse(format!(
+                        "invalid txid in getprioritisedtransactions response from bitcoind: {txid}: {error}"
+                    ))
+                })?;
+                let fee_delta = priority
+                    .get("fee_delta")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| {
+                        BitcoindRpcError::InvalidResponse(format!(
+                            "invalid fee_delta for {txid} in getprioritisedtransactions response from bitcoind"
+                        ))
+                    })?;
+                let in_mempool = priority
+                    .get("in_mempool")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        BitcoindRpcError::InvalidResponse(format!(
+                            "invalid in_mempool for {txid} in getprioritisedtransactions response from bitcoind"
+                        ))
+                    })?;
+                let modified_fee = priority
+                    .get("modified_fee")
+                    .map(|modified_fee| {
+                        modified_fee.as_i64().ok_or_else(|| {
+                            BitcoindRpcError::InvalidResponse(format!(
+                                "invalid modified_fee for {txid} in getprioritisedtransactions response from bitcoind"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
+                Ok((
+                    parsed_txid,
+                    PrioTx {
+                        txid: parsed_txid,
+                        fee_delta,
+                        in_mempool,
+                        modified_fee,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn prioritise_transaction(
+        &self,
+        txid: &Txid,
+        fee_delta: i64,
+    ) -> Result<(), BitcoindRpcError> {
         let (status, text) = self
             .send_request(
                 "prioritisetransaction",
-                json!([txid.to_string(), 0, self.fee_delta]),
+                json!([txid.to_string(), 0, fee_delta]),
             )
             .await?;
         info!(
             txid = %txid,
-            fee_delta = self.fee_delta,
+            fee_delta,
             %status,
             response = %text,
             "bitcoind prioritisetransaction response"
@@ -68,73 +146,8 @@ impl BitcoindRpc {
             None => Err(BitcoindRpcError::Prioritize(format!(
                 "invalid prioritisetransaction response from bitcoind: {text}"
             ))),
-        }
-    }
-
-    pub(crate) async fn transaction_in_mempool(
-        &self,
-        txid: &str,
-    ) -> Result<bool, BitcoindRpcError> {
-        Ok(self.get_mempool_entry(txid).await?.is_some())
-    }
-
-    pub(crate) async fn mempool_entry_fees(
-        &self,
-        txid: &Txid,
-    ) -> Result<Option<(f64, f64)>, BitcoindRpcError> {
-        let Some(result) = self.get_mempool_entry(&txid.to_string()).await? else {
-            return Ok(None);
-        };
-
-        let fees = result.get("fees").ok_or_else(|| {
-            BitcoindRpcError::InvalidResponse(format!(
-                "missing fees in getmempoolentry response from bitcoind: {result}"
-            ))
-        })?;
-        let real_fee = fees.get("base").and_then(Value::as_f64).ok_or_else(|| {
-            BitcoindRpcError::InvalidResponse(format!(
-                "missing fees.base in getmempoolentry response from bitcoind: {result}"
-            ))
-        })?;
-        let modified_fee = fees
-            .get("modified")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                BitcoindRpcError::InvalidResponse(format!(
-                    "missing fees.modified in getmempoolentry response from bitcoind: {result}"
-                ))
-            })?;
-
-        Ok(Some((real_fee, modified_fee)))
-    }
-
-    async fn get_mempool_entry(&self, txid: &str) -> Result<Option<Value>, BitcoindRpcError> {
-        let txid = validate_transaction_hex(txid)?;
-        let (status, text) = self.send_request("getmempoolentry", json!([txid])).await?;
-        let resp = RpcResponse::decode(status, &text)?;
-
-        if let Some(error) = resp.error {
-            if is_not_in_mempool_error(&error) {
-                return Ok(None);
-            }
-
-            return Err(BitcoindRpcError::Other(format!(
-                "bitcoind RPC error while checking mempool entry: {error}"
-            )));
-        }
-
-        if !status.is_success() {
-            return Err(BitcoindRpcError::Other(format!(
-                "bitcoind HTTP {status}: {text}"
-            )));
-        }
-
-        match resp.result {
-            Some(result @ Value::Object(_)) => Ok(Some(result)),
-            _ => Err(BitcoindRpcError::InvalidResponse(format!(
-                "invalid getmempoolentry response from bitcoind: {text}"
-            ))),
-        }
+        }?;
+        Ok(())
     }
 
     async fn send_request(
@@ -153,7 +166,6 @@ impl BitcoindRpc {
             method,
             url = self.url.as_str(),
             rpc_user = self.user.as_str(),
-            fee_delta = self.fee_delta,
             "sending bitcoind RPC request"
         );
 
@@ -177,6 +189,7 @@ impl BitcoindRpc {
     }
 }
 
+#[allow(dead_code)]
 fn txid_from_sendrawtransaction_response(
     transaction: &Transaction,
     status: StatusCode,
@@ -215,6 +228,7 @@ fn txid_from_sendrawtransaction_response(
         .map_err(|e| BitcoindRpcError::InvalidResponse(format!("invalid txid from bitcoind: {e}")))
 }
 
+#[allow(dead_code)]
 fn transaction_from_hex(tx: &str) -> Result<Transaction, BitcoindRpcError> {
     deserialize_hex(tx).map_err(|e| {
         BitcoindRpcError::InvalidTransaction(format!("failed to decode transaction hex: {e}"))
@@ -256,28 +270,7 @@ impl RpcResponse {
     }
 }
 
-fn validate_transaction_hex(tx: &str) -> Result<&str, BitcoindRpcError> {
-    let tx = tx.trim();
-    if tx.is_empty() {
-        return Err(BitcoindRpcError::InvalidTransaction(
-            "transaction hex cannot be empty".to_string(),
-        ));
-    }
-    // Hex encoding represents each byte with two characters,
-    // so valid transaction hex must have an even length.
-    if tx.len() % 2 == 1 {
-        return Err(BitcoindRpcError::InvalidTransaction(
-            "Invalid transaction hash".to_string(),
-        ));
-    }
-    if !tx.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
-        return Err(BitcoindRpcError::InvalidTransaction(
-            "transaction must be hex encoded".to_string(),
-        ));
-    }
-    Ok(tx)
-}
-
+#[allow(dead_code)]
 fn is_already_in_mempool_error(error: &Value) -> bool {
     error
         .get("message")
@@ -288,21 +281,9 @@ fn is_already_in_mempool_error(error: &Value) -> bool {
         })
 }
 
-fn is_not_in_mempool_error(error: &Value) -> bool {
-    let code_is_not_found = error.get("code").and_then(Value::as_i64) == Some(-5);
-    let message_says_not_in_mempool = error
-        .get("message")
-        .and_then(Value::as_str)
-        .is_some_and(|message| message.to_ascii_lowercase().contains("not in mempool"));
-
-    code_is_not_found || message_says_not_in_mempool
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_already_in_mempool_error, is_not_in_mempool_error, transaction_from_hex, BitcoindRpc,
-    };
+    use super::{is_already_in_mempool_error, transaction_from_hex, BitcoindRpc};
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use serde_json::json;
     use serde_json::Value;
@@ -320,26 +301,6 @@ mod tests {
         "00",
         "00000000",
     );
-
-    #[test]
-    fn detects_bitcoind_not_in_mempool_error() {
-        let error = json!({
-            "code": -5,
-            "message": "Transaction not in mempool"
-        });
-
-        assert!(is_not_in_mempool_error(&error));
-    }
-
-    #[test]
-    fn ignores_unrelated_bitcoind_errors() {
-        let error = json!({
-            "code": -26,
-            "message": "mandatory-script-verify-flag-failed"
-        });
-
-        assert!(!is_not_in_mempool_error(&error));
-    }
 
     #[test]
     fn detects_bitcoind_already_in_mempool_error() {
@@ -362,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_transaction_prioritizes_when_tx_is_already_in_mempool() {
+    async fn priority_rpc_methods_use_expected_requests() {
         #[derive(Clone)]
         struct MockBitcoindState {
             requests: UnboundedSender<Value>,
@@ -393,6 +354,20 @@ mod tests {
                         "id": "dmnd-client"
                     })),
                 ),
+                Some("getprioritisedtransactions") => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "result": {
+                            "2fb7d2ab4ea206f3491ae234583c124d5087b6267308288e1359a6052fc477e1": {
+                                "fee_delta": 100_000_000,
+                                "in_mempool": true,
+                                "modified_fee": 100_010_000
+                            }
+                        },
+                        "error": null,
+                        "id": "dmnd-client"
+                    })),
+                ),
                 Some("prioritisetransaction") => (
                     StatusCode::OK,
                     Json(json!({
@@ -415,9 +390,8 @@ mod tests {
             }
         }
 
-        let expected_txid = transaction_from_hex(RAW_TX)
-            .expect("valid test transaction")
-            .compute_txid();
+        let transaction = transaction_from_hex(RAW_TX).expect("valid test transaction");
+        let expected_txid = transaction.compute_txid();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test server should bind");
@@ -436,13 +410,38 @@ mod tests {
             format!("http://{addr}"),
             "user".to_string(),
             "password".to_string(),
-            100_000_000,
         );
 
-        let txid = rpc
-            .submit_transaction(RAW_TX)
+        let prioritised_transactions = rpc
+            .get_prioritised_transactions()
             .await
-            .expect("already-in-mempool tx should still be prioritized");
+            .expect("getprioritisedtransactions should return the priority map");
+        assert_eq!(
+            prioritised_transactions,
+            std::collections::HashMap::from([(
+                expected_txid,
+                super::PrioTx {
+                    txid: expected_txid,
+                    fee_delta: 100_000_000,
+                    in_mempool: true,
+                    modified_fee: Some(100_010_000),
+                },
+            )])
+        );
+        let get_prioritised_request = received_requests
+            .recv()
+            .await
+            .expect("getprioritisedtransactions request");
+        assert_eq!(
+            get_prioritised_request["method"],
+            "getprioritisedtransactions"
+        );
+        assert_eq!(get_prioritised_request["params"], json!([]));
+
+        let txid = rpc
+            .submit_transaction(&transaction)
+            .await
+            .expect("already-in-mempool response should be accepted");
 
         assert_eq!(txid, expected_txid.to_string());
 
@@ -451,6 +450,11 @@ mod tests {
             .await
             .expect("sendrawtransaction request");
         assert_eq!(submit_request["method"], "sendrawtransaction");
+        assert_eq!(submit_request["params"], json!([RAW_TX]));
+
+        rpc.prioritise_transaction(&expected_txid, 100_000_000)
+            .await
+            .expect("fee delta adjustment should be applied");
 
         let prioritize_request = received_requests
             .recv()
@@ -461,6 +465,7 @@ mod tests {
             prioritize_request["params"],
             json!([expected_txid, 0, 100_000_000])
         );
+        assert!(received_requests.try_recv().is_err());
 
         server.abort();
     }

@@ -35,7 +35,7 @@ pub mod jd_client;
 mod merge_mining;
 mod minin_pool_connection;
 mod monitor;
-mod prioritized_transactions;
+pub mod prioritized_transactions;
 mod proxy_protocol;
 mod proxy_state;
 mod router;
@@ -98,6 +98,10 @@ pub(crate) fn share_log_enabled() -> bool {
     SHARE_LOG_ENABLED.load(Ordering::Relaxed)
 }
 
+fn supports_transaction_prioritization(environment: &str) -> bool {
+    matches!(environment, "production" | "local")
+}
+
 pub async fn start(config: Configuration) {
     Configuration::init(config);
     start_internal().await;
@@ -148,6 +152,12 @@ async fn start_internal() {
     }
     Configuration::log_prioritizing_txs_status();
 
+    if !supports_transaction_prioritization(&Configuration::environment())
+        || !Configuration::prioritizing_txs_enabled()
+    {
+        api::START_TX_PRIO.store(false, Ordering::Relaxed);
+    }
+
     Configuration::token().expect("TOKEN is not set");
 
     //`self_update` performs synchronous I/O so spawn_blocking is needed
@@ -180,6 +190,15 @@ async fn start_internal() {
             "production" => panic!("Pool address is missing"),
             _ => unreachable!(),
         });
+    if !api::reset_node_fee_deltas_at_startup().await {
+        error!("node prioritization has not been reset");
+    }
+
+    if api::START_TX_PRIO.load(Ordering::Relaxed) {
+        info!("Transaction prioritization activated");
+    } else {
+        warn!("Transaction prioritization is disabled");
+    }
 
     let mut router = router::Router::new(pool_addresses, auth_pub_k, None, None);
     let epsilon = Duration::from_millis(30_000);
@@ -399,4 +418,17 @@ async fn monitor(
 pub enum Reconnect {
     NewUpstream(std::net::SocketAddr), // Reconnecting with a new upstream
     NoUpstream,                        // Reconnecting without upstream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supports_transaction_prioritization;
+
+    #[test]
+    fn transaction_prioritization_is_supported_in_production_and_local() {
+        assert!(supports_transaction_prioritization("production"));
+        assert!(supports_transaction_prioritization("local"));
+        assert!(!supports_transaction_prioritization("staging"));
+        assert!(!supports_transaction_prioritization("testnet3"));
+    }
 }

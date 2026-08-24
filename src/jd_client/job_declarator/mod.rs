@@ -242,7 +242,11 @@ impl JobDeclarator {
             .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;
 
         let template_transactions = tx_list_.to_vec();
-        let prioritized_txids = crate::prioritized_transactions::snapshot_txids();
+        let mut prioritized_txids =
+            crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.snapshot_txids();
+        prioritized_txids.extend(
+            crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.snapshot_txids(),
+        );
         let mut template_txids = HashSet::with_capacity(template_transactions.len());
         let mut tx_list: Vec<Transaction> = Vec::new();
         let mut tx_ids = vec![];
@@ -263,11 +267,8 @@ impl JobDeclarator {
             }
         }
         let missing_txids = missing_prioritized_txids(&prioritized_txids, &template_txids);
-        if !missing_txids.is_empty() {
-            tokio::task::spawn(check_missing_prioritized_txids(
-                missing_txids,
-                template.template_id,
-            ));
+        for tx in missing_txids {
+            warn!("Prioritized txs missing from block. POssible cause: already have been mined. Txid: {}", tx);
         }
         let tx_ids: Seq064K<'static, U256> = Seq064K::from(tx_ids);
 
@@ -616,54 +617,13 @@ impl JobDeclarator {
 }
 
 fn missing_prioritized_txids(
-    prioritized_txids: &[Txid],
+    prioritized_txids: &HashSet<Txid>,
     template_txids: &HashSet<Txid>,
 ) -> Vec<Txid> {
     prioritized_txids
-        .iter()
-        .filter(|txid| !template_txids.contains(*txid))
+        .difference(template_txids)
         .copied()
         .collect()
-}
-
-// Prioritized transactions are submitted to bitcoind with a large virtual fee delta so they
-// should remain attractive for block templates while they are in the mempool. If such a
-// transaction is missing from a template, check getmempoolentry before logging an error: when
-// bitcoind no longer has it in the mempool, the most likely explanation is that it was mined.
-async fn check_missing_prioritized_txids(missing_txids: Vec<Txid>, template_id: u64) {
-    let Some(config) = crate::Configuration::bitcoind_rpc_config() else {
-        return;
-    };
-
-    let rpc = crate::api::bitcoin_rpc::BitcoindRpc::new(
-        config.url,
-        config.user,
-        config.pwd,
-        config.fee_delta,
-    );
-
-    for txid in missing_txids {
-        match rpc.transaction_in_mempool(&txid.to_string()).await {
-            Ok(true) => {
-                error!(
-                    txid = %txid,
-                    template_id,
-                    "prioritized transaction is in mempool but missing from template transaction list"
-                );
-            }
-            Ok(false) => {
-                crate::prioritized_transactions::remove(&txid);
-            }
-            Err(e) => {
-                warn!(
-                    txid = %txid,
-                    template_id,
-                    error = %e,
-                    "failed to check prioritized transaction mempool state"
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -681,7 +641,7 @@ mod tests {
         let a = txid(1);
         let b = txid(2);
         let c = txid(3);
-        let prioritized = vec![a, b];
+        let prioritized = HashSet::from([a, b]);
         let template = HashSet::from([a, b, c]);
 
         assert!(missing_prioritized_txids(&prioritized, &template).is_empty());
@@ -692,7 +652,7 @@ mod tests {
         let a = txid(1);
         let b = txid(2);
         let c = txid(3);
-        let prioritized = vec![a, b, c];
+        let prioritized = HashSet::from([a, b, c]);
         let template = HashSet::from([a, c]);
 
         assert_eq!(missing_prioritized_txids(&prioritized, &template), vec![b]);
