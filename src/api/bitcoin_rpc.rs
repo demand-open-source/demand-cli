@@ -4,16 +4,9 @@ use bitcoin::{
     consensus::encode::{deserialize_hex, serialize_hex},
     Txid,
 };
-use bitcoincore_rpc::{Auth, Client};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    collections::HashMap,
-    error::Error as StdError,
-    fmt,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, error::Error as StdError, fmt, time::Duration};
 use tracing::{debug, info};
 
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

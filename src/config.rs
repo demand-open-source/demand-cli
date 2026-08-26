@@ -158,6 +158,7 @@ impl ConfigFile {
         }
     }
 }
+
 #[derive(Debug)]
 pub struct Configuration {
     token: Option<String>,

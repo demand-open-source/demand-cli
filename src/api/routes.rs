@@ -3,20 +3,18 @@ use super::{
     utils::get_cpu_and_memory_usage,
     AppState, PRIORITIZED_TRANSACTIONS_POLL_LOCK,
 };
-use crate::{config::Configuration, db::history, proxy_state::ProxyState};
+use crate::{config::Configuration, proxy_state::ProxyState};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
-use bitcoin::{consensus::encode::serialize_hex, Txid};
+use bitcoin::Txid;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{error, info, warn};
-
-use serde_json::json;
 
 /// Render one received template for the dashboard.
 fn template_payload(
@@ -25,7 +23,8 @@ fn template_payload(
 ) -> serde_json::Value {
     let mut prioritized =
         crate::prioritized_transactions::PRIORITIZED_TRANSACTIONS.snapshot_txids();
-    prioritized.extend(crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.snapshot_txids());
+    prioritized
+        .extend(crate::prioritized_transactions::MEMPOOL_DOT_SPACE_ACCELERATED.snapshot_txids());
     let prioritized_included: Vec<String> = snapshot
         .transactions
         .iter()
@@ -74,12 +73,6 @@ fn template_payload(
         payload["transactions"] = json!(transactions);
     }
     payload
-}
-
-/// `None` keeps everything.
-#[derive(Debug, Deserialize)]
-pub struct HistoryRetentionRequest {
-    pub keep_blocks: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,105 +480,6 @@ impl Api {
 
         (StatusCode::OK, Json(APIResponse::success(Some(response))))
     }
-
-    /// One page of declarations, newest first.
-    pub async fn get_job_history(
-        Query(params): Query<std::collections::HashMap<String, String>>,
-    ) -> impl IntoResponse {
-        let Some(db) = crate::db::pool() else {
-            return no_database();
-        };
-        let page = params
-            .get("page")
-            .and_then(|p| p.parse::<i64>().ok())
-            .unwrap_or(1);
-        let per_page = params
-            .get("per_page")
-            .and_then(|p| p.parse::<i64>().ok())
-            .unwrap_or(10);
-
-        match history::page(db, page, per_page).await {
-            Ok(response) => (StatusCode::OK, Json(APIResponse::success(Some(response)))),
-            Err(e) => internal(format!("Failed to get job history: {e}")),
-        }
-    }
-
-    /// The transactions one declaration declared.
-    pub async fn get_job_txids(Path(template_id): Path<i64>) -> impl IntoResponse {
-        let Some(db) = crate::db::pool() else {
-            return no_database();
-        };
-        match history::txids(db, template_id).await {
-            Ok(txids) => (
-                StatusCode::OK,
-                Json(APIResponse::success(Some(json!({
-                    "template_id": template_id,
-                    "total": txids.len(),
-                    "txids": txids,
-                })))),
-            ),
-            Err(e) => internal(format!("Failed to get job txids: {e}")),
-        }
-    }
-
-    /// How many blocks of history the proxy is keeping.
-    pub async fn get_history_retention() -> impl IntoResponse {
-        let Some(db) = crate::db::pool() else {
-            return no_database();
-        };
-        (
-            StatusCode::OK,
-            Json(APIResponse::success(Some(json!({
-                "keep_blocks": history::keep_blocks(db).await,
-                "default_keep_blocks": history::default_keep_blocks(),
-            })))),
-        )
-    }
-
-    /// Set retention; null keeps everything.
-    pub async fn set_history_retention(
-        Json(request): Json<HistoryRetentionRequest>,
-    ) -> impl IntoResponse {
-        let Some(db) = crate::db::pool() else {
-            return no_database();
-        };
-        if let Some(keep) = request.keep_blocks {
-            if keep < 1 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(APIResponse::error(Some(
-                        "keep_blocks must be at least 1, or null to keep everything".to_string(),
-                    ))),
-                );
-            }
-        }
-        match history::set_keep_blocks(db, request.keep_blocks).await {
-            Ok(()) => {
-                info!(keep_blocks = ?request.keep_blocks, "history retention set");
-                (
-                    StatusCode::OK,
-                    Json(APIResponse::success(Some(
-                        json!({ "keep_blocks": request.keep_blocks }),
-                    ))),
-                )
-            }
-            Err(e) => internal(format!("Failed to set the history retention: {e}")),
-        }
-    }
-
-    /// Delete the whole history.
-    pub async fn clear_job_history() -> impl IntoResponse {
-        let Some(db) = crate::db::pool() else {
-            return no_database();
-        };
-        match history::clear(db).await {
-            Ok(removed) => (
-                StatusCode::OK,
-                Json(APIResponse::success(Some(json!({ "removed": removed })))),
-            ),
-            Err(e) => internal(format!("Failed to clear the job history: {e}")),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -642,24 +536,6 @@ pub struct APIResponse<T> {
     success: bool,
     message: Option<String>,
     data: Option<T>,
-}
-
-/// Shared 503 for database-backed endpoints.
-fn no_database<T: Serialize>() -> (StatusCode, Json<APIResponse<T>>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(APIResponse::error(Some(
-            "Database not available".to_string(),
-        ))),
-    )
-}
-
-fn internal<T: Serialize>(message: String) -> (StatusCode, Json<APIResponse<T>>) {
-    error!(%message);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(APIResponse::error(Some(message))),
-    )
 }
 
 impl<T: Serialize> APIResponse<T> {

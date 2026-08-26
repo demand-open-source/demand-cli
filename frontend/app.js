@@ -5,7 +5,6 @@ const TEMPLATE_REFRESH_INTERVAL = 5_000;
 
 const ROUTES = {
   "/dashboard/overview": "Overview",
-  "/dashboard/job-history": "Declared templates",
 };
 
 // Ranking criteria; keys are the backend policy names. `value` is null when a
@@ -49,14 +48,6 @@ const LOG_FILTERS = [
   ["error", "Errors"],
 ];
 
-// Retention choices; this bounds the database size.
-const HISTORY_RETENTIONS = [
-  [5, "last 5 blocks"],
-  [10, "last 10 blocks"],
-  [20, "last 20 blocks"],
-  ["", "until I delete"],
-];
-
 const state = {
   route: normalizeRoute(window.location.pathname),
   mode: localStorage.getItem("demand-mode") || "light",
@@ -74,15 +65,6 @@ const state = {
   logs: [],
   logFilter: "all",
   miners: null,
-  jobs: [],
-  jobPage: 1,
-  // How many blocks of history the proxy keeps; null means until deleted by hand.
-  historyKeepBlocks: 5,
-  jobPerPage: 10,
-  jobTotal: 0,
-  jobTotalPages: 0,
-  jobsLoading: false,
-  jobsError: null,
   // The newest template the poll has shown, so the next one is noticed.
   newestTemplateId: null,
   // Candidate summaries from /api/templates/recent, newest first.
@@ -104,8 +86,6 @@ const state = {
   // Prioritisation state; its endpoints use their own API token.
   prioritizationEnabled: null,
   prioritizedToken: localStorage.getItem("demand-tx-token") || "",
-  prioritized: [],
-  prioritizedError: null,
   prioritizing: false,
   // Current block height, used to notice tip changes.
   blockHeight: null,
@@ -153,15 +133,7 @@ const ICON_PATHS = {
   upload:
     '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>',
   copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
-  external:
-    '<path d="M15 3h6v6M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
   hash: '<path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/>',
-  chevronLeft: '<path d="m15 18-6-6 6-6"/>',
-  chevronRight: '<path d="m9 18 6-6-6-6"/>',
-  chevronsLeft: '<path d="m11 17-5-5 5-5M18 17l-5-5 5-5"/>',
-  chevronsRight: '<path d="m13 17 5-5-5-5M6 17l5-5-5-5"/>',
-  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12"/><circle cx="12" cy="12" r="3"/>',
-  trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v5M14 11v5"/>',
   undo: '<path d="M3 7v6h6"/><path d="M3 13a9 9 0 1 0 3-7.7L3 8"/>',
   info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
   layers:
@@ -178,7 +150,6 @@ function normalizeRoute(path) {
   const clean = path.replace(/\.html$/, "").replace(/\/$/, "") || "/";
   if (clean === "/" || clean === "/dashboard") return "/dashboard/overview";
   if (clean === "/overview") return "/dashboard/overview";
-  if (clean === "/history") return "/dashboard/job-history";
   return ROUTES[clean] ? clean : "/dashboard/overview";
 }
 
@@ -209,24 +180,6 @@ function formatBytes(value) {
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-const DATE_FORMAT = new Intl.DateTimeFormat("en-US", {
-  month: "long",
-  day: "numeric",
-  year: "numeric",
-  hour: "numeric",
-  minute: "2-digit",
-});
-
-function formatDate(value) {
-  if (!value) return "N/A";
-  const raw = Number(value);
-  const date = Number.isFinite(raw)
-    ? new Date(raw < 10_000_000_000 ? raw * 1000 : raw)
-    : new Date(value);
-  if (Number.isNaN(date.getTime())) return "N/A";
-  return DATE_FORMAT.format(date);
-}
-
 function shortHash(value, front = 8, back = 8) {
   const text = String(value || "");
   return text.length > front + back + 3
@@ -251,7 +204,6 @@ function renderShell() {
     <aside id="sidebar" class="sidebar">
       <nav class="sidebar-nav" aria-label="Dashboard navigation">
         ${sidebarLink("/dashboard/overview", "dashboard", "Dashboard")}
-        ${sidebarLink("/dashboard/job-history", "history", "Declared templates")}
       </nav>
     </aside>
     <div class="main-shell">
@@ -305,8 +257,7 @@ function navigate(route, replace = false) {
 
 function renderRoute() {
   closeModal();
-  if (state.route === "/dashboard/job-history") renderJobHistory();
-  else renderOverview();
+  renderOverview();
 }
 
 async function apiRequest(path, options = {}) {
@@ -352,7 +303,10 @@ function toast(title, description = "", type = "info", duration = 5_000) {
   const root = document.querySelector("#toast-root");
   const item = document.createElement("div");
   item.className = `toast ${type}`;
-  item.innerHTML = `<div class="toast-title">${escapeHtml(title)}</div>${description ? `<div class="toast-description">${escapeHtml(description)}</div>` : ""}`;
+  item.innerHTML = `<div class="toast-text">
+      <div class="toast-title">${escapeHtml(title)}</div>${description ? `<div class="toast-description">${escapeHtml(description)}</div>` : ""}
+    </div>
+    <button class="toast-close" type="button" data-action="dismiss-toast" aria-label="Dismiss">${icon("x", 14)}</button>`;
   root.append(item);
   window.setTimeout(() => item.remove(), duration);
 }
@@ -498,7 +452,7 @@ function renderOverview() {
   renderMiners();
   renderLogs();
   if (!state.templatesLoaded) loadTemplates();
-  loadPrioritized();
+  loadPrioritizationCapability();
   loadMiners();
 }
 
@@ -648,300 +602,6 @@ function summaryMetric(label, value) {
   return `<div class="summary-metric"><div class="summary-metric-label">${label}</div><div class="summary-metric-value">${value}</div></div>`;
 }
 
-function detail(label, value) {
-  return `<div><div class="detail-label">${label}</div><div class="detail-value">${escapeHtml(value)}</div></div>`;
-}
-
-function renderJobHistory() {
-  const page = currentPageElement();
-  page.className = "page compact-top";
-  page.innerHTML = `<section class="page-header">
-    <div><h1 class="page-title">Declared templates</h1><p class="page-description">Every template this proxy has declared, newest first, under the block it was declared for.</p></div>
-    <div class="page-actions"><button class="tiny-setting" type="button" data-action="open-retention" id="retention-open"></button></div>
-  </section><div id="job-history-content"></div>`;
-  renderJobHistoryContent();
-  if (!state.jobsLoading && !state.jobs.length && !state.jobsError)
-    loadJobHistory();
-  // Fetched once per page visit.
-  loadHistoryRetention();
-}
-
-async function loadJobHistory() {
-  state.jobsLoading = true;
-  state.jobsError = null;
-  renderJobHistoryContent();
-  try {
-    const data = await envelopeRequest(
-      `/api/job-history?page=${state.jobPage}&per_page=${state.jobPerPage}`,
-    );
-    state.jobs = data?.jobs || [];
-    state.jobTotal = Number(data?.total) || 0;
-    state.jobTotalPages = Number(data?.total_pages) || 0;
-  } catch (error) {
-    state.jobsError = error.message;
-  } finally {
-    state.jobsLoading = false;
-    renderJobHistoryContent();
-  }
-}
-
-async function loadHistoryRetention() {
-  try {
-    const data = await envelopeRequest("/api/history/retention");
-    state.historyKeepBlocks = data?.keep_blocks ?? null;
-  } catch (_) {
-    // Keep the last known value.
-  }
-  renderRetentionButton();
-}
-
-async function saveHistoryRetention(value) {
-  const keep_blocks = value === "" ? null : Number(value);
-  const previous = state.historyKeepBlocks;
-  state.historyKeepBlocks = keep_blocks;
-  try {
-    await envelopeRequest("/api/history/retention", {
-      method: "POST",
-      body: JSON.stringify({ keep_blocks }),
-    });
-    toast(
-      "Retention set",
-      keep_blocks === null
-        ? "History is kept until you delete it."
-        : `Only the last ${keep_blocks} blocks are kept. Anything older has been removed.`,
-      "success",
-    );
-    // Applied immediately by the proxy, so the list on screen is already stale.
-    loadJobHistory();
-  } catch (error) {
-    state.historyKeepBlocks = previous;
-    toast("Could not change the retention", error.message, "error");
-  }
-  // Patch the open dialog; a rejected change puts the radio back.
-  refreshRetentionModal();
-}
-
-function refreshRetentionModal() {
-  const form = document.querySelector("#retention-form");
-  if (!form) return;
-  const chosenValue = String(state.historyKeepBlocks ?? "");
-  form.querySelectorAll(".auto-declare-option").forEach((option) => {
-    const input = option.querySelector("input");
-    const chosen = input.value === chosenValue;
-    option.classList.toggle("is-chosen", chosen);
-    input.checked = chosen;
-  });
-  renderRetentionButton();
-}
-
-// Irreversible: the stored txid lists exist nowhere else.
-function openClearHistoryModal() {
-  const total = state.jobTotal;
-  if (!total) return;
-  openModal({
-    title: "Delete history",
-    description: `${formatNumber(total)} declaration${total === 1 ? "" : "s"} will be removed.`,
-    size: "",
-    body: `<p class="auto-declare-note">The transaction list each one declared exists nowhere
-        else — a candidate is dropped from memory the moment the tip moves. This cannot be undone.</p>
-      <div class="modal-actions">
-        <button class="btn" type="button" data-action="close-modal">Cancel</button>
-        <button class="btn danger" type="button" data-action="confirm-clear-history">${icon("trash", 14)} Delete all</button>
-      </div>`,
-  });
-}
-
-async function clearJobHistory() {
-  const total = state.jobTotal;
-  if (!total) return;
-  try {
-    const data = await envelopeRequest("/api/job-history", {
-      method: "DELETE",
-    });
-    toast(
-      "History deleted",
-      `${formatNumber(data?.removed ?? total)} removed.`,
-      "success",
-    );
-    state.jobPage = 1;
-    closeModal();
-    loadJobHistory();
-  } catch (error) {
-    toast("Could not delete the history", error.message, "error");
-  }
-}
-
-function renderJobHistoryContent() {
-  const root = document.querySelector("#job-history-content");
-  if (!root) return;
-  if (state.jobsError) {
-    root.innerHTML = `<section class="card history-error"><div>Error loading job history: ${escapeHtml(state.jobsError)}</div><button class="btn" type="button" data-action="refresh-history">${icon("refresh", 16)} Try Again</button></section>`;
-    return;
-  }
-  const totalPages = Math.max(1, state.jobTotalPages || 1);
-  const start = state.jobTotal ? (state.jobPage - 1) * state.jobPerPage + 1 : 0;
-  const end = Math.min(state.jobPage * state.jobPerPage, state.jobTotal);
-  root.innerHTML = `<section class="card history-card">
-    <div class="history-toolbar">
-      <div class="button-row" style="gap:.5rem">
-        <button class="btn small" type="button" data-action="refresh-history" ${state.jobsLoading ? "disabled" : ""}>${icon("refresh", 15)} Refresh</button>
-        <button class="btn small danger" type="button" data-action="clear-history" ${state.jobTotal ? "" : "disabled"}>${icon("trash", 14)} Delete all</button>
-      </div>
-      <span class="muted">${state.jobsLoading ? "Loading…" : `${state.jobTotal} declaration${state.jobTotal === 1 ? "" : "s"}`}</span>
-    </div>
-    <div class="table-shell"><table class="data-table history-table"><thead><tr><th>JD No</th><th>Template</th><th class="right">Fees (BTC)</th><th class="right">TXs</th><th class="right">Block fill</th><th>Channel</th><th>Mining Job Token</th><th>Declared</th><th>Actions</th></tr></thead><tbody>${renderJobRows()}</tbody></table></div>
-    <div class="history-pagination"><span>Showing ${start} to ${end} of ${state.jobTotal} entries</span><div class="pagination-controls"><label class="nowrap">Rows per page <select id="job-page-size" class="select-control"><option>10</option><option>20</option><option>30</option><option>50</option></select></label><span>Page ${state.jobPage} of ${totalPages}</span><button class="icon-btn" data-job-page="first" ${state.jobPage <= 1 ? "disabled" : ""}>${icon("chevronsLeft", 15)}</button><button class="icon-btn" data-job-page="previous" ${state.jobPage <= 1 ? "disabled" : ""}>${icon("chevronLeft", 15)}</button><button class="icon-btn" data-job-page="next" ${state.jobPage >= totalPages ? "disabled" : ""}>${icon("chevronRight", 15)}</button><button class="icon-btn" data-job-page="last" ${state.jobPage >= totalPages ? "disabled" : ""}>${icon("chevronsRight", 15)}</button></div></div>
-  </section>`;
-  const pageSize = root.querySelector("#job-page-size");
-  if (pageSize) pageSize.value = String(state.jobPerPage);
-  renderRetentionButton();
-}
-
-function renderRetentionButton() {
-  const button = document.querySelector("#retention-open");
-  if (!button) return;
-  button.innerHTML = `${icon("sliders", 13)} Keeping ${escapeHtml(retentionLabel())}`;
-}
-
-function retentionLabel() {
-  const match = HISTORY_RETENTIONS.find(
-    ([value]) => value === String(state.historyKeepBlocks ?? ""),
-  );
-  return match ? match[1] : "last 5 blocks";
-}
-
-function openRetentionModal() {
-  openModal({
-    title: "History",
-    description: "",
-    size: "",
-    body: `<form id="retention-form" class="auto-declare">
-      ${HISTORY_RETENTIONS.map(
-        ([
-          value,
-          label,
-        ]) => `<label class="auto-declare-option ${String(state.historyKeepBlocks ?? "") === value ? "is-chosen" : ""}">
-          <input type="radio" name="keep_blocks" value="${escapeHtml(value)}" ${String(state.historyKeepBlocks ?? "") === value ? "checked" : ""} />
-          <span class="auto-declare-copy"><strong>${escapeHtml(label)}</strong></span>
-        </label>`,
-      ).join("")}
-      <p class="auto-declare-note">Older blocks are dropped as they fall outside this.</p>
-    </form>`,
-  });
-}
-
-const HISTORY_COLUMNS = 9;
-
-// History rows, grouped under the block each declaration was for.
-function renderJobRows() {
-  if (state.jobsLoading && !state.jobs.length)
-    return `<tr><td colspan="${HISTORY_COLUMNS}" class="empty-cell">Loading…</td></tr>`;
-  if (!state.jobs.length)
-    return `<tr><td colspan="${HISTORY_COLUMNS}" class="empty-cell">Nothing has been declared yet.</td></tr>`;
-
-  // Mark rows still live on the current tip.
-  const liveIds = new Set(
-    state.templates.map((template) => template.template_id),
-  );
-  const perBlock = new Map();
-  for (const job of state.jobs)
-    perBlock.set(job.height, (perBlock.get(job.height) || 0) + 1);
-
-  const rows = [];
-  let block;
-
-  state.jobs.forEach((job, index) => {
-    if (index === 0 || job.height !== block) {
-      block = job.height;
-      const inBlock = perBlock.get(block);
-      rows.push(`<tr class="hist-block"><td colspan="${HISTORY_COLUMNS}">
-        ${icon("layers", 13)}
-        <strong>${known(block) ? `Block ${formatNumber(block)}` : "Block not recorded"}</strong>
-        <span class="muted">${formatNumber(inBlock)} declaration${inBlock === 1 ? "" : "s"} on this page${known(block) ? "" : " · declared before the block was stored with it"}</span>
-      </td></tr>`);
-    }
-
-    const isInForce = Number(job.template_id) === state.activeDeclaration;
-    const isLive = liveIds.has(Number(job.template_id));
-    const fill = known(job.total_weight)
-      ? `${((job.total_weight / MAX_BLOCK_WEIGHT) * 100).toFixed(2)}%`
-      : '<span class="muted">—</span>';
-
-    rows.push(`<tr>
-      <td><strong>#${formatNumber(job.id)}</strong></td>
-      <td><span class="inline" style="gap:.35rem"><code>${escapeHtml(job.template_id)}</code>${
-        isInForce
-          ? `<span class="tplx-chip tplx-chip-declared" title="This is the declaration in use for the block being mined now">${icon("check", 10)} in use</span>`
-          : isLive
-            ? '<span class="tplx-chip" title="Still a candidate for the block being mined now">current block</span>'
-            : ""
-      }</span></td>
-      <td class="right">${known(job.total_fees_sat) ? formatBtc(job.total_fees_sat) : '<span class="muted">—</span>'}</td>
-      <td class="right">${formatNumber(job.txid_count)}</td>
-      <td class="right">${fill}</td>
-      <td><span class="badge">CH-${escapeHtml(job.channel_id)}</span></td>
-      <td><span class="inline" style="gap:.35rem"><code>${escapeHtml(shortHash(job.mining_job_token))}</code><button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(job.mining_job_token)}" aria-label="Copy mining job token">${icon("copy", 13)}</button></span></td>
-      <td class="muted">${escapeHtml(formatDate(job.created_at))}</td>
-      <td><button class="btn ghost small" type="button" data-view-txids="${escapeHtml(job.template_id)}">${icon("eye", 14)} View TXIDs</button></td>
-    </tr>`);
-  });
-
-  return rows.join("");
-}
-
-async function openJobTxids(templateId) {
-  openModal({
-    title: `Job TXIDs - Template ${templateId}`,
-    description: "Transaction IDs included in this job declaration",
-    size: "xlarge",
-    body: '<div class="empty-cell" style="display:grid;place-items:center">Loading transaction IDs...</div>',
-  });
-  try {
-    const data = await envelopeRequest(
-      `/api/job-txids/${encodeURIComponent(templateId)}`,
-    );
-    const txids = data?.txids || [];
-    state.modalCopyText = txids.join("\n");
-    openModal({
-      title: `Job TXIDs - Template ${templateId}`,
-      description: "Transaction IDs included in this job declaration",
-      size: "xlarge",
-      body: `<div class="detail-card"><h4>${icon("hash", 16)} Transaction Summary</h4><div class="details-grid">${detail("Template ID", data?.template_id ?? templateId)}${detail("Total TXIDs", data?.total ?? txids.length)}</div></div>
-      <div class="validation-head" style="margin:1rem 0"><span class="badge">${txids.length} Transaction${txids.length === 1 ? "" : "s"}</span><div class="button-row" style="gap:.5rem"><button class="btn small" type="button" data-action="copy-modal-text">${icon("copy", 14)} Copy All</button><button class="btn small" type="button" data-export-txids="${escapeHtml(templateId)}">${icon("download", 14)} Export CSV</button></div></div>
-      <h4>Transaction IDs</h4><div class="txid-list">${txids.map((txid, index) => `<div class="txid-row"><span class="badge">${index + 1}</span><span class="txid-value" title="${escapeHtml(txid)}">${escapeHtml(txid)}</span><div class="button-row"><button class="icon-btn btn ghost" data-copy="${escapeHtml(txid)}" aria-label="Copy transaction ID">${icon("copy", 14)}</button><a class="icon-btn btn ghost" href="https://mempool.space/tx/${encodeURIComponent(txid)}" target="_blank" rel="noopener noreferrer" aria-label="View on mempool.space">${icon("external", 14)}</a></div></div>`).join("")}</div>`,
-    });
-    document
-      .querySelector("[data-export-txids]")
-      ?.addEventListener(
-        "click",
-        () =>
-          downloadText(
-            ["txid", ...txids].join("\n"),
-            `job-txids-${templateId}.csv`,
-            "text/csv;charset=utf-8",
-          ),
-        { once: true },
-      );
-  } catch (error) {
-    openModal({
-      title: `Job TXIDs - Template ${templateId}`,
-      description: "Transaction IDs included in this job declaration",
-      body: `<div class="history-error">Error: ${escapeHtml(error.message)}</div>`,
-    });
-  }
-}
-
-function changeJobPage(action) {
-  const totalPages = Math.max(1, state.jobTotalPages || 1);
-  if (action === "first") state.jobPage = 1;
-  else if (action === "previous")
-    state.jobPage = Math.max(1, state.jobPage - 1);
-  else if (action === "next")
-    state.jobPage = Math.min(totalPages, state.jobPage + 1);
-  else if (action === "last") state.jobPage = totalPages;
-  loadJobHistory();
-}
-
 async function copyWithToast(text) {
   try {
     await copyText(text);
@@ -972,10 +632,7 @@ const CLICK_ACTIONS = {
     if (!event.target.closest("[data-panel]") || target.closest("button"))
       closePanel();
   },
-  "refresh-history": () => loadJobHistory(),
-  "open-retention": () => openRetentionModal(),
-  "clear-history": () => openClearHistoryModal(),
-  "confirm-clear-history": () => clearJobHistory(),
+  "dismiss-toast": (event, target) => target.closest(".toast")?.remove(),
   "refresh-templates": () => loadTemplates(),
   "open-prioritize": () => openPrioritizePanel(),
   "open-auto-declare": () => openAutoDeclareModal(),
@@ -1013,12 +670,6 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  const jobPage = event.target.closest("[data-job-page]");
-  if (jobPage) return changeJobPage(jobPage.dataset.jobPage);
-
-  const viewTxids = event.target.closest("[data-view-txids]");
-  if (viewTxids) return openJobTxids(viewTxids.dataset.viewTxids);
-
   const copy = event.target.closest("[data-copy]");
   if (copy) return copyWithToast(copy.dataset.copy);
 
@@ -1034,15 +685,6 @@ document.addEventListener("change", async (event) => {
     // Switching sort resets the direction to descending.
     state.templateSort = { key: target.value, direction: "desc" };
     renderTemplatesSection();
-  } else if (
-    target.name === "keep_blocks" &&
-    target.closest("#retention-form")
-  ) {
-    await saveHistoryRetention(target.value);
-  } else if (target.id === "job-page-size") {
-    state.jobPerPage = Number(target.value);
-    state.jobPage = 1;
-    loadJobHistory();
   }
 });
 
@@ -1055,8 +697,10 @@ document.addEventListener("submit", async (event) => {
       state.prioritizedToken = token;
       localStorage.setItem("demand-tx-token", token);
     }
-    const hex = String(data.get("tx") || "").trim();
-    if (hex) await prioritizeTransaction(hex);
+    const txid = String(data.get("txid") || "").trim();
+    const feeDelta = Number(data.get("feedelta"));
+    if (txid && Number.isFinite(feeDelta) && feeDelta !== 0)
+      await prioritizeTransaction(txid, feeDelta);
     return;
   }
 });
@@ -1128,8 +772,6 @@ async function fetchTemplates() {
   }
   state.templatesLoaded = true;
   renderTemplatesSection();
-  // The history page marks live candidates from this payload.
-  if (state.route === "/dashboard/job-history") renderJobHistoryContent();
 }
 
 function noticeNewTemplate() {
@@ -1619,6 +1261,7 @@ function criterionLabel(key) {
 // Right-side panel, for tasks rather than reading.
 function openPanel({ title, description = "", body = "", footer = "" }) {
   const root = document.querySelector("#panel-root");
+  const wasOpen = !!root.querySelector("[data-panel]");
   root.innerHTML = `<div class="panel-overlay" data-action="close-panel">
     <section class="panel" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}" data-panel>
       <header class="panel-head">
@@ -1632,9 +1275,10 @@ function openPanel({ title, description = "", body = "", footer = "" }) {
       ${footer ? `<footer class="panel-foot">${footer}</footer>` : ""}
     </section>
   </div>`;
-  requestAnimationFrame(() =>
-    root.querySelector("input, textarea, button")?.focus(),
-  );
+  if (!wasOpen)
+    requestAnimationFrame(() =>
+      root.querySelector("input, textarea, button")?.focus(),
+    );
 }
 
 function closePanel() {
@@ -1647,8 +1291,7 @@ function openPrioritizePanel() {
   const needsToken = !state.prioritizedToken;
   openPanel({
     title: "Prioritise a transaction",
-    body: `${renderPrioritizedList()}
-      <form id="prio-panel-form" class="panel-form">
+    body: `<form id="prio-panel-form" class="panel-form">
         ${
           needsToken
             ? `<label class="panel-field">
@@ -1659,14 +1302,26 @@ function openPrioritizePanel() {
             : ""
         }
         <label class="panel-field">
-          <span class="panel-label">Raw transaction <span class="muted">hex</span></span>
-          <textarea class="panel-input panel-textarea" name="tx" rows="7" spellcheck="false" autocomplete="off" placeholder="0200000001..." required></textarea>
+          <span class="panel-label">Transaction <span class="muted">txid</span></span>
+          <input class="panel-input" type="text" name="txid" spellcheck="false" autocomplete="off" pattern="[0-9a-fA-F]{64}" placeholder="e3b0c44298fc1c14..." required />
         </label>
-        ${state.prioritizedError ? `<p class="tplx-note is-error">${escapeHtml(state.prioritizedError)}</p>` : ""}
+        <label class="panel-field">
+          <span class="panel-label">Fee delta <span class="muted">sats</span></span>
+          <input class="panel-input" type="number" name="feedelta" step="1" value="100000" required />
+        </label>
+        <div class="panel-form-actions">
+          <button class="btn pill" type="button" data-action="close-panel">Cancel</button>
+          <button class="btn pill primary" id="prio-submit" type="submit">Submit</button>
+        </div>
       </form>`,
-    footer: `<button class="btn pill" type="button" data-action="close-panel">Cancel</button>
-      <button class="btn pill primary panel-submit" type="submit" form="prio-panel-form" ${state.prioritizing ? "disabled" : ""}>${state.prioritizing ? "Sending…" : "Prioritise transaction"}</button>`,
   });
+}
+
+function setPrioritizingUI(busy) {
+  const button = document.querySelector("#prio-submit");
+  if (!button) return;
+  button.disabled = busy;
+  button.textContent = busy ? "Sending…" : "Prioritise transaction";
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,57 +1329,14 @@ function openPrioritizePanel() {
 // *next*. Endpoints authenticate with API_TX_TOKEN, kept in this browser only.
 // ---------------------------------------------------------------------------
 
-// "Not in a candidate yet" is the normal first state.
-function renderPrioritizedList() {
-  if (!state.prioritizedToken) return "";
-
-  const carriers = new Map();
-  for (const template of state.templates) {
-    for (const txid of template.prioritized_included || []) {
-      if (!carriers.has(txid)) carriers.set(txid, []);
-      carriers.get(txid).push(template.template_id);
-    }
-  }
-
-  if (!state.prioritized.length) {
-    return `<section class="panel-section"><h3 class="panel-section-title">Currently prioritised</h3>
-      <p class="panel-hint">No prioritised transactions yet</p></section>`;
-  }
-
-  return `<section class="panel-section">
-    <h3 class="panel-section-title">Currently prioritised <span class="muted">${formatNumber(state.prioritized.length)}</span></h3>
-    <ul class="prio-list">${state.prioritized
-      .map((tx) => {
-        const inTemplates = carriers.get(tx.txid) || [];
-        return `<li class="prio-row">
-          <span class="inline" style="gap:.3rem">
-            <code title="${escapeHtml(tx.txid)}">${escapeHtml(shortHash(tx.txid, 8, 6))}</code>
-            <button class="icon-btn btn ghost" type="button" data-copy="${escapeHtml(tx.txid)}" aria-label="Copy transaction ID">${icon("copy", 12)}</button>
-          </span>
-          <span class="prio-fee" title="The fee bitcoind sees for it: its own, then the one the delta gives it">${escapeHtml(formatBtcFee(tx.tx_fee?.real))} → <strong>${escapeHtml(formatBtcFee(tx.tx_fee?.modified))}</strong></span>
-          <span class="prio-in">${
-            inTemplates.length
-              ? `<span class="tplx-chip tplx-chip-prio" title="Candidates that carry it">${icon("check", 10)} ${inTemplates.map((id) => `#${formatNumber(id)}`).join(" ")}</span>`
-              : '<span class="muted">not in a candidate yet</span>'
-          }</span>
-        </li>`;
-      })
-      .join("")}</ul>
-  </section>`;
-}
-
-// The RPC reports fees in BTC; show sats.
-function formatBtcFee(btc) {
-  if (!known(btc)) return "—";
-  return `${Number(btc).toFixed(8).replace(/0+$/, "").replace(/\.$/, "")} BTC`;
-}
-
 function updatePrioritizeButton() {
   const button = document.querySelector("#prio-open");
   if (button) button.hidden = state.prioritizationEnabled !== true;
 }
 
-async function loadPrioritized() {
+// Whether the proxy was started with the RPC credentials and API token the
+// prioritisation endpoints need. Decides if the button is offered at all.
+async function loadPrioritizationCapability() {
   if (state.prioritizationEnabled === null) {
     try {
       const capabilities = await envelopeRequest("/api/capabilities");
@@ -1732,63 +1344,87 @@ async function loadPrioritized() {
         capabilities?.transaction_prioritization,
       );
     } catch (error) {
-      state.prioritizationEnabled = false;
+      state.prioritizationEnabled = null;
     }
   }
   updatePrioritizeButton();
-  if (!state.prioritizationEnabled || !state.prioritizedToken) return;
+}
+
+// Submit a raw transaction and have bitcoind prioritise it.
+// One transaction should not be prioritised by both bitcoind and mempool.space, so check the former first.
+async function passesMempoolSpaceCheck(txid) {
+  let accelerated;
   try {
     const data = await envelopeRequest("/api/tx/prioritized", {
       headers: { Authorization: `Bearer ${state.prioritizedToken}` },
     });
-    state.prioritized = data?.txs || [];
-    state.prioritizedError = null;
+    accelerated = Object.keys(data?.mempool_space || {});
   } catch (error) {
-    state.prioritized = [];
-    state.prioritizedError = /unauthorized/i.test(error.message)
-      ? "That token was rejected. It is the proxy's API_TX_TOKEN."
-      : error.message;
+    toast(
+      "Check failed",
+      "Could not verify this transaction. Try again.",
+      "error",
+    );
+    addLog(
+      "PrioritizeTransaction",
+      "WARNING",
+      `Check failed for ${txid}: ${error.message}`,
+    );
+    return false;
   }
-  // Redraw only if the panel is open.
-  if (document.querySelector("#prio-panel-form")) openPrioritizePanel();
+
+  // bitcoind reports txids in lower case; the field accepts either.
+  if (accelerated.some((id) => id.toLowerCase() === txid.toLowerCase())) {
+    toast(
+      "Already prioritised",
+      "mempool.space is already prioritising this transaction.",
+      "error",
+    );
+    addLog(
+      "PrioritizeTransaction",
+      "WARNING",
+      `${txid} is already prioritised by mempool.space`,
+    );
+    return false;
+  }
+
+  return true;
 }
 
-// Submit a raw transaction and have bitcoind prioritise it.
-async function prioritizeTransaction(hex) {
+async function prioritizeTransaction(txid, feeDelta) {
   state.prioritizing = true;
-  if (document.querySelector("#prio-panel-form")) openPrioritizePanel();
+  setPrioritizingUI(true);
   try {
-    // The endpoint takes the tx in the path.
-    const txid = await envelopeRequest(
-      `/api/tx/submit/${encodeURIComponent(hex)}`,
+    if (!(await passesMempoolSpaceCheck(txid))) return;
+    // Both the txid and the delta go in the path.
+    await envelopeRequest(
+      `/api/tx/prioritize/${encodeURIComponent(txid)}/${encodeURIComponent(feeDelta)}`,
       {
         method: "POST",
         headers: { Authorization: `Bearer ${state.prioritizedToken}` },
       },
     );
     toast(
-      "Prioritised",
-      `bitcoind accepted ${shortHash(String(txid), 8, 6)}. It can appear in the next template.`,
+      "Transaction prioritised",
+      `Transaction ${txid} is successfully prioritised by ${feeDelta} sats`,
       "success",
     );
     addLog(
       "PrioritizeTransaction",
       "INFO",
-      `Submitted ${txid} for prioritisation`,
+      `Prioritised ${txid} by ${feeDelta} sats`,
     );
-    state.prioritizedError = null;
     closePanel();
   } catch (error) {
-    state.prioritizedError = error.message;
+    toast("Prioritisation failed", error.message, "error");
     addLog(
       "PrioritizeTransactionError",
       "ERROR",
       `Prioritisation failed: ${error.message}`,
     );
-    openPrioritizePanel();
   } finally {
     state.prioritizing = false;
-    await loadPrioritized();
+    setPrioritizingUI(false);
   }
 }
 
@@ -1820,7 +1456,7 @@ async function refreshTemplateModal() {
       title: `Template ${templateId}`,
       description: "Transactions in this template",
       size: "xlarge",
-      body: `<div class="history-error">Error: ${escapeHtml(error.message)}</div>`,
+      body: `<div class="modal-error">Error: ${escapeHtml(error.message)}</div>`,
     });
     return;
   }

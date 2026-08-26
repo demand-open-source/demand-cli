@@ -13,13 +13,12 @@ use std::{
 
 use crate::{
     api::bitcoin_rpc::{BitcoindRpc, BitcoindRpcError},
-    config,
     dashboard::{assets::static_handler, open_dashboard},
     router::Router,
     Configuration,
 };
 use axum::{
-    routing::{delete, get, post},
+    routing::{get, post},
     Router as AxumRouter,
 };
 use bitcoin::{
@@ -28,7 +27,7 @@ use bitcoin::{
 };
 use routes::Api;
 use stats::StatsSender;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const MEMPOOL_SPACE_API_BASE_URL: &str = "https://mempool.space/api";
 const PRIORITIZED_TRANSACTIONS_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -154,10 +153,6 @@ pub(crate) async fn start(
         }
     }
 
-    if let Err(e) = crate::db::init().await {
-        warn!("Failed to open the database; job history will not be recorded: {e}");
-    }
-
     let state = AppState {
         router,
         stats_sender,
@@ -196,13 +191,6 @@ pub(crate) async fn start(
         .route("/api/templates/recent", get(Api::get_recent_templates))
         .route("/api/declaration-policy", post(Api::set_declaration_policy))
         .route("/api/templates/{template_id}", get(Api::get_template_by_id))
-        .route("/api/job-history", get(Api::get_job_history))
-        .route("/api/job-history", delete(Api::clear_job_history))
-        .route(
-            "/api/history/retention",
-            get(Api::get_history_retention).post(Api::set_history_retention),
-        )
-        .route("/api/job-txids/{template_id}", get(Api::get_job_txids))
         // Dashboard routes
         .route("/", get(static_handler))
         .route("/{*path}", get(static_handler))

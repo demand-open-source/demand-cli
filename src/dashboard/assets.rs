@@ -16,11 +16,7 @@ fn resolve_asset_path(request_path: Option<&str>) -> String {
 
     match path {
         "app.css" | "app.js" => path.to_string(),
-        "index.html"
-        | "overview.html"
-        | "history.html"
-        | "dashboard/overview.html"
-        | "dashboard/job-history.html" => SPA_INDEX.to_string(),
+        "index.html" | "overview.html" | "dashboard/overview.html" => SPA_INDEX.to_string(),
         path if path.contains('.') => path.to_string(),
         _ => SPA_INDEX.to_string(),
     }
@@ -52,10 +48,8 @@ mod tests {
     #[test]
     fn application_routes_resolve_to_the_spa() {
         let overview = resolve_asset_path(Some("dashboard/overview"));
-        let history = resolve_asset_path(Some("dashboard/job-history"));
 
         assert_eq!(overview, SPA_INDEX);
-        assert_eq!(history, SPA_INDEX);
         assert_eq!(
             resolve_asset_path(Some("dashboard/overview.html")),
             SPA_INDEX

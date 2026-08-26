@@ -311,11 +311,9 @@ pub fn clear_for_new_tip() {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     pending(|in_flight| in_flight.clear());
-    crate::db::history::prune_for_new_tip();
 }
 
 struct Pending {
-    mining_job_token: Option<Vec<u8>>,
     sent_at: Instant,
 }
 
@@ -334,35 +332,19 @@ pub fn declaration_sent(template_id: u64) {
         in_flight.insert(
             template_id,
             Pending {
-                mining_job_token: None,
                 sent_at: Instant::now(),
             },
         )
     });
 }
 
-/// The token the pool issued, which arrives before it accepts the job.
-pub fn declaration_token(template_id: u64, mining_job_token: &[u8]) {
-    pending(|in_flight| {
-        if let Some(held) = in_flight.get_mut(&template_id) {
-            held.mining_job_token = Some(mining_job_token.to_vec());
-        }
-    });
-}
-
-/// The pool accepted the declaration: mark it active and record it.
-pub fn declaration_accepted(template_id: u64, channel_id: u32, job_id: u32) {
+/// The pool accepted the declaration: mark it active.
+pub fn declaration_accepted(template_id: u64) {
     let Some(held) = pending(|in_flight| in_flight.remove(&template_id)) else {
         return;
     };
     set_active_declaration(template_id);
     crate::api::stats::record_declaration_latency(held.sent_at.elapsed().as_millis() as u64);
-    tokio::spawn(crate::db::history::record(
-        template_id,
-        channel_id,
-        job_id,
-        held.mining_job_token,
-    ));
 }
 
 /// One candidate by id.

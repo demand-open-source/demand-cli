@@ -29,7 +29,6 @@ mod api;
 mod auto_update;
 mod config;
 mod dashboard;
-mod db;
 mod debug_timing;
 mod ingress;
 pub use config::Configuration;
@@ -275,6 +274,7 @@ async fn initialize_proxy(
                 return;
             }
         };
+
         if let Some(_tp_addr) = tp {
             jdc_abortable = jd_client::start(
                 jdc_from_translator_receiver,

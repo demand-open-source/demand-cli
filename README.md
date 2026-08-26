@@ -59,7 +59,7 @@ The Template Provider listens on port **8336** by default — you'll need that i
 
 ### Dashboard
 
-The client serves a local dashboard at `http://127.0.0.1:3001` (set the port with `--api-server-port`). It shows pool and miner status, the block templates sv2-tp is offering, and the history of declared templates; from it you can choose how much history to keep and ask bitcoind to prioritise a transaction. It opens in a browser on start; set `HEADFUL=false` to stop that.
+The client serves a local dashboard at `http://127.0.0.1:3001` (set the port with `--api-server-port`). It shows pool and miner status and the block templates sv2-tp is offering, and lets you ask bitcoind to prioritise a transaction. It opens in a browser on start; set `HEADFUL=false` to stop that.
 
 ## 4. Run the DMND Client
 
