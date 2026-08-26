@@ -225,14 +225,21 @@ impl Api {
 
     pub async fn get_capabilities(State(state): State<AppState>) -> impl IntoResponse {
         Json(APIResponse::success(Some(json!({
-            "templates": true,
-            // Needs RPC credentials and an API token.
+            // Both need the RPC credentials and the API token.
+            "templates": state.prioritizing_txs.is_some(),
             "transaction_prioritization": state.prioritizing_txs.is_some()
         }))))
     }
 
     /// Candidates for the current tip, newest first.
-    pub async fn get_recent_templates() -> impl IntoResponse {
+    pub async fn get_recent_templates(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        if let Some(refusal) = check_authorization(&state, &headers) {
+            return refusal;
+        }
+
         let policy = crate::block_templates::declaration_policy();
         let templates: Vec<serde_json::Value> = crate::block_templates::with_candidates(|held| {
             held.iter()
@@ -240,21 +247,30 @@ impl Api {
                 .collect()
         });
 
-        Json(APIResponse::success(Some(json!({
-            "templates": templates,
-            "candidate_limit": crate::block_templates::CANDIDATE_LIMIT,
-            // The declaration the pool has accepted
-            "active_declaration": crate::block_templates::active_declaration(),
-            "policy": policy.as_str(),
-            // What the policy resolves to
-            "policy_pick": crate::block_templates::policy_pick(policy),
-        }))))
+        (
+            StatusCode::OK,
+            Json(APIResponse::success(Some(json!({
+                "templates": templates,
+                "candidate_limit": crate::block_templates::CANDIDATE_LIMIT,
+                // The declaration the pool has accepted
+                "active_declaration": crate::block_templates::active_declaration(),
+                "policy": policy.as_str(),
+                // What the policy resolves to
+                "policy_pick": crate::block_templates::policy_pick(policy),
+            })))),
+        )
     }
 
     /// Set which candidate gets auto-declared.
     pub async fn set_declaration_policy(
+        State(state): State<AppState>,
+        headers: HeaderMap,
         Json(request): Json<DeclarationPolicyRequest>,
     ) -> impl IntoResponse {
+        if let Some(refusal) = check_authorization(&state, &headers) {
+            return refusal;
+        }
+
         let Some(policy) = crate::block_templates::DeclarationPolicy::parse(&request.policy) else {
             return (
                 StatusCode::BAD_REQUEST,
@@ -275,7 +291,15 @@ impl Api {
     }
 
     /// One received template with its full transaction list.
-    pub async fn get_template_by_id(Path(template_id): Path<u64>) -> impl IntoResponse {
+    pub async fn get_template_by_id(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path(template_id): Path<u64>,
+    ) -> impl IntoResponse {
+        if let Some(refusal) = check_authorization(&state, &headers) {
+            return refusal;
+        }
+
         let Some(snapshot) = crate::block_templates::by_id(template_id) else {
             return (
                 StatusCode::NOT_FOUND,
@@ -522,6 +546,32 @@ fn is_authorized_for_tx_prioritization(headers: &HeaderMap, expected_token: &str
         .is_some_and(|token| token == expected_token)
 }
 
+/// Checks if the request is authorized based on the provided headers and the expected API token.
+fn check_authorization<T: Serialize>(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, Json<APIResponse<T>>)> {
+    let Some(prioritizing_txs) = state.prioritizing_txs.as_ref() else {
+        warn!("PRIORITIZING TXS NOT ENABLED");
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(APIResponse::error(Some(
+                "PRIORITIZING TXS NOT ENABLED".to_string(),
+            ))),
+        ));
+    };
+
+    if !is_authorized_for_tx_prioritization(headers, &prioritizing_txs.api_tx_token) {
+        warn!("unauthorized job declaration request");
+        return Some((
+            StatusCode::UNAUTHORIZED,
+            Json(APIResponse::error(Some("Unauthorized".to_string()))),
+        ));
+    }
+
+    None
+}
+
 #[derive(Serialize)]
 struct AggregateStates {
     total_connected_device: u32,
@@ -563,6 +613,9 @@ async fn health_check_reports_full_translator_handoff() {
     use std::{net::IpAddr, time::Instant};
     use tokio::sync::mpsc;
 
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
     let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let (send_to_upstream, recv_from_downstream) = mpsc::channel(1);
 
@@ -575,9 +628,8 @@ async fn health_check_reports_full_translator_handoff() {
         })
         .expect("test handoff queue should accept first item");
 
-    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
     let state = AppState {
-        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
+        router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -601,10 +653,13 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
     use axum::response::IntoResponse;
     use tokio::sync::mpsc;
 
-    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
+
     let state = AppState {
-        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
+        router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: None,
@@ -627,10 +682,12 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
     use axum::response::IntoResponse;
     use tokio::sync::mpsc;
 
-    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let state = AppState {
-        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
+        router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -973,10 +1030,12 @@ async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
             .expect("test server should run");
     });
 
-    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    let router = crate::router::Router::new(vec![], auth_pub_k, None, None);
+
+    let (handoff_tx, _handoff_rx) = mpsc::channel(1);
     let state = AppState {
-        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
+        router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
         prioritizing_txs: Some(super::PrioritizingTxs {
@@ -1045,4 +1104,147 @@ fn tx_prioritization_auth_accepts_matching_bearer_token() {
     headers.insert(AUTHORIZATION, "Bearer api-token".parse().unwrap());
 
     assert!(is_authorized_for_tx_prioritization(&headers, "api-token"));
+}
+
+#[cfg(test)]
+fn declaration_test_state(api_tx_token: Option<&str>) -> AppState {
+    let (handoff_tx, _handoff_rx) = tokio::sync::mpsc::channel(1);
+    let auth_pub_k = crate::AUTH_PUB_KEY.parse().expect("Invalid public key");
+    AppState {
+        router: crate::router::Router::new(vec![], auth_pub_k, None, None),
+        stats_sender: crate::api::stats::StatsSender::new(),
+        downstream_handoff: handoff_tx,
+        prioritizing_txs: api_tx_token.map(|token| super::PrioritizingTxs {
+            rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
+                "http://127.0.0.1:8332".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+            )),
+            api_tx_token: token.to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn bearer(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    headers
+}
+
+// The token gates the templates a caller can read and the criterion it can
+// change, so all three routes refuse the same way.
+#[tokio::test]
+async fn job_declaration_routes_require_the_bearer_token() {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+
+    let wrong_token = bearer("not-the-token");
+    for headers in [HeaderMap::new(), wrong_token] {
+        let state = declaration_test_state(Some("api-token"));
+        assert_eq!(
+            Api::get_recent_templates(State(state.clone()), headers.clone())
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            Api::get_template_by_id(State(state.clone()), headers.clone(), Path(1))
+                .await
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            Api::set_declaration_policy(
+                State(state),
+                headers,
+                Json(DeclarationPolicyRequest {
+                    policy: "block_weight".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+// A proxy started without a token does not serve these routes at all, rather
+// than serving them to anyone.
+#[tokio::test]
+async fn job_declaration_routes_are_disabled_without_the_prioritizing_txs_config() {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+
+    let state = declaration_test_state(None);
+    let headers = bearer("api-token");
+
+    assert_eq!(
+        Api::get_recent_templates(State(state.clone()), headers.clone())
+            .await
+            .into_response()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        Api::get_template_by_id(State(state.clone()), headers.clone(), Path(1))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        Api::set_declaration_policy(
+            State(state),
+            headers,
+            Json(DeclarationPolicyRequest {
+                policy: "block_weight".to_string(),
+            }),
+        )
+        .await
+        .into_response()
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+// The matching token gets through; a missing template is then a 404, not a 401.
+#[tokio::test]
+async fn the_configured_token_reaches_the_job_declaration_routes() {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+
+    let state = declaration_test_state(Some("api-token"));
+    let headers = bearer("api-token");
+
+    assert_eq!(
+        Api::get_recent_templates(State(state.clone()), headers.clone())
+            .await
+            .into_response()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        Api::set_declaration_policy(
+            State(state.clone()),
+            headers.clone(),
+            Json(DeclarationPolicyRequest {
+                policy: "block_weight".to_string(),
+            }),
+        )
+        .await
+        .into_response()
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        Api::get_template_by_id(State(state), headers, Path(u64::MAX))
+            .await
+            .into_response()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }

@@ -71,6 +71,9 @@ const state = {
   templates: [],
   templatesLoaded: false,
   templatesError: null,
+  // The status the templates request failed with, so the section can say
+  // whether the browser needs a token or the proxy was started without one.
+  templatesErrorStatus: null,
   // How many candidates the backend keeps for one tip.
   templatesCandidateLimit: null,
   // The chosen criterion, and which candidate it currently resolves to.
@@ -83,10 +86,14 @@ const state = {
   // How the candidate ribbon is ordered, and which kinds of candidate it shows.
   templateSort: { key: "received", direction: "desc" },
   templateFilter: "all",
-  // Prioritisation state; its endpoints use their own API token.
-  prioritizationEnabled: null,
-  prioritizedToken: localStorage.getItem("demand-tx-token") || "",
+  // Prioritisation state.
+  // What the proxy was started with. Resolved once, before the dashboard renders.
+  capabilities: null,
+  polling: false,
   prioritizing: false,
+  // The proxy's API_TX_TOKEN. Guards the job declaration and prioritisation
+  // endpoints alike, so both features read it from here.
+  apiToken: localStorage.getItem("demand-tx-token") || "",
   // Current block height, used to notice tip changes.
   blockHeight: null,
   blockSeenAt: null,
@@ -285,6 +292,25 @@ async function envelopeRequest(path, options = {}) {
   return payload.data;
 }
 
+function authHeaders() {
+  return state.apiToken ? { Authorization: `Bearer ${state.apiToken}` } : {};
+}
+
+// The proxy returns 401 for a missing or invalid token. The dashboard clears the
+function handleRejectedToken(error) {
+  if (error.status !== 401) return false;
+  state.apiToken = "";
+  localStorage.removeItem("demand-tx-token");
+  renderSetup("The proxy no longer accepts that token.");
+  return true;
+}
+
+function saveApiToken(token) {
+  state.apiToken = token;
+  localStorage.setItem("demand-tx-token", token);
+  state.templatesErrorStatus = null;
+}
+
 function addLog(event, level, message, atSeconds) {
   state.logs.unshift({
     event,
@@ -452,7 +478,6 @@ function renderOverview() {
   renderMiners();
   renderLogs();
   if (!state.templatesLoaded) loadTemplates();
-  loadPrioritizationCapability();
   loadMiners();
 }
 
@@ -633,6 +658,7 @@ const CLICK_ACTIONS = {
       closePanel();
   },
   "dismiss-toast": (event, target) => target.closest(".toast")?.remove(),
+  "retry-setup": () => initialize(),
   "refresh-templates": () => loadTemplates(),
   "open-prioritize": () => openPrioritizePanel(),
   "open-auto-declare": () => openAutoDeclareModal(),
@@ -689,14 +715,15 @@ document.addEventListener("change", async (event) => {
 });
 
 document.addEventListener("submit", async (event) => {
+  if (event.target.id === "token-panel-form") {
+    event.preventDefault();
+    const token = String(new FormData(event.target).get("token") || "").trim();
+    if (token) await submitApiToken(event.target, token);
+    return;
+  }
   if (event.target.id === "prio-panel-form") {
     event.preventDefault();
     const data = new FormData(event.target);
-    const token = String(data.get("token") || "").trim();
-    if (token) {
-      state.prioritizedToken = token;
-      localStorage.setItem("demand-tx-token", token);
-    }
     const txid = String(data.get("txid") || "").trim();
     const feeDelta = Number(data.get("feedelta"));
     if (txid && Number.isFinite(feeDelta) && feeDelta !== 0)
@@ -756,19 +783,26 @@ function loadTemplates() {
 }
 
 async function fetchTemplates() {
+  if (!state.apiToken) return;
   try {
-    const payload = await envelopeRequest("/api/templates/recent");
+    const payload = await envelopeRequest("/api/templates/recent", {
+      headers: authHeaders(),
+    });
     state.templates = payload?.templates || [];
     state.templatesCandidateLimit = payload?.candidate_limit ?? null;
     state.policy = payload?.policy ?? state.policy;
     state.policyPick = payload?.policy_pick ?? null;
     state.activeDeclaration = payload?.active_declaration ?? null;
     state.templatesError = null;
+    state.templatesErrorStatus = null;
     noticeNewBlock();
     noticeNewTemplate();
   } catch (error) {
+    state.templatesLoaded = true;
+    if (handleRejectedToken(error)) return;
     state.templates = [];
     state.templatesError = error.message;
+    state.templatesErrorStatus = error.status ?? null;
   }
   state.templatesLoaded = true;
   renderTemplatesSection();
@@ -911,6 +945,7 @@ async function saveDeclarationPolicy(policy) {
   try {
     const result = await envelopeRequest("/api/declaration-policy", {
       method: "POST",
+      headers: authHeaders(),
       body: JSON.stringify({ policy }),
     });
     toast(
@@ -927,6 +962,7 @@ async function saveDeclarationPolicy(policy) {
     await loadTemplates();
   } catch (error) {
     state.policy = previous;
+    if (handleRejectedToken(error)) return;
     toast("Could not change the criterion", error.message, "error");
     renderTemplatesSection();
   }
@@ -997,7 +1033,7 @@ function renderTemplateCandidates() {
     return;
   }
   if (state.templatesError) {
-    root.innerHTML = `<div class="tplx-empty">Could not load templates: ${escapeHtml(state.templatesError)}</div>`;
+    root.innerHTML = templatesErrorHtml();
     return;
   }
   if (!state.templates.length) {
@@ -1286,24 +1322,54 @@ function closePanel() {
   if (root) root.innerHTML = "";
 }
 
+// A token this browser does not have is worth asking for; one the proxy was
+// never given is not, so the two refusals read differently.
+function templatesErrorHtml() {
+  if (state.templatesErrorStatus === 503) {
+    return `<div class="tplx-empty">
+      <strong>Job declaration is not enabled.</strong><br />
+      This proxy was started without <code>RPC_URL</code>, <code>RPC_USER</code>,
+      <code>RPC_PWD</code> and <code>API_TX_TOKEN</code>.
+    </div>`;
+  }
+  return `<div class="tplx-empty">Could not load templates: ${escapeHtml(state.templatesError)}</div>`;
+}
+
+// Try the token before keeping it, so a wrong one is rejected without saving it.
+async function submitApiToken(form, token) {
+  const button = form.querySelector("#token-submit");
+  const error = form.querySelector("#token-panel-error");
+  const label = button.textContent;
+  error.hidden = true;
+  button.disabled = true;
+  button.textContent = "Checking…";
+  try {
+    await envelopeRequest("/api/templates/recent", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (failure) {
+    button.disabled = false;
+    button.textContent = label;
+    error.textContent =
+      failure.status === 401
+        ? "The proxy rejected that token. Check API_TX_TOKEN and try again."
+        : failure.message;
+    error.hidden = false;
+    return;
+  }
+  saveApiToken(token);
+  startDashboard();
+}
+
 // Prioritise a transaction; asks for the API_TX_TOKEN first when unset.
 function openPrioritizePanel() {
-  const needsToken = !state.prioritizedToken;
   openPanel({
     title: "Prioritise a transaction",
     body: `<form id="prio-panel-form" class="panel-form">
-        ${
-          needsToken
-            ? `<label class="panel-field">
-                <span class="panel-label">API token <span class="muted">required</span></span>
-                <input class="panel-input" type="password" name="token" placeholder="API_TX_TOKEN" autocomplete="off" required />
-                <span class="panel-hint">The proxy's own <code>API_TX_TOKEN</code>. Kept in this browser and sent only to this proxy.</span>
-              </label>`
-            : ""
-        }
         <label class="panel-field">
           <span class="panel-label">Transaction <span class="muted">txid</span></span>
           <input class="panel-input" type="text" name="txid" spellcheck="false" autocomplete="off" pattern="[0-9a-fA-F]{64}" placeholder="e3b0c44298fc1c14..." required />
+          <span class="panel-hint">The transaction must already be in your node's mempool.</span>
         </label>
         <label class="panel-field">
           <span class="panel-label">Fee delta <span class="muted">sats</span></span>
@@ -1331,32 +1397,19 @@ function setPrioritizingUI(busy) {
 
 function updatePrioritizeButton() {
   const button = document.querySelector("#prio-open");
-  if (button) button.hidden = state.prioritizationEnabled !== true;
+  if (button)
+    button.hidden = state.capabilities?.transaction_prioritization !== true;
 }
 
 // Whether the proxy was started with the RPC credentials and API token the
 // prioritisation endpoints need. Decides if the button is offered at all.
-async function loadPrioritizationCapability() {
-  if (state.prioritizationEnabled === null) {
-    try {
-      const capabilities = await envelopeRequest("/api/capabilities");
-      state.prioritizationEnabled = Boolean(
-        capabilities?.transaction_prioritization,
-      );
-    } catch (error) {
-      state.prioritizationEnabled = null;
-    }
-  }
-  updatePrioritizeButton();
-}
-
 // Submit a raw transaction and have bitcoind prioritise it.
 // One transaction should not be prioritised by both bitcoind and mempool.space, so check the former first.
 async function passesMempoolSpaceCheck(txid) {
   let accelerated;
   try {
     const data = await envelopeRequest("/api/tx/prioritized", {
-      headers: { Authorization: `Bearer ${state.prioritizedToken}` },
+      headers: authHeaders(),
     });
     accelerated = Object.keys(data?.mempool_space || {});
   } catch (error) {
@@ -1401,7 +1454,7 @@ async function prioritizeTransaction(txid, feeDelta) {
       `/api/tx/prioritize/${encodeURIComponent(txid)}/${encodeURIComponent(feeDelta)}`,
       {
         method: "POST",
-        headers: { Authorization: `Bearer ${state.prioritizedToken}` },
+        headers: authHeaders(),
       },
     );
     toast(
@@ -1450,8 +1503,10 @@ async function refreshTemplateModal() {
   try {
     template = await envelopeRequest(
       `/api/templates/${encodeURIComponent(templateId)}`,
+      { headers: authHeaders() },
     );
   } catch (error) {
+    if (handleRejectedToken(error)) return;
     openModal({
       title: `Template ${templateId}`,
       description: "Transactions in this template",
@@ -1572,26 +1627,110 @@ function templateTransactionsTable(template) {
 // ---------------------------------------------------------------------------
 
 // Declare one candidate; any candidate on the current tip is valid.
-function initialize() {
-  applyAppearance();
-  if (window.location.pathname !== state.route)
-    window.history.replaceState({}, "", state.route);
+
+// Setup
+//
+// Everything the dashboard needs before it is worth rendering.
+
+const PREREQUISITES = [
+  {
+    id: "api-token",
+    label: "API token",
+    // The proxy gates every job declaration endpoint on API_TX_TOKEN, so
+    // /api/capabilities reporting templates: false means it has none set.
+    onProxy: (capabilities) => capabilities?.templates === true,
+    inBrowser: () => Boolean(state.apiToken),
+    // Nothing typed here can conjure a token the proxy was never given.
+    missingOnProxy: `<p class="setup-lead">This proxy was started without an
+      <code>API_TX_TOKEN</code>. Add it to <code>config.toml</code> (alongside
+      <code>RPC_URL</code>, <code>RPC_USER</code> and <code>RPC_PWD</code>) and
+      restart the client.</p>`,
+    form: `<form id="token-panel-form" class="panel-form">
+        <label class="panel-field">
+          <span class="panel-label">API token <span class="muted">required</span></span>
+          <input class="panel-input" type="password" name="token" placeholder="API_TX_TOKEN" autocomplete="off" required />
+          <span class="panel-hint">The proxy's own <code>API_TX_TOKEN</code>. Kept in this browser and sent only to this proxy.</span>
+        </label>
+        <p class="panel-error" id="token-panel-error" hidden></p>
+        <div class="panel-form-actions">
+          <button class="btn pill primary" id="token-submit" type="submit">Continue</button>
+        </div>
+      </form>`,
+  },
+];
+
+function unmetPrerequisites() {
+  return PREREQUISITES.filter(
+    (item) => !item.onProxy(state.capabilities) || !item.inBrowser(),
+  );
+}
+
+async function resolveCapabilities() {
+  try {
+    state.capabilities = await envelopeRequest("/api/capabilities");
+    return true;
+  } catch (error) {
+    state.capabilities = null;
+    return false;
+  }
+}
+
+function renderSetup(notice = "") {
+  const app = document.querySelector("#app");
+  const unmet = unmetPrerequisites();
+
+  const body = !state.capabilities
+    ? `<p class="setup-lead">Could not reach the proxy to read its settings.</p>
+       <div class="panel-form-actions">
+         <button class="btn pill primary" type="button" data-action="retry-setup">Try again</button>
+       </div>`
+    : unmet
+        .map((item) =>
+          item.onProxy(state.capabilities) ? item.form : item.missingOnProxy,
+        )
+        .join("");
+
+  app.innerHTML = `<div class="setup-screen">
+    <section class="setup-card">
+      <img class="setup-logo" src="/dmnd-logo.svg" alt="DMND" width="64" height="27" draggable="false" />
+      <h1 class="setup-title">Before you start</h1>
+      ${notice ? `<p class="panel-error">${escapeHtml(notice)}</p>` : ""}
+      ${body}
+    </section>
+  </div>`;
+}
+
+function startDashboard() {
   renderShell();
   pollStats();
   loadTemplates();
-  // Polls pause while the tab is hidden.
+  if (state.polling) return;
+  state.polling = true;
+  const onDashboard = () => !document.hidden && Boolean(state.apiToken);
   setInterval(() => {
-    if (!document.hidden) pollStats();
+    if (onDashboard()) pollStats();
   }, API_POLL_INTERVAL);
   setInterval(() => {
-    if (!document.hidden) loadTemplates();
+    if (onDashboard()) loadTemplates();
   }, TEMPLATE_REFRESH_INTERVAL);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) {
+    if (onDashboard()) {
       pollStats();
       loadTemplates();
     }
   });
+}
+
+async function initialize() {
+  applyAppearance();
+  if (window.location.pathname !== state.route)
+    window.history.replaceState({}, "", state.route);
+  await resolveCapabilities();
+  if (!state.capabilities || unmetPrerequisites().length) {
+    renderSetup();
+    return;
+  }
+  startDashboard();
 }
 
 initialize();

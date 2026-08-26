@@ -33,7 +33,7 @@ pub async fn static_handler(path: Option<Path<String>>) -> impl IntoResponse {
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime.as_ref())
-                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CACHE_CONTROL, "no-store")
                 .body(body.into())
                 .unwrap()
         }

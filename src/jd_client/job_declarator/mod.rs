@@ -472,7 +472,7 @@ impl JobDeclarator {
         self_mutex: Arc<Mutex<Self>>,
         set_new_prev_hash: SetNewPrevHash<'static>,
     ) -> Result<(), Error> {
-        crate::block_templates::clear_for_new_tip();
+        crate::block_templates::clear_for_new_tip(set_new_prev_hash.template_id);
         let task_manager = self_mutex
             .safe_lock(|s| s.task_manager.clone())
             .map_err(|_| Error::JobDeclaratorMutexCorrupted)?;

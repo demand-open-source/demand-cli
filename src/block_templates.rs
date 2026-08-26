@@ -71,8 +71,24 @@ impl DeclarationPolicy {
 /// How many candidates to keep for the current tip.
 pub const CANDIDATE_LIMIT: usize = 3;
 
-static CANDIDATES: OnceLock<RwLock<VecDeque<TemplateSnapshot>>> = OnceLock::new();
 static POLICY: OnceLock<RwLock<DeclarationPolicy>> = OnceLock::new();
+
+struct Pending {
+    sent_at: Instant,
+}
+
+#[derive(Default)]
+struct TemplateState {
+    candidates: VecDeque<TemplateSnapshot>,
+    pending: HashMap<u64, Pending>,
+    active: Option<u64>,
+}
+
+static STATE: OnceLock<RwLock<TemplateState>> = OnceLock::new();
+
+fn state() -> &'static RwLock<TemplateState> {
+    STATE.get_or_init(|| RwLock::new(TemplateState::default()))
+}
 
 /// The policy in use.
 fn policy_slot() -> &'static RwLock<DeclarationPolicy> {
@@ -84,26 +100,12 @@ fn policy_slot() -> &'static RwLock<DeclarationPolicy> {
     })
 }
 
-static ACTIVE_DECLARATION: OnceLock<RwLock<Option<u64>>> = OnceLock::new();
-
-fn active_slot() -> &'static RwLock<Option<u64>> {
-    ACTIVE_DECLARATION.get_or_init(|| RwLock::new(None))
-}
-
 /// The declaration the pool has accepted, if any.
 pub fn active_declaration() -> Option<u64> {
-    *active_slot()
+    state()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn set_active_declaration(template_id: u64) {
-    if !is_candidate(template_id) {
-        return;
-    }
-    *active_slot()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(template_id);
+        .active
 }
 
 pub fn declaration_policy() -> DeclarationPolicy {
@@ -116,11 +118,6 @@ pub fn set_declaration_policy(policy: DeclarationPolicy) {
     *policy_slot()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy;
-}
-
-/// Newest first.
-fn candidates() -> &'static RwLock<VecDeque<TemplateSnapshot>> {
-    CANDIDATES.get_or_init(|| RwLock::new(VecDeque::new()))
 }
 
 pub fn unix_now() -> u64 {
@@ -244,27 +241,22 @@ fn record_template(
         received_at: unix_now(),
     };
 
-    let mut held = candidates()
+    let mut state = state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    held.retain(|candidate| candidate.template_id != template_id);
-    held.push_front(snapshot);
-    held.truncate(CANDIDATE_LIMIT);
+    state
+        .candidates
+        .retain(|candidate| candidate.template_id != template_id);
+    state.candidates.push_front(snapshot);
+    state.candidates.truncate(CANDIDATE_LIMIT);
 }
 
 /// Read the candidate set in place, newest first, without cloning.
 pub fn with_candidates<T>(f: impl FnOnce(&VecDeque<TemplateSnapshot>) -> T) -> T {
-    f(&candidates()
+    let state = state()
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()))
-}
-
-/// Whether this template is still a candidate for the current tip.
-fn is_candidate(template_id: u64) -> bool {
-    with_candidates(|held| {
-        held.iter()
-            .any(|snapshot| snapshot.template_id == template_id)
-    })
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&state.candidates)
 }
 
 #[cfg(test)]
@@ -278,80 +270,100 @@ fn recent() -> Vec<TemplateSnapshot> {
 }
 
 #[cfg(test)]
+fn has_pending_declaration(template_id: u64) -> bool {
+    state()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pending
+        .contains_key(&template_id)
+}
+
+#[cfg(test)]
 pub static TEST_HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub fn clear_history_for_tests() {
-    candidates()
+    let mut state = state()
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.candidates.clear();
+    state.pending.clear();
+    state.active = None;
+    crate::api::stats::clear_declaration_latency_for_tests();
 }
 
 /// Which candidate `policy` would declare, if any are held.
 pub fn policy_pick(policy: DeclarationPolicy) -> Option<u64> {
-    let held = candidates()
+    let state = state()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    held.iter()
+    state
+        .candidates
+        .iter()
         .rev()
         .max_by_key(|snapshot| policy.score(snapshot))
         .map(|snapshot| snapshot.template_id)
 }
 
-/// Mark a candidate declared.
-/// Drop every candidate on a tip change.
-pub fn clear_for_new_tip() {
-    let mut held = candidates()
+/// Drop all candidates and pending entries whose template differs from `template_id`,
+/// and clear the active template if it no longer matches.
+///
+/// This is called when a new best tip arrives so stale templates from the previous tip are not
+/// accidentally declared.
+pub fn clear_for_new_tip(template_id: u64) {
+    let mut state = state()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    held.clear();
-    // The active declaration belonged to the old tip too.
-    *active_slot()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    pending(|in_flight| in_flight.clear());
-}
-
-struct Pending {
-    sent_at: Instant,
-}
-
-static PENDING: OnceLock<RwLock<HashMap<u64, Pending>>> = OnceLock::new();
-
-fn pending<T>(f: impl FnOnce(&mut HashMap<u64, Pending>) -> T) -> T {
-    let lock = PENDING.get_or_init(|| RwLock::new(HashMap::new()));
-    f(&mut lock
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    state
+        .candidates
+        .retain(|candidate| candidate.template_id == template_id);
+    state
+        .pending
+        .retain(|pending_id, _| *pending_id == template_id);
+    if state.active != Some(template_id) {
+        state.active = None;
+    }
 }
 
 /// A `DeclareMiningJob` has gone out for this template.
 pub fn declaration_sent(template_id: u64) {
-    pending(|in_flight| {
-        in_flight.insert(
+    state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pending
+        .insert(
             template_id,
             Pending {
                 sent_at: Instant::now(),
             },
-        )
-    });
+        );
 }
 
 /// The pool accepted the declaration: mark it active.
 pub fn declaration_accepted(template_id: u64) {
-    let Some(held) = pending(|in_flight| in_flight.remove(&template_id)) else {
+    let mut state = state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(pending) = state.pending.remove(&template_id) else {
         return;
     };
-    set_active_declaration(template_id);
-    crate::api::stats::record_declaration_latency(held.sent_at.elapsed().as_millis() as u64);
+    if state
+        .candidates
+        .iter()
+        .any(|candidate| candidate.template_id == template_id)
+    {
+        state.active = Some(template_id);
+    }
+
+    crate::api::stats::record_declaration_latency(pending.sent_at.elapsed().as_millis() as u64);
 }
 
 /// One candidate by id.
 pub fn by_id(template_id: u64) -> Option<TemplateSnapshot> {
-    candidates()
+    state()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .candidates
         .iter()
         .find(|snapshot| snapshot.template_id == template_id)
         .cloned()
@@ -488,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tip_moving_clears_the_set() {
+    fn the_tip_moving_keeps_only_the_template_it_names() {
         let _guard = TEST_HISTORY_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -497,21 +509,70 @@ mod tests {
         let prefix = [0x03, 0x77, 0xaa, 0x0e];
         record_template(20, true, 0, 0, &prefix, &[tx(1)]);
         record_template(21, false, 0, 0, &prefix, &[tx(2)]);
-        set_active_declaration(20);
+        declaration_sent(20);
+        declaration_accepted(20);
         assert_eq!(active_declaration(), Some(20));
 
-        clear_for_new_tip();
-        assert!(recent().is_empty());
-        assert_eq!(policy_pick(DeclarationPolicy::HighestFees), None);
-        assert_eq!(active_declaration(), None, "the tip moved");
+        // The tip moves to 21, so only 20 went stale.
+        clear_for_new_tip(21);
+        assert_eq!(
+            recent().iter().map(|s| s.template_id).collect::<Vec<_>>(),
+            vec![21]
+        );
+        assert_eq!(policy_pick(DeclarationPolicy::HighestFees), Some(21));
+        assert_eq!(active_declaration(), None, "20 belonged to the old tip");
 
-        set_active_declaration(20);
+        declaration_sent(20);
+        declaration_accepted(20);
         assert_eq!(active_declaration(), None, "20 is not a candidate any more");
 
         // A candidate for the new tip is accepted as normal.
         record_template(31, true, 0, 0, &prefix, &[tx(2)]);
-        set_active_declaration(31);
+        declaration_sent(31);
+        declaration_accepted(31);
         assert_eq!(active_declaration(), Some(31));
+
+        // A tip naming a template that was never recorded leaves nothing.
+        clear_for_new_tip(999);
+        assert!(recent().is_empty());
+        assert_eq!(active_declaration(), None);
+    }
+
+    // The pool only ever accepts the custom job after `SetNewPrevHash` for the
+    // same template, so the tip change must not drop the pending declaration.
+    #[test]
+    fn a_declaration_accepted_after_the_tip_moved_still_goes_active() {
+        let _guard = TEST_HISTORY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_history_for_tests();
+
+        let prefix = [0x03, 0x77, 0xaa, 0x0e];
+        record_template(40, true, 0, 0, &prefix, &[tx(1)]);
+        record_template(41, true, 0, 0, &prefix, &[tx(2)]);
+        declaration_sent(40);
+        declaration_sent(41);
+
+        // The template provider promotes 41 to the tip.
+        clear_for_new_tip(41);
+        assert!(has_pending_declaration(41));
+        assert!(
+            !has_pending_declaration(40),
+            "40 lost its tip, so its declaration is moot"
+        );
+
+        // The pool's acceptance arrives afterwards, and still counts.
+        declaration_accepted(41);
+        assert_eq!(active_declaration(), Some(41));
+        assert!(crate::api::stats::declaration_latency_ms().is_some());
+        assert!(
+            !has_pending_declaration(41),
+            "acceptance consumes the pending entry"
+        );
+
+        // A stale acceptance cannot revive a template the tip change dropped.
+        declaration_accepted(40);
+        assert_eq!(active_declaration(), Some(41));
     }
 
     // One process-global candidate set, so all cases share one test.

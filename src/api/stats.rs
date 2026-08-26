@@ -35,6 +35,11 @@ pub fn record_declaration_latency(millis: u64) {
     DECLARATION_MS.store(millis.max(1), Relaxed);
 }
 
+#[cfg(test)]
+pub fn clear_declaration_latency_for_tests() {
+    DECLARATION_MS.store(0, Relaxed);
+}
+
 /// Returns the average bandwidth in bytes per second since the first record_sent or record_received call.
 pub fn bandwidth_bytes_per_sec() -> Option<u64> {
     let elapsed = COUNTING_SINCE.get()?.elapsed().as_secs();

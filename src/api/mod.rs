@@ -159,7 +159,6 @@ pub(crate) async fn start(
         downstream_handoff,
         prioritizing_txs,
     };
-
     let app = AxumRouter::new()
         .route("/api/health", get(Api::health_check))
         .route("/api/capabilities", get(Api::get_capabilities))
