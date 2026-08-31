@@ -94,6 +94,7 @@ const state = {
   // The proxy's API_TX_TOKEN. Guards the job declaration and prioritisation
   // endpoints alike, so both features read it from here.
   apiToken: localStorage.getItem("demand-tx-token") || "",
+  tokenNotice: "",
   // Current block height, used to notice tip changes.
   blockHeight: null,
   blockSeenAt: null,
@@ -301,7 +302,11 @@ function handleRejectedToken(error) {
   if (error.status !== 401) return false;
   state.apiToken = "";
   localStorage.removeItem("demand-tx-token");
-  renderSetup("The proxy no longer accepts that token.");
+  state.tokenNotice = "The API token is invalid.";
+  closeModal();
+  closePanel();
+  state.templates = [];
+  renderTemplatesSection();
   return true;
 }
 
@@ -309,6 +314,7 @@ function saveApiToken(token) {
   state.apiToken = token;
   localStorage.setItem("demand-tx-token", token);
   state.templatesErrorStatus = null;
+  state.tokenNotice = "";
 }
 
 function addLog(event, level, message, atSeconds) {
@@ -356,6 +362,7 @@ function openModal({ title, description = "", body = "", size = "large" }) {
 function closeModal() {
   const root = document.querySelector("#modal-root");
   if (root) root.innerHTML = "";
+  state.openTemplateId = null;
 }
 
 async function copyText(text) {
@@ -419,7 +426,7 @@ function renderOverview() {
   page.innerHTML = `<section class="page-header">
     <div><h1 class="page-title">Welcome back, DMND'er</h1></div>
     <div class="page-actions">
-      <button class="btn primary" id="prio-open" type="button" data-action="open-prioritize" hidden>${icon("pin", 16)} Prioritise transaction</button>
+      <button class="btn primary" id="prio-open" type="button" data-action="open-prioritize">${icon("pin", 16)} Prioritise transaction</button>
     </div>
   </section>
   <section class="stats-grid" aria-label="Mining statistics">
@@ -474,10 +481,9 @@ function renderOverview() {
   </div>`;
   updateStatsUI();
   renderTemplatesSection();
-  updatePrioritizeButton();
   renderMiners();
   renderLogs();
-  if (!state.templatesLoaded) loadTemplates();
+  if (!state.templatesLoaded && state.apiToken) loadTemplates();
   loadMiners();
 }
 
@@ -658,7 +664,6 @@ const CLICK_ACTIONS = {
       closePanel();
   },
   "dismiss-toast": (event, target) => target.closest(".toast")?.remove(),
-  "retry-setup": () => initialize(),
   "refresh-templates": () => loadTemplates(),
   "open-prioritize": () => openPrioritizePanel(),
   "open-auto-declare": () => openAutoDeclareModal(),
@@ -691,13 +696,13 @@ document.addEventListener("click", async (event) => {
   // Actions win over opening: the declare button sits *inside* a template pad that
   // is itself clickable.
   const actionTarget = event.target.closest("[data-action]");
+  const copyTarget = event.target.closest("[data-copy]");
+  if (copyTarget && (!actionTarget || actionTarget.contains(copyTarget)))
+    return copyWithToast(copyTarget.dataset.copy);
   if (actionTarget) {
     await CLICK_ACTIONS[actionTarget.dataset.action]?.(event, actionTarget);
     return;
   }
-
-  const copy = event.target.closest("[data-copy]");
-  if (copy) return copyWithToast(copy.dataset.copy);
 
   const opener = event.target.closest("[data-template-open]");
   if (opener) openTemplateTransactions(Number(opener.dataset.templateOpen));
@@ -768,6 +773,11 @@ let templatesRequest = null;
 let templatesRequestedAgain = false;
 
 function loadTemplates() {
+  if (!state.apiToken) {
+    state.templatesLoaded = true;
+    renderTemplatesSection();
+    return;
+  }
   if (templatesRequest) {
     templatesRequestedAgain = true;
     return templatesRequest;
@@ -865,6 +875,16 @@ function relativeAge(seconds) {
 function renderTemplatesSection() {
   if (state.route !== "/dashboard/overview") return;
 
+  const gated = !state.apiToken;
+  const controls = document.querySelector(".tplx-controls");
+  if (controls) controls.hidden = gated;
+  const declareButton = document.querySelector("#auto-declare-open");
+  if (declareButton) declareButton.hidden = gated;
+  if (gated) {
+    renderTemplateCandidates();
+    return;
+  }
+
   const policy = document.querySelector("#auto-declare-open");
   if (policy) {
     policy.innerHTML = `${icon("sliders", 15)} Auto declare: ${escapeHtml(criterionLabel(state.policy))}`;
@@ -917,8 +937,13 @@ function renderTemplateFilters() {
     ],
   ];
 
+  const available = kinds.filter(([, , count]) => count > 0);
+  const hideChips = available.length < 3;
+  if (hideChips || !available.some(([key]) => key === state.templateFilter))
+    state.templateFilter = "all";
+
   // Hide the chips when only one kind is present.
-  if (kinds.filter(([, , count]) => count > 0).length < 3) return "";
+  if (hideChips) return "";
 
   return (
     `<span class="policy-label">Show</span>` +
@@ -970,7 +995,7 @@ async function saveDeclarationPolicy(policy) {
 }
 
 function autoDeclarePickHtml() {
-  if (!state.policyPick) {
+  if (!known(state.policyPick)) {
     return '<span class="muted">no candidate to pick from yet</span>';
   }
   return `${escapeHtml(criterionLabel(state.policy))} is <strong>#${formatNumber(state.policyPick)}</strong> right now`;
@@ -1023,11 +1048,18 @@ function renderTemplateCandidates() {
   const declared =
     state.templates.find(
       (candidate) => candidate.template_id === state.activeDeclaration,
-    ) || null;
+    ) ||
+    (known(state.activeDeclaration)
+      ? { template_id: state.activeDeclaration }
+      : null);
 
   const facts = document.querySelector("#block-facts");
   if (facts) facts.innerHTML = renderBlockContext(current, declared, now);
 
+  if (!state.apiToken) {
+    root.innerHTML = tokenPromptHtml();
+    return;
+  }
   if (!state.templatesLoaded) {
     root.innerHTML = `<div class="tplx-empty">Loading templates…</div>`;
     return;
@@ -1118,7 +1150,7 @@ function renderBlockContext(current, declared, now) {
       escapeHtml(criterionLabel(state.policy)),
       "",
       `${policyCopy(state.policy)}${
-        state.policyPick
+        known(state.policyPick)
           ? ` As it stands that is template ${state.policyPick}, which changes with every rebuild sv2-tp sends.`
           : ""
       }`,
@@ -1324,14 +1356,39 @@ function closePanel() {
 
 // A token this browser does not have is worth asking for; one the proxy was
 // never given is not, so the two refusals read differently.
+function tokenMissingOnProxyHtml(
+  title = "Job declaration is not enabled.",
+) {
+  return `<div class="tplx-empty">
+    <strong>${escapeHtml(title)}</strong><br />
+    This proxy was started without an <code>API_TX_TOKEN</code>. Add it to
+    <code>config.toml</code> and restart the client.
+  </div>`;
+}
+
+function tokenPromptHtml() {
+  if (state.capabilities?.templates === false) return tokenMissingOnProxyHtml();
+  return `<div class="tplx-gate">
+    <p class="tplx-gate-lead">Please provide the dmnd client's <code>API_TX_TOKEN</code> to see the block templates.</p>
+    ${tokenFormHtml()}
+  </div>`;
+}
+
+function tokenFormHtml() {
+  return `<form id="token-panel-form" class="panel-form">
+      ${state.tokenNotice ? `<p class="panel-error">${escapeHtml(state.tokenNotice)}</p>` : ""}
+      <label class="panel-field">
+        <input class="panel-input" type="password" name="token" placeholder="API_TX_TOKEN" autocomplete="off" required />
+      </label>
+      <p class="panel-error" id="token-panel-error" hidden></p>
+      <div class="panel-form-actions">
+        <button class="btn pill primary" id="token-submit" type="submit">Continue</button>
+      </div>
+    </form>`;
+}
+
 function templatesErrorHtml() {
-  if (state.templatesErrorStatus === 503) {
-    return `<div class="tplx-empty">
-      <strong>Job declaration is not enabled.</strong><br />
-      This proxy was started without <code>RPC_URL</code>, <code>RPC_USER</code>,
-      <code>RPC_PWD</code> and <code>API_TX_TOKEN</code>.
-    </div>`;
-  }
+  if (state.templatesErrorStatus === 503) return tokenMissingOnProxyHtml();
   return `<div class="tplx-empty">Could not load templates: ${escapeHtml(state.templatesError)}</div>`;
 }
 
@@ -1358,11 +1415,48 @@ async function submitApiToken(form, token) {
     return;
   }
   saveApiToken(token);
-  startDashboard();
+  closePanel();
+  loadTemplates();
 }
 
-// Prioritise a transaction; asks for the API_TX_TOKEN first when unset.
+// Prioritise a transaction, or say what is stopping it: what the proxy was
+// started without, then the token this browser has yet to be given.
 function openPrioritizePanel() {
+  if (!state.capabilities) {
+    openPanel({
+      title: "Prioritise a transaction",
+      body: '<p class="panel-lead">Could not read the proxy configuration. Reload the dashboard and try again.</p>',
+      footer: '<button class="btn pill" type="button" data-action="close-panel">Close</button>',
+    });
+    return;
+  }
+  if (state.capabilities.templates === false) {
+    openPanel({
+      title: "Prioritise a transaction",
+      body: tokenMissingOnProxyHtml(
+        "Transaction prioritisation is not enabled.",
+      ),
+      footer: '<button class="btn pill" type="button" data-action="close-panel">Close</button>',
+    });
+    return;
+  }
+  if (state.capabilities?.transaction_prioritization !== true) {
+    openPanel({
+      title: "Prioritise a transaction",
+      body: `<p class="panel-lead">To prioritise a transaction, the dmnd client needs the bitcoind RPC settings
+        (<code>RPC_URL</code>, <code>RPC_USER</code>, <code>RPC_PWD</code>)  One or more of these are unset. Set them and restart the client to use this feature.</p>`,
+      footer: `<button class="btn pill" type="button" data-action="close-panel">Close</button>`,
+    });
+    return;
+  }
+  if (!state.apiToken) {
+    openPanel({
+      title: "Prioritise a transaction",
+      description: "This browser has not been given the proxy's API token yet.",
+      body: tokenFormHtml(),
+    });
+    return;
+  }
   openPanel({
     title: "Prioritise a transaction",
     body: `<form id="prio-panel-form" class="panel-form">
@@ -1395,14 +1489,6 @@ function setPrioritizingUI(busy) {
 // *next*. Endpoints authenticate with API_TX_TOKEN, kept in this browser only.
 // ---------------------------------------------------------------------------
 
-function updatePrioritizeButton() {
-  const button = document.querySelector("#prio-open");
-  if (button)
-    button.hidden = state.capabilities?.transaction_prioritization !== true;
-}
-
-// Whether the proxy was started with the RPC credentials and API token the
-// prioritisation endpoints need. Decides if the button is offered at all.
 // Submit a raw transaction and have bitcoind prioritise it.
 // One transaction should not be prioritised by both bitcoind and mempool.space, so check the former first.
 async function passesMempoolSpaceCheck(txid) {
@@ -1506,6 +1592,8 @@ async function refreshTemplateModal() {
       { headers: authHeaders() },
     );
   } catch (error) {
+    // Closed or switched while in flight.
+    if (state.openTemplateId !== templateId) return;
     if (handleRejectedToken(error)) return;
     openModal({
       title: `Template ${templateId}`,
@@ -1628,43 +1716,6 @@ function templateTransactionsTable(template) {
 
 // Declare one candidate; any candidate on the current tip is valid.
 
-// Setup
-//
-// Everything the dashboard needs before it is worth rendering.
-
-const PREREQUISITES = [
-  {
-    id: "api-token",
-    label: "API token",
-    // The proxy gates every job declaration endpoint on API_TX_TOKEN, so
-    // /api/capabilities reporting templates: false means it has none set.
-    onProxy: (capabilities) => capabilities?.templates === true,
-    inBrowser: () => Boolean(state.apiToken),
-    // Nothing typed here can conjure a token the proxy was never given.
-    missingOnProxy: `<p class="setup-lead">This proxy was started without an
-      <code>API_TX_TOKEN</code>. Add it to <code>config.toml</code> (alongside
-      <code>RPC_URL</code>, <code>RPC_USER</code> and <code>RPC_PWD</code>) and
-      restart the client.</p>`,
-    form: `<form id="token-panel-form" class="panel-form">
-        <label class="panel-field">
-          <span class="panel-label">API token <span class="muted">required</span></span>
-          <input class="panel-input" type="password" name="token" placeholder="API_TX_TOKEN" autocomplete="off" required />
-          <span class="panel-hint">The proxy's own <code>API_TX_TOKEN</code>. Kept in this browser and sent only to this proxy.</span>
-        </label>
-        <p class="panel-error" id="token-panel-error" hidden></p>
-        <div class="panel-form-actions">
-          <button class="btn pill primary" id="token-submit" type="submit">Continue</button>
-        </div>
-      </form>`,
-  },
-];
-
-function unmetPrerequisites() {
-  return PREREQUISITES.filter(
-    (item) => !item.onProxy(state.capabilities) || !item.inBrowser(),
-  );
-}
-
 async function resolveCapabilities() {
   try {
     state.capabilities = await envelopeRequest("/api/capabilities");
@@ -1675,49 +1726,25 @@ async function resolveCapabilities() {
   }
 }
 
-function renderSetup(notice = "") {
-  const app = document.querySelector("#app");
-  const unmet = unmetPrerequisites();
-
-  const body = !state.capabilities
-    ? `<p class="setup-lead">Could not reach the proxy to read its settings.</p>
-       <div class="panel-form-actions">
-         <button class="btn pill primary" type="button" data-action="retry-setup">Try again</button>
-       </div>`
-    : unmet
-        .map((item) =>
-          item.onProxy(state.capabilities) ? item.form : item.missingOnProxy,
-        )
-        .join("");
-
-  app.innerHTML = `<div class="setup-screen">
-    <section class="setup-card">
-      <img class="setup-logo" src="/dmnd-logo.svg" alt="DMND" width="64" height="27" draggable="false" />
-      <h1 class="setup-title">Before you start</h1>
-      ${notice ? `<p class="panel-error">${escapeHtml(notice)}</p>` : ""}
-      ${body}
-    </section>
-  </div>`;
-}
-
+// The stats need no token, so the dashboard renders without one; only the
+// templates wait for it.
 function startDashboard() {
   renderShell();
   pollStats();
-  loadTemplates();
+  if (state.apiToken) loadTemplates();
   if (state.polling) return;
   state.polling = true;
-  const onDashboard = () => !document.hidden && Boolean(state.apiToken);
+  const visible = () => !document.hidden;
   setInterval(() => {
-    if (onDashboard()) pollStats();
+    if (visible()) pollStats();
   }, API_POLL_INTERVAL);
   setInterval(() => {
-    if (onDashboard()) loadTemplates();
+    if (visible() && state.apiToken) loadTemplates();
   }, TEMPLATE_REFRESH_INTERVAL);
   document.addEventListener("visibilitychange", () => {
-    if (onDashboard()) {
-      pollStats();
-      loadTemplates();
-    }
+    if (!visible()) return;
+    pollStats();
+    if (state.apiToken) loadTemplates();
   });
 }
 
@@ -1726,10 +1753,6 @@ async function initialize() {
   if (window.location.pathname !== state.route)
     window.history.replaceState({}, "", state.route);
   await resolveCapabilities();
-  if (!state.capabilities || unmetPrerequisites().length) {
-    renderSetup();
-    return;
-  }
   startDashboard();
 }
 

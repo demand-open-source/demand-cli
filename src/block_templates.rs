@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{OnceLock, RwLock},
+    sync::{atomic::Ordering::Relaxed, OnceLock, RwLock},
     time::Instant,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -278,17 +278,22 @@ fn has_pending_declaration(template_id: u64) -> bool {
         .contains_key(&template_id)
 }
 
+pub fn reset() {
+    *state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = TemplateState::default();
+    crate::api::stats::CONNECTION_STARTED_AT.store(unix_now(), Relaxed);
+    crate::api::stats::SENT_BYTES.store(0, Relaxed);
+    crate::api::stats::RECEIVED_BYTES.store(0, Relaxed);
+    crate::api::stats::DECLARATION_MS.store(0, Relaxed);
+}
+
 #[cfg(test)]
 pub static TEST_HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub fn clear_history_for_tests() {
-    let mut state = state()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.candidates.clear();
-    state.pending.clear();
-    state.active = None;
+    reset();
     crate::api::stats::clear_declaration_latency_for_tests();
 }
 
@@ -337,6 +342,14 @@ pub fn declaration_sent(template_id: u64) {
                 sent_at: Instant::now(),
             },
         );
+}
+/// Remove the pending entry for a template if the pool rejected it.
+pub fn declaration_rejected(template_id: u64) {
+    state()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pending
+        .remove(&template_id);
 }
 
 /// The pool accepted the declaration: mark it active.

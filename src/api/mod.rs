@@ -49,13 +49,13 @@ pub struct AppState {
     router: Router,
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
+    api_tx_token: Option<String>,
     prioritizing_txs: Option<PrioritizingTxs>,
 }
 
 #[derive(Clone)]
 struct PrioritizingTxs {
     rpc: Arc<BitcoindRpc>,
-    api_tx_token: String,
 }
 
 pub(crate) async fn reset_node_fee_deltas_at_startup() -> bool {
@@ -119,12 +119,9 @@ pub(crate) async fn start(
     stats_sender: StatsSender,
     downstream_handoff: crate::DownstreamHandoffSender,
 ) {
-    let prioritizing_txs = Configuration::bitcoind_rpc_config().map(|config| {
-        let rpc = Arc::new(BitcoindRpc::new(config.url, config.user, config.pwd));
-        PrioritizingTxs {
-            rpc,
-            api_tx_token: config.api_tx_token,
-        }
+    let api_tx_token = Configuration::api_tx_token();
+    let prioritizing_txs = Configuration::bitcoind_rpc_config().map(|config| PrioritizingTxs {
+        rpc: Arc::new(BitcoindRpc::new(config.url, config.user, config.pwd)),
     });
     let mut _tx_prio_tasks = None;
     if START_TX_PRIO.load(Ordering::Relaxed) {
@@ -157,6 +154,7 @@ pub(crate) async fn start(
         router,
         stats_sender,
         downstream_handoff,
+        api_tx_token,
         prioritizing_txs,
     };
     let app = AxumRouter::new()

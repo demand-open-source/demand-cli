@@ -624,6 +624,7 @@ impl ParseUpstreamMiningMessages<Downstream, NullDownstreamMiningSelector, NoRou
         m: roles_logic_sv2::mining_sv2::SetCustomMiningJobError,
     ) -> Result<roles_logic_sv2::handlers::mining::SendTo<Downstream>, RolesLogicError> {
         if let Some(request) = self.template_to_job_id.take_request(m.request_id) {
+            crate::block_templates::declaration_rejected(request.template_id);
             warn!(
                 template_id = request.template_id,
                 request_id = m.request_id,

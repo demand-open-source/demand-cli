@@ -1,33 +1,22 @@
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
-        OnceLock,
-    },
-    time::Instant,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
-static COUNTING_SINCE: OnceLock<Instant> = OnceLock::new();
-
-static SENT_BYTES: AtomicU64 = AtomicU64::new(0);
-static RECEIVED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CONNECTION_STARTED_AT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SENT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RECEIVED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Last declaration round trip in ms; 0 means none yet.
-static DECLARATION_MS: AtomicU64 = AtomicU64::new(0);
-
-fn counting_since() -> &'static Instant {
-    COUNTING_SINCE.get_or_init(Instant::now)
-}
+pub(crate) static DECLARATION_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_sent(bytes: usize) {
-    counting_since();
     SENT_BYTES.fetch_add(bytes as u64, Relaxed);
 }
 
 pub fn record_received(bytes: usize) {
-    counting_since();
     RECEIVED_BYTES.fetch_add(bytes as u64, Relaxed);
 }
 
@@ -40,9 +29,13 @@ pub fn clear_declaration_latency_for_tests() {
     DECLARATION_MS.store(0, Relaxed);
 }
 
-/// Returns the average bandwidth in bytes per second since the first record_sent or record_received call.
+/// Returns average bandwidth in bytes per second for the current pool connection.
 pub fn bandwidth_bytes_per_sec() -> Option<u64> {
-    let elapsed = COUNTING_SINCE.get()?.elapsed().as_secs();
+    let started_at = CONNECTION_STARTED_AT.load(Relaxed);
+    if started_at == 0 {
+        return None;
+    }
+    let elapsed = crate::block_templates::unix_now().saturating_sub(started_at);
     if elapsed == 0 {
         return None;
     }

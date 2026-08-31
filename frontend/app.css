@@ -99,6 +99,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   width: 100%;
@@ -1066,47 +1070,6 @@ svg {
   gap: 1.5rem;
   padding: 1.75rem;
 }
-.setup-screen {
-  display: grid;
-  min-height: 100dvh;
-  place-items: center;
-  padding: 1.5rem;
-  background: var(--canvas);
-}
-
-.setup-card {
-  width: min(26rem, 100%);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.75rem;
-  background: var(--background);
-  box-shadow: var(--shadow);
-}
-
-.setup-logo {
-  height: 1.15rem;
-  width: auto;
-  user-select: none;
-}
-
-.setup-title {
-  margin: 1.25rem 0 1rem;
-  font-size: 1.125rem;
-  font-weight: 650;
-  letter-spacing: -0.02em;
-}
-
-.setup-lead {
-  margin: 0;
-  color: var(--muted-foreground);
-  font-size: 0.8125rem;
-  line-height: 1.55;
-}
-
-.setup-card .panel-error {
-  margin-bottom: 1rem;
-}
-
 .panel-form,
 .panel-field {
   display: grid;
@@ -1152,6 +1115,12 @@ svg {
   color: var(--muted-foreground);
   font-size: 0.8125rem;
   line-height: 1.45;
+}
+.panel-lead {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.55;
 }
 .panel-error {
   color: var(--destructive);
@@ -1514,6 +1483,24 @@ svg {
   font-size: 0.6875rem;
   font-weight: 600;
   white-space: nowrap;
+}
+.tplx-gate {
+  display: grid;
+  gap: 1.25rem;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+
+.tplx-gate-lead {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+}
+
+.tplx-gate .panel-form {
+  gap: 1rem;
 }
 
 .tplx-empty {

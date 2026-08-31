@@ -429,7 +429,10 @@ impl JobDeclarator {
                                 state.last_declare_mining_jobs_sent.remove(&m.request_id)
                             })
                             .unwrap_or(None);
-                        if removed.is_some() {
+                        if let Some(Some(removed)) = removed {
+                            crate::block_templates::declaration_rejected(
+                                removed.template.template_id,
+                            );
                             super::IS_CUSTOM_JOB_SET
                                 .store(true, std::sync::atomic::Ordering::Release);
                         }

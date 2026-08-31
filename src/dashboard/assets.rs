@@ -24,7 +24,12 @@ fn resolve_asset_path(request_path: Option<&str>) -> String {
 
 /// Handles requests for static dashboard assets and routes.
 pub async fn static_handler(path: Option<Path<String>>) -> impl IntoResponse {
-    let asset_path = resolve_asset_path(path.as_ref().map(|Path(path)| path.as_str()));
+    let request_path = path.as_ref().map(|Path(path)| path.as_str());
+    let normalized_path = request_path.unwrap_or_default().trim_matches('/');
+    if normalized_path == "api" || normalized_path.starts_with("api/") {
+        return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
+    }
+    let asset_path = resolve_asset_path(request_path);
 
     match Asset::get(&asset_path) {
         Some(content) => {

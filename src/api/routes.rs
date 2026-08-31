@@ -225,9 +225,9 @@ impl Api {
 
     pub async fn get_capabilities(State(state): State<AppState>) -> impl IntoResponse {
         Json(APIResponse::success(Some(json!({
-            // Both need the RPC credentials and the API token.
-            "templates": state.prioritizing_txs.is_some(),
-            "transaction_prioritization": state.prioritizing_txs.is_some()
+            "templates": state.api_tx_token.is_some(),
+            "transaction_prioritization": state.api_tx_token.is_some()
+                && state.prioritizing_txs.is_some()
         }))))
     }
 
@@ -336,7 +336,10 @@ impl Api {
             );
         };
 
-        if !is_authorized_for_tx_prioritization(&headers, &prioritizing_txs.api_tx_token) {
+        if !is_authorized_for_tx_prioritization(
+            &headers,
+            state.api_tx_token.as_deref().unwrap_or(""),
+        ) {
             warn!("unauthorized tx prioritization request");
             return (
                 StatusCode::UNAUTHORIZED,
@@ -401,8 +404,10 @@ impl Api {
                 ))),
             );
         };
-
-        if !is_authorized_for_tx_prioritization(&headers, &prioritizing_txs.api_tx_token) {
+        if !is_authorized_for_tx_prioritization(
+            &headers,
+            state.api_tx_token.as_deref().unwrap_or(""),
+        ) {
             warn!("unauthorized tx priority restoration request");
             return (
                 StatusCode::UNAUTHORIZED,
@@ -473,7 +478,10 @@ impl Api {
             );
         };
 
-        if !is_authorized_for_tx_prioritization(&headers, &prioritizing_txs.api_tx_token) {
+        if !is_authorized_for_tx_prioritization(
+            &headers,
+            state.api_tx_token.as_deref().unwrap_or(""),
+        ) {
             warn!("unauthorized prioritized txs request");
             return (
                 StatusCode::UNAUTHORIZED,
@@ -551,18 +559,16 @@ fn check_authorization<T: Serialize>(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<(StatusCode, Json<APIResponse<T>>)> {
-    let Some(prioritizing_txs) = state.prioritizing_txs.as_ref() else {
-        warn!("PRIORITIZING TXS NOT ENABLED");
+    let Some(expected_token) = state.api_tx_token.as_deref() else {
+        warn!("API TX TOKEN NOT SET");
         return Some((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(APIResponse::error(Some(
-                "PRIORITIZING TXS NOT ENABLED".to_string(),
-            ))),
+            Json(APIResponse::error(Some("API TX TOKEN NOT SET".to_string()))),
         ));
     };
 
-    if !is_authorized_for_tx_prioritization(headers, &prioritizing_txs.api_tx_token) {
-        warn!("unauthorized job declaration request");
+    if !is_authorized_for_tx_prioritization(headers, expected_token) {
+        warn!("unauthorized API request");
         return Some((
             StatusCode::UNAUTHORIZED,
             Json(APIResponse::error(Some("Unauthorized".to_string()))),
@@ -632,13 +638,13 @@ async fn health_check_reports_full_translator_handoff() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:8332".to_string(),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
 
@@ -662,6 +668,7 @@ async fn send_tx_reports_unavailable_when_rpc_is_disabled() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: None,
     };
 
@@ -690,13 +697,13 @@ async fn send_tx_rejects_missing_api_tx_token_header() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:8332".to_string(),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
 
@@ -732,13 +739,13 @@ async fn prioritize_transaction_rejects_a_cached_bad_transaction() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:1".to_string(),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
     let mut headers = HeaderMap::new();
@@ -809,13 +816,13 @@ async fn successful_prioritization_records_the_applied_fee_delta() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 format!("http://{addr}/bitcoin"),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
     let mut headers = HeaderMap::new();
@@ -895,13 +902,13 @@ async fn successful_restore_reverses_and_removes_all_cached_fee_deltas() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 format!("http://{addr}/bitcoin"),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
     let mut headers = HeaderMap::new();
@@ -1038,13 +1045,13 @@ async fn get_prioritized_transactions_returns_categorized_bitcoind_snapshot() {
         router,
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
+        api_tx_token: Some("api-token".to_string()),
         prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 format!("http://{addr}"),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: "api-token".to_string(),
         }),
     };
 
@@ -1114,13 +1121,13 @@ fn declaration_test_state(api_tx_token: Option<&str>) -> AppState {
         router: crate::router::Router::new(vec![], auth_pub_k, None, None),
         stats_sender: crate::api::stats::StatsSender::new(),
         downstream_handoff: handoff_tx,
-        prioritizing_txs: api_tx_token.map(|token| super::PrioritizingTxs {
+        api_tx_token: api_tx_token.map(str::to_string),
+        prioritizing_txs: Some(super::PrioritizingTxs {
             rpc: std::sync::Arc::new(crate::api::bitcoin_rpc::BitcoindRpc::new(
                 "http://127.0.0.1:8332".to_string(),
                 "user".to_string(),
                 "password".to_string(),
             )),
-            api_tx_token: token.to_string(),
         }),
     }
 }
@@ -1175,7 +1182,7 @@ async fn job_declaration_routes_require_the_bearer_token() {
 // A proxy started without a token does not serve these routes at all, rather
 // than serving them to anyone.
 #[tokio::test]
-async fn job_declaration_routes_are_disabled_without_the_prioritizing_txs_config() {
+async fn job_declaration_routes_are_disabled_without_the_api_tx_token() {
     use axum::extract::{Path, State};
     use axum::response::IntoResponse;
 
@@ -1211,7 +1218,8 @@ async fn job_declaration_routes_are_disabled_without_the_prioritizing_txs_config
     );
 }
 
-// The matching token gets through; a missing template is then a 404, not a 401.
+// The matching token gets through with no bitcoind RPC configured, and a
+// missing template is then a 404, not a 401 or a 503.
 #[tokio::test]
 async fn the_configured_token_reaches_the_job_declaration_routes() {
     use axum::extract::{Path, State};

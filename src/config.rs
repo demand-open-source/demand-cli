@@ -188,6 +188,7 @@ pub struct Configuration {
     headful: bool,
     auto_update: bool,
     miner_name: Option<String>,
+    api_tx_token: Option<String>,
     prioritizing_txs_config: Option<BitcoindRpcConfig>,
     missing_prioritizing_txs_variables: Vec<&'static str>,
 }
@@ -197,7 +198,6 @@ pub(crate) struct BitcoindRpcConfig {
     pub url: String,
     pub user: String,
     pub pwd: String,
-    pub api_tx_token: String,
 }
 
 impl Configuration {
@@ -258,6 +258,11 @@ and make that test pass."
             panic!("{error}");
         }
 
+        let configured_api_tx_token = if api_tx_token.trim().is_empty() {
+            None
+        } else {
+            Some(api_tx_token.clone())
+        };
         let (prioritizing_txs_config, missing_prioritizing_txs_variables) =
             Self::build_prioritizing_txs_config(rpc_url, rpc_user, rpc_pwd, api_tx_token);
 
@@ -289,6 +294,7 @@ and make that test pass."
             headful,
             auto_update,
             miner_name,
+            api_tx_token: configured_api_tx_token,
             prioritizing_txs_config,
             missing_prioritizing_txs_variables,
         }
@@ -318,15 +324,7 @@ and make that test pass."
             return (None, missing);
         }
 
-        (
-            Some(BitcoindRpcConfig {
-                url,
-                user,
-                pwd,
-                api_tx_token,
-            }),
-            missing,
-        )
+        (Some(BitcoindRpcConfig { url, user, pwd }), missing)
     }
 
     pub(crate) fn init(config: Configuration) {
@@ -555,6 +553,10 @@ and make that test pass."
         Self::cfg().miner_name.clone()
     }
 
+    pub(crate) fn api_tx_token() -> Option<String> {
+        Self::cfg().api_tx_token.clone()
+    }
+
     pub(crate) fn prioritizing_txs_enabled() -> bool {
         Self::cfg().prioritizing_txs_config.is_some()
     }
@@ -580,6 +582,9 @@ and make that test pass."
                 missing_env_variables = %missing.join(", "),
                 "PRIORITIZING TXS NOT ENABLED, missing env variable"
             );
+        }
+        if Self::cfg().api_tx_token.is_none() && Self::cfg().headful {
+            warn!("API_TX_TOKEN NOT SET.");
         }
     }
 

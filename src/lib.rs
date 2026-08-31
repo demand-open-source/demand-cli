@@ -240,6 +240,7 @@ async fn initialize_proxy(
                 continue;
             }
         };
+        block_templates::reset();
 
         let (downs_sv1_tx, downs_sv1_rx) = channel(crate::DOWNSTREAM_ACCEPT_BUFFER_SIZE);
         let downstream_handoff = downs_sv1_tx.clone();
