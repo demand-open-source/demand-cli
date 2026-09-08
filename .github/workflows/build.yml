@@ -75,3 +75,25 @@ jobs:
         with:
           name: windows-artifact
           path: dmnd-client-windows.exe
+
+  add-checksum:
+    name: Create Checksums
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: binaries
+        run: sha256sum dmnd-client-linux dmnd-client-macos dmnd-client-windows.exe > checksums.sha256
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: binaries/checksums.sha256
