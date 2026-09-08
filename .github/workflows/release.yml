@@ -120,6 +120,14 @@ jobs:
           name: windows-artifact
           path: .
 
+      - name: Generate SHA-256 checksums
+        run: |
+          sha256sum \
+            dmnd-client-linux \
+            dmnd-client-macos \
+            dmnd-client-windows.exe \
+            > SHA256SUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
@@ -128,6 +136,7 @@ jobs:
             dmnd-client-linux
             dmnd-client-macos
             dmnd-client-windows.exe
+            SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
